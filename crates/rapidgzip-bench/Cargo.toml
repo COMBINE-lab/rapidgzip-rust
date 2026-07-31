@@ -1,0 +1,24 @@
+[package]
+name = "rapidgzip-bench"
+description = "Unpublished benchmark harness for rapidgzip-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+rapidgzip-core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+paraseq.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false
+
+[lints]
+workspace = true

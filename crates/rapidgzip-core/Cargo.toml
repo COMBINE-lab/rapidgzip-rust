@@ -1,0 +1,20 @@
+[package]
+name = "rapidgzip-core"
+description = "Parallel, multi-member gzip decoder based on the rapidgzip marker/window algorithm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crossbeam-deque.workspace = true
+libz-rs-sys.workspace = true
+
+[dev-dependencies]
+paraseq.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

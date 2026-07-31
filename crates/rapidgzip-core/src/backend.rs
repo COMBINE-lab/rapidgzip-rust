@@ -1,0 +1,1919 @@
+use crate::config::Config;
+use crate::crc32::Crc32;
+use crate::gzip::{SourceCursor, parse_member_header};
+use crate::parallel::Window;
+use crate::parallel::deflate::{
+    Error as NativeError, InitialHistory, decode_to_estimated_boundary,
+    find_next_structural_candidate,
+};
+use crate::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ReadAt};
+use crossbeam_deque::{Injector, Steal};
+use libz_rs_sys as z;
+use std::collections::BTreeMap;
+use std::ffi::CStr;
+use std::io::Write;
+use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::Duration;
+
+pub(crate) trait Output {
+    fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError>;
+}
+
+pub(crate) struct DirectOutput<'a, W> {
+    writer: &'a mut W,
+}
+
+impl<'a, W> DirectOutput<'a, W> {
+    pub(crate) const fn new(writer: &'a mut W) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Output for DirectOutput<'_, W> {
+    fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError> {
+        self.writer
+            .write_all(&chunk)
+            .map_err(DecodeError::output_io)
+    }
+}
+
+/// RAII wrapper around zlib-rs's zlib-compatible raw-inflate ABI.
+struct RawInflater {
+    stream: z::z_stream,
+    initialized: bool,
+}
+
+impl RawInflater {
+    fn new() -> Result<Self, DecodeError> {
+        let mut result = Self {
+            stream: z::z_stream::default(),
+            initialized: false,
+        };
+
+        // SAFETY:
+        // - `result.stream` is a live, uniquely borrowed `z_stream`.
+        // - `zlibVersion` returns a static NUL-terminated version string.
+        // - the structure size matches the exact Rust ABI type passed.
+        // - `-15` requests raw DEFLATE with a 32 KiB window.
+        let status = unsafe {
+            z::inflateInit2_(
+                &mut result.stream,
+                -15,
+                z::zlibVersion(),
+                size_of::<z::z_stream>() as i32,
+            )
+        };
+        if status != z::Z_OK {
+            return Err(DecodeError::InvalidDeflate {
+                bit_offset: 0,
+                reason: DeflateErrorKind::BackendStatus(status),
+            });
+        }
+        result.initialized = true;
+        Ok(result)
+    }
+
+    fn message(&self) -> Option<String> {
+        if self.stream.msg.is_null() {
+            return None;
+        }
+        // SAFETY: while the initialized zlib stream is live, zlib owns `msg`
+        // as a valid NUL-terminated diagnostic string or leaves it null.
+        Some(
+            unsafe { CStr::from_ptr(self.stream.msg) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    fn reset(&mut self, bit_offset: u64) -> Result<(), DecodeError> {
+        // SAFETY: this wrapper owns a successfully initialized stream and
+        // holds its unique mutable borrow. `inflateReset` retains the raw
+        // window mode selected by `inflateInit2_`.
+        let status = unsafe { z::inflateReset(&mut self.stream) };
+        if status == z::Z_OK {
+            Ok(())
+        } else {
+            Err(DecodeError::InvalidDeflate {
+                bit_offset,
+                reason: DeflateErrorKind::BackendStatus(status),
+            })
+        }
+    }
+}
+
+impl Drop for RawInflater {
+    fn drop(&mut self) {
+        if self.initialized {
+            // SAFETY: this wrapper calls `inflateEnd` exactly once for the
+            // successfully initialized, uniquely owned stream.
+            let _ = unsafe { z::inflateEnd(&mut self.stream) };
+        }
+    }
+}
+
+pub(crate) fn decode_source<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    // BGZF block starts are normally tens of KiB apart and only their short
+    // headers are needed for indexing. A small page avoids reading the
+    // complete compressed payload before decoding.
+    let bgzf_index = index_bgzf(source, config.input_page_size.min(256))?;
+    if let Some(index) = bgzf_index
+        && index.len() > 1
+    {
+        return decode_bgzf_parallel(source, config, cancelled, output, &index);
+    }
+    if config.decoder_threads > 1 {
+        if let Some(index) = index_stored_stream(source, config.input_page_size.min(256))?
+            && index.tasks.len() > 1
+        {
+            return decode_stored_parallel(source, config, cancelled, output, &index);
+        }
+        let grid_size = adjusted_compressed_chunk_size(source, config)?;
+        return decode_rapidgzip_estimated(source, config, cancelled, output, grid_size);
+    }
+    decode_source_sequential(source, config, cancelled, output)
+}
+
+fn adjusted_compressed_chunk_size<R: ReadAt + ?Sized>(
+    _source: &R,
+    config: &Config,
+) -> Result<usize, DecodeError> {
+    Ok(config.compressed_chunk_size)
+}
+
+#[derive(Clone, Copy)]
+struct StoredMember {
+    expected_crc: u32,
+    expected_size: u32,
+}
+
+#[derive(Clone)]
+struct StoredTask {
+    member: usize,
+    ranges: Vec<CompressedRange>,
+    decoded_size: usize,
+    last_in_member: bool,
+}
+
+struct StoredIndex {
+    members: Vec<StoredMember>,
+    tasks: Vec<StoredTask>,
+    compressed_size: u64,
+}
+
+fn index_stored_stream<R: ReadAt + ?Sized>(
+    source: &R,
+    page_size: usize,
+) -> Result<Option<StoredIndex>, DecodeError> {
+    let mut cursor = SourceCursor::new(source, page_size)?;
+    let mut members = Vec::new();
+    let mut tasks = Vec::new();
+
+    while !cursor.at_end() {
+        let member_number = members.len() as u64;
+        let header = parse_member_header(&mut cursor, members.is_empty())?;
+        let mut member_ranges = Vec::new();
+        let mut decoded_size = 0_u32;
+        let mut block_start = header.deflate_start;
+        loop {
+            cursor.seek(block_start)?;
+            let block_header = cursor.read_exact::<5>(block_start)?;
+            let final_block = block_header[0] & 1 != 0;
+            let block_type = (block_header[0] >> 1) & 0b11;
+            if block_type != 0 {
+                return Ok(None);
+            }
+            let length = u16::from_le_bytes([block_header[1], block_header[2]]);
+            let complement = u16::from_le_bytes([block_header[3], block_header[4]]);
+            if length != !complement {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: block_start.saturating_mul(8),
+                    reason: DeflateErrorKind::InvalidData,
+                });
+            }
+            let data_start = block_start + 5;
+            let data_end = data_start.saturating_add(u64::from(length));
+            if data_end > cursor.length() {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: block_start.saturating_mul(8),
+                    reason: DeflateErrorKind::Truncated,
+                });
+            }
+            member_ranges.push(CompressedRange {
+                start: data_start,
+                end: data_end,
+            });
+            decoded_size = decoded_size.wrapping_add(u32::from(length));
+            block_start = data_end;
+            if final_block {
+                break;
+            }
+        }
+
+        cursor.seek(block_start)?;
+        let footer = cursor.read_exact::<8>(block_start)?;
+        let expected_crc = u32::from_le_bytes(footer[..4].try_into().expect("four bytes"));
+        let expected_size = u32::from_le_bytes(footer[4..].try_into().expect("four bytes"));
+        if expected_size != decoded_size {
+            return Err(DecodeError::SizeMismatch {
+                member: member_number,
+                expected: expected_size,
+                actual_mod32: decoded_size,
+            });
+        }
+        let member = members.len();
+        members.push(StoredMember {
+            expected_crc,
+            expected_size,
+        });
+
+        let mut task_ranges = Vec::new();
+        let mut task_size: usize = 0;
+        for range in member_ranges {
+            let range_size =
+                usize::try_from(range.end - range.start).expect("a stored block length fits usize");
+            if !task_ranges.is_empty() && task_size.saturating_add(range_size) > 4 * 1024 * 1024 {
+                tasks.push(StoredTask {
+                    member,
+                    ranges: std::mem::take(&mut task_ranges),
+                    decoded_size: task_size,
+                    last_in_member: false,
+                });
+                task_size = 0;
+            }
+            task_ranges.push(range);
+            task_size += range_size;
+        }
+        tasks.push(StoredTask {
+            member,
+            ranges: task_ranges,
+            decoded_size: task_size,
+            last_in_member: true,
+        });
+    }
+
+    Ok(Some(StoredIndex {
+        members,
+        tasks,
+        compressed_size: cursor.position(),
+    }))
+}
+
+struct StoredResult {
+    index: usize,
+    result: Result<Vec<u8>, DecodeError>,
+}
+
+struct StopGuard<'a>(&'a AtomicBool);
+
+impl Drop for StopGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+fn send_stored_result(
+    sender: &mpsc::SyncSender<StoredResult>,
+    stopped: &AtomicBool,
+    mut result: StoredResult,
+) {
+    loop {
+        if stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        match sender.try_send(result) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(returned)) => {
+                result = returned;
+                thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn decode_stored_parallel<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    index: &StoredIndex,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    let task_queue = Arc::new(Injector::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let task_window = config
+        .in_flight_chunks
+        .max(config.decoder_threads)
+        .min(index.tasks.len());
+    for task_index in 0..task_window {
+        task_queue.push(task_index);
+    }
+    let (sender, receiver) = mpsc::sync_channel::<StoredResult>(task_window);
+    let mut next_to_schedule = task_window;
+    let mut next_to_emit = 0;
+    let mut reordered = BTreeMap::new();
+    let mut total_output = 0_u64;
+    let mut accounting = MemberAccounting::new();
+
+    let scoped_result = thread::scope(|scope| -> Result<(), DecodeError> {
+        let _stop_on_exit = StopGuard(&stopped);
+        for _ in 0..config.decoder_threads.min(index.tasks.len()) {
+            let queue = Arc::clone(&task_queue);
+            let worker_stopped = Arc::clone(&stopped);
+            let sender = sender.clone();
+            scope.spawn(move || {
+                while !worker_stopped.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed)
+                {
+                    let task_index = loop {
+                        match queue.steal() {
+                            Steal::Success(task_index) => break task_index,
+                            Steal::Retry => std::hint::spin_loop(),
+                            Steal::Empty => {
+                                if worker_stopped.load(Ordering::Relaxed)
+                                    || cancelled.load(Ordering::Relaxed)
+                                {
+                                    return;
+                                }
+                                thread::park_timeout(Duration::from_millis(1));
+                            }
+                        }
+                    };
+                    let task = &index.tasks[task_index];
+                    let result = (|| {
+                        let mut decoded = Vec::with_capacity(task.decoded_size);
+                        for range in &task.ranges {
+                            let length = usize::try_from(range.end - range.start)
+                                .expect("stored block length fits usize");
+                            decoded.extend_from_slice(&read_range(source, range.start, length)?);
+                        }
+                        Ok(decoded)
+                    })();
+                    send_stored_result(
+                        &sender,
+                        &worker_stopped,
+                        StoredResult {
+                            index: task_index,
+                            result,
+                        },
+                    );
+                }
+            });
+        }
+        drop(sender);
+
+        while next_to_emit < index.tasks.len() {
+            if cancelled.load(Ordering::Relaxed) {
+                stopped.store(true, Ordering::Relaxed);
+                return Err(DecodeError::Cancelled);
+            }
+            let result = match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => result,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    stopped.store(true, Ordering::Relaxed);
+                    return Err(DecodeError::WorkerPanicked);
+                }
+            };
+            reordered.insert(result.index, result.result);
+            while let Some(result) = reordered.remove(&next_to_emit) {
+                let task = &index.tasks[next_to_emit];
+                let decoded = result?;
+                emit_accounted(decoded, config, output, &mut accounting, &mut total_output)?;
+                if task.last_in_member {
+                    let member = index.members[task.member];
+                    let actual_crc = accounting.crc.finish();
+                    if actual_crc != member.expected_crc {
+                        stopped.store(true, Ordering::Relaxed);
+                        return Err(DecodeError::ChecksumMismatch {
+                            member: task.member as u64,
+                            expected: member.expected_crc,
+                            actual: actual_crc,
+                        });
+                    }
+                    if accounting.size != member.expected_size {
+                        stopped.store(true, Ordering::Relaxed);
+                        return Err(DecodeError::SizeMismatch {
+                            member: task.member as u64,
+                            expected: member.expected_size,
+                            actual_mod32: accounting.size,
+                        });
+                    }
+                    accounting = MemberAccounting::new();
+                }
+                next_to_emit += 1;
+                if next_to_schedule < index.tasks.len() {
+                    task_queue.push(next_to_schedule);
+                    next_to_schedule += 1;
+                }
+            }
+        }
+        stopped.store(true, Ordering::Relaxed);
+        Ok(())
+    });
+    stopped.store(true, Ordering::Relaxed);
+    scoped_result?;
+
+    let final_length = source
+        .len()
+        .map_err(|error| DecodeError::input_io(index.compressed_size, error))?;
+    if final_length != index.compressed_size {
+        return Err(DecodeError::input_io(
+            index.compressed_size,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed source length changed during decoding",
+            ),
+        ));
+    }
+
+    Ok(DecodeReport {
+        compressed_bytes: index.compressed_size,
+        decompressed_bytes: total_output,
+        member_count: index.members.len() as u64,
+        decoder_threads: config.decoder_threads,
+    })
+}
+
+fn decode_source_sequential<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    let mut cursor = SourceCursor::new(source, config.input_page_size)?;
+    let mut total_output = 0_u64;
+    let mut member_count = 0_u64;
+
+    while !cursor.at_end() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(DecodeError::Cancelled);
+        }
+
+        let header = parse_member_header(&mut cursor, member_count == 0)?;
+        debug_assert!(header.start <= header.deflate_start);
+        debug_assert_eq!(header.deflate_start, cursor.position());
+        let _observed_bgzf_size = header.bgzf_block_size;
+        let mut inflater = RawInflater::new()?;
+        let mut crc = Crc32::new();
+        let mut member_output = 0_u32;
+
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(DecodeError::Cancelled);
+            }
+            if cursor.at_end() {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: cursor.position().saturating_mul(8),
+                    reason: DeflateErrorKind::Truncated,
+                });
+            }
+
+            let (input_pointer, input_length) = {
+                let input = cursor.available()?;
+                (input.as_ptr(), input.len().min(u32::MAX as usize))
+            };
+            let mut decoded = vec![0_u8; config.decoded_chunk_size];
+
+            inflater.stream.next_in = input_pointer;
+            inflater.stream.avail_in = input_length as u32;
+            inflater.stream.next_out = decoded.as_mut_ptr();
+            inflater.stream.avail_out = decoded.len() as u32;
+            let input_before = inflater.stream.avail_in;
+            let output_before = inflater.stream.avail_out;
+
+            // SAFETY:
+            // - `inflater.stream` was initialized and is uniquely borrowed.
+            // - `next_in/avail_in` describe the current immutable cursor page,
+            //   which is not moved or mutated until this call returns.
+            // - `next_out/avail_out` describe the initialized, uniquely owned
+            //   `decoded` allocation.
+            let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
+
+            let consumed = usize::try_from(input_before - inflater.stream.avail_in)
+                .expect("zlib uInt fits usize");
+            let produced = usize::try_from(output_before - inflater.stream.avail_out)
+                .expect("zlib uInt fits usize");
+            cursor.advance(consumed);
+            decoded.truncate(produced);
+
+            if !decoded.is_empty() {
+                let new_total = total_output.checked_add(decoded.len() as u64).ok_or(
+                    DecodeError::OutputLimitExceeded {
+                        limit: config.output_limit.unwrap_or(u64::MAX),
+                    },
+                )?;
+                if config.output_limit.is_some_and(|limit| new_total > limit) {
+                    return Err(DecodeError::OutputLimitExceeded {
+                        limit: config.output_limit.expect("checked as some"),
+                    });
+                }
+                total_output = new_total;
+                member_output = member_output.wrapping_add(decoded.len() as u32);
+                crc.update(&decoded);
+                output.emit(decoded)?;
+            }
+
+            match status {
+                z::Z_STREAM_END => break,
+                z::Z_OK => {
+                    if consumed == 0 && produced == 0 {
+                        return Err(DecodeError::InvalidDeflate {
+                            bit_offset: cursor.position().saturating_mul(8),
+                            reason: DeflateErrorKind::Stalled,
+                        });
+                    }
+                }
+                z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {}
+                z::Z_BUF_ERROR => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: cursor.position().saturating_mul(8),
+                        reason: DeflateErrorKind::Truncated,
+                    });
+                }
+                z::Z_NEED_DICT => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: header.deflate_start.saturating_mul(8),
+                        reason: DeflateErrorKind::UnexpectedDictionary,
+                    });
+                }
+                z::Z_DATA_ERROR => {
+                    let _diagnostic = inflater.message();
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: cursor.position().saturating_mul(8),
+                        reason: DeflateErrorKind::InvalidData,
+                    });
+                }
+                other => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: cursor.position().saturating_mul(8),
+                        reason: DeflateErrorKind::BackendStatus(other),
+                    });
+                }
+            }
+        }
+
+        let footer_offset = cursor.position();
+        let footer = cursor.read_exact::<8>(footer_offset)?;
+        let expected_crc = u32::from_le_bytes(footer[0..4].try_into().expect("four bytes"));
+        let expected_size = u32::from_le_bytes(footer[4..8].try_into().expect("four bytes"));
+        let actual_crc = crc.finish();
+        if expected_crc != actual_crc {
+            return Err(DecodeError::ChecksumMismatch {
+                member: member_count,
+                expected: expected_crc,
+                actual: actual_crc,
+            });
+        }
+        if expected_size != member_output {
+            return Err(DecodeError::SizeMismatch {
+                member: member_count,
+                expected: expected_size,
+                actual_mod32: member_output,
+            });
+        }
+
+        member_count += 1;
+    }
+
+    if member_count == 0 {
+        return Err(DecodeError::InvalidGzip {
+            offset: 0,
+            reason: GzipErrorKind::BadMagic,
+        });
+    }
+
+    let final_length = source
+        .len()
+        .map_err(|error| DecodeError::input_io(cursor.position(), error))?;
+    if final_length != cursor.length() {
+        return Err(DecodeError::input_io(
+            cursor.position(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed source length changed during decoding",
+            ),
+        ));
+    }
+
+    Ok(DecodeReport {
+        compressed_bytes: cursor.position(),
+        decompressed_bytes: total_output,
+        member_count,
+        decoder_threads: config.decoder_threads,
+    })
+}
+
+fn read_range<R: ReadAt + ?Sized>(
+    source: &R,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, DecodeError> {
+    let mut bytes = Vec::new();
+    read_range_reuse(source, offset, length, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_range_reuse<R: ReadAt + ?Sized>(
+    source: &R,
+    offset: u64,
+    length: usize,
+    bytes: &mut Vec<u8>,
+) -> Result<(), DecodeError> {
+    bytes.resize(length, 0);
+    let mut filled = 0;
+    while filled < length {
+        let absolute = offset.saturating_add(filled as u64);
+        let read = source
+            .read_at(absolute, &mut bytes[filled..])
+            .map_err(|error| DecodeError::input_io(absolute, error))?;
+        if read == 0 {
+            return Err(DecodeError::input_io(
+                absolute,
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "positional source ended before its snapshotted length",
+                ),
+            ));
+        }
+        filled += read;
+    }
+    Ok(())
+}
+
+impl RawInflater {
+    fn prime(&mut self, bits: u8, value: u8, bit_offset: u64) -> Result<(), DecodeError> {
+        // SAFETY: the stream is initialized and uniquely borrowed. zlib accepts
+        // at most 16 low-order bits before the first inflate call; this wrapper
+        // supplies at most the seven unread bits from one source byte.
+        let status =
+            unsafe { z::inflatePrime(&mut self.stream, i32::from(bits), i32::from(value)) };
+        if status == z::Z_OK {
+            Ok(())
+        } else {
+            Err(DecodeError::InvalidDeflate {
+                bit_offset,
+                reason: DeflateErrorKind::BackendStatus(status),
+            })
+        }
+    }
+
+    fn set_dictionary(&mut self, window: &Window, bit_offset: u64) -> Result<(), DecodeError> {
+        if window.as_slice().is_empty() {
+            return Ok(());
+        }
+        // SAFETY: `window` remains immutably borrowed for the call, and its
+        // slice is no larger than DEFLATE's 32 KiB history limit.
+        let status = unsafe {
+            z::inflateSetDictionary(
+                &mut self.stream,
+                window.as_slice().as_ptr(),
+                window.as_slice().len() as u32,
+            )
+        };
+        if status == z::Z_OK {
+            Ok(())
+        } else {
+            Err(DecodeError::InvalidDeflate {
+                bit_offset,
+                reason: DeflateErrorKind::BackendStatus(status),
+            })
+        }
+    }
+}
+
+struct MemberAccounting {
+    crc: Crc32,
+    size: u32,
+}
+
+impl MemberAccounting {
+    const fn new() -> Self {
+        Self {
+            crc: Crc32::new(),
+            size: 0,
+        }
+    }
+}
+
+fn emit_accounted<O: Output>(
+    decoded: Vec<u8>,
+    config: &Config,
+    output: &mut O,
+    accounting: &mut MemberAccounting,
+    total_output: &mut u64,
+) -> Result<(), DecodeError> {
+    let next_total =
+        total_output
+            .checked_add(decoded.len() as u64)
+            .ok_or(DecodeError::OutputLimitExceeded {
+                limit: config.output_limit.unwrap_or(u64::MAX),
+            })?;
+    if config.output_limit.is_some_and(|limit| next_total > limit) {
+        return Err(DecodeError::OutputLimitExceeded {
+            limit: config.output_limit.expect("checked as some"),
+        });
+    }
+    *total_output = next_total;
+    accounting.size = accounting.size.wrapping_add(decoded.len() as u32);
+    accounting.crc.update(&decoded);
+    if !decoded.is_empty() {
+        output.emit(decoded)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inflate_from_block<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    start_bit: u64,
+    window: &Window,
+    accounting: &mut MemberAccounting,
+    total_output: &mut u64,
+) -> Result<u64, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    let mut cursor = SourceCursor::new(source, config.input_page_size)?;
+    let byte_offset = start_bit / 8;
+    cursor.seek(byte_offset)?;
+    let mut inflater = RawInflater::new()?;
+    let skipped_bits = (start_bit % 8) as u8;
+    if skipped_bits != 0 {
+        let byte = cursor.read_exact::<1>(byte_offset)?[0];
+        let remaining_bits = 8 - skipped_bits;
+        inflater.prime(remaining_bits, byte >> skipped_bits, start_bit)?;
+    }
+    inflater.set_dictionary(window, start_bit)?;
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(DecodeError::Cancelled);
+        }
+        if cursor.at_end() {
+            return Err(DecodeError::InvalidDeflate {
+                bit_offset: cursor.position().saturating_mul(8),
+                reason: DeflateErrorKind::Truncated,
+            });
+        }
+        let (input_pointer, input_length) = {
+            let input = cursor.available()?;
+            (input.as_ptr(), input.len().min(u32::MAX as usize))
+        };
+        let mut decoded = vec![0_u8; config.decoded_chunk_size];
+        inflater.stream.next_in = input_pointer;
+        inflater.stream.avail_in = input_length as u32;
+        inflater.stream.next_out = decoded.as_mut_ptr();
+        inflater.stream.avail_out = decoded.len() as u32;
+        let input_before = inflater.stream.avail_in;
+        let output_before = inflater.stream.avail_out;
+
+        // SAFETY: identical pointer and lifetime argument to the main raw
+        // inflate loop above; this stream additionally has valid primed bits
+        // and a copied dictionary.
+        let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
+        let consumed =
+            usize::try_from(input_before - inflater.stream.avail_in).expect("zlib uInt fits usize");
+        let produced = usize::try_from(output_before - inflater.stream.avail_out)
+            .expect("zlib uInt fits usize");
+        cursor.advance(consumed);
+        decoded.truncate(produced);
+        if !decoded.is_empty() {
+            emit_accounted(decoded, config, output, accounting, total_output)?;
+        }
+        match status {
+            z::Z_STREAM_END => return Ok(cursor.position()),
+            z::Z_OK if consumed != 0 || produced != 0 => {}
+            z::Z_BUF_ERROR if consumed != 0 || produced != 0 => {}
+            z::Z_DATA_ERROR => {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: cursor.position().saturating_mul(8),
+                    reason: DeflateErrorKind::InvalidData,
+                });
+            }
+            z::Z_NEED_DICT => {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: start_bit,
+                    reason: DeflateErrorKind::UnexpectedDictionary,
+                });
+            }
+            z::Z_OK | z::Z_BUF_ERROR => {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: cursor.position().saturating_mul(8),
+                    reason: DeflateErrorKind::Stalled,
+                });
+            }
+            other => {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: cursor.position().saturating_mul(8),
+                    reason: DeflateErrorKind::BackendStatus(other),
+                });
+            }
+        }
+    }
+}
+
+struct EstimatedTask {
+    search_start_bit: u64,
+    search_end_bit: u64,
+    estimated_stop_bit: u64,
+    read_end_bit: u64,
+    exact_start: bool,
+}
+
+struct NativeResult {
+    index: usize,
+    result: Result<crate::parallel::deflate::Chunk, NativeError>,
+}
+
+fn send_native_result(
+    sender: &mpsc::SyncSender<NativeResult>,
+    stopped: &AtomicBool,
+    mut result: NativeResult,
+) {
+    loop {
+        if stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        match sender.try_send(result) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(returned)) => {
+                result = returned;
+                thread::park_timeout(Duration::from_micros(25));
+            }
+        }
+    }
+}
+
+struct BackendTail {
+    output: Vec<u8>,
+    end_bit: usize,
+    reached_stream_end: bool,
+}
+
+fn inflate_tail(
+    bytes: &[u8],
+    start_bit: usize,
+    stop_bit: usize,
+    window: &Window,
+    maximum_output: usize,
+    exact_stop: bool,
+) -> Result<BackendTail, NativeError> {
+    let mut inflater = RawInflater::new().map_err(|_| NativeError::InvalidSymbol)?;
+    let byte_offset = start_bit / 8;
+    let skipped_bits = (start_bit % 8) as u8;
+    let mut input_position = byte_offset;
+    if skipped_bits != 0 {
+        let byte = *bytes.get(byte_offset).ok_or(NativeError::UnexpectedEof)?;
+        inflater
+            .prime(8 - skipped_bits, byte >> skipped_bits, start_bit as u64)
+            .map_err(|_| NativeError::InvalidSymbol)?;
+        input_position += 1;
+    }
+    inflater
+        .set_dictionary(window, start_bit as u64)
+        .map_err(|_| NativeError::InvalidDistance)?;
+
+    // Typical 1 MiB compressed grid chunks expand to roughly 1--2 MiB. An
+    // eager 2 MiB ceiling avoids repeated growth/copying without reserving the
+    // much larger adversarial-output allowance for every worker.
+    let mut output = Vec::with_capacity(maximum_output.min(2 * 1024 * 1024));
+    loop {
+        let input = bytes
+            .get(input_position..)
+            .ok_or(NativeError::UnexpectedEof)?;
+        if input.is_empty() {
+            return Err(NativeError::UnexpectedEof);
+        }
+        let input_length = input.len().min(u32::MAX as usize);
+        let remaining = maximum_output.saturating_sub(output.len());
+        let reserve = remaining.clamp(1, 256 * 1024);
+        output.reserve(reserve);
+        let old_output_length = output.len();
+        let spare = output.spare_capacity_mut();
+        let output_length = spare.len().min(u32::MAX as usize);
+        inflater.stream.next_in = input.as_ptr();
+        inflater.stream.avail_in = input_length as u32;
+        inflater.stream.next_out = spare.as_mut_ptr().cast::<u8>();
+        inflater.stream.avail_out = output_length as u32;
+        let input_before = inflater.stream.avail_in;
+        let output_before = inflater.stream.avail_out;
+
+        // SAFETY: `inflater` owns an initialized stream. The input and output
+        // slices remain live and immovable for this call, and their lengths
+        // exactly match the `avail_*` fields.
+        let status = unsafe { z::inflate(&mut inflater.stream, z::Z_BLOCK) };
+        let consumed =
+            usize::try_from(input_before - inflater.stream.avail_in).expect("zlib uInt fits usize");
+        let produced = usize::try_from(output_before - inflater.stream.avail_out)
+            .expect("zlib uInt fits usize");
+        input_position += consumed;
+        if old_output_length
+            .checked_add(produced)
+            .is_none_or(|size| size > maximum_output)
+        {
+            return Err(NativeError::OutputLimit);
+        }
+        // SAFETY: zlib reported exactly `produced` bytes written through
+        // `next_out`. The pointer covered the vector's spare capacity and the
+        // output-limit check also proves the new length cannot overflow.
+        unsafe {
+            output.set_len(old_output_length + produced);
+        }
+
+        // zlib exposes the number of bits currently buffered but not consumed
+        // in the low six data_type bits. Optimized inflaters may read several
+        // bytes ahead, so masking only the low three bits can place a gzip
+        // footer multiple bytes too late.
+        let unused_bits = usize::try_from(inflater.stream.data_type & 0x3F)
+            .expect("the low six data_type bits are non-negative");
+        let position = input_position.saturating_mul(8).saturating_sub(unused_bits);
+        if status == z::Z_STREAM_END {
+            return Ok(BackendTail {
+                output,
+                end_bit: position.div_ceil(8).saturating_mul(8),
+                reached_stream_end: true,
+            });
+        }
+        if status != z::Z_OK && status != z::Z_BUF_ERROR {
+            return Err(NativeError::InvalidSymbol);
+        }
+        if inflater.stream.data_type & 0x80 != 0 {
+            match position.cmp(&stop_bit) {
+                std::cmp::Ordering::Equal => {
+                    return Ok(BackendTail {
+                        output,
+                        end_bit: position,
+                        reached_stream_end: false,
+                    });
+                }
+                std::cmp::Ordering::Greater if !exact_stop => {
+                    return Ok(BackendTail {
+                        output,
+                        end_bit: position,
+                        reached_stream_end: false,
+                    });
+                }
+                std::cmp::Ordering::Greater => return Err(NativeError::BoundaryMismatch),
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        if consumed == 0 && produced == 0 {
+            return Err(NativeError::UnexpectedEof);
+        }
+    }
+}
+
+fn run_estimated_task<R: ReadAt + ?Sized>(
+    source: &R,
+    task: &EstimatedTask,
+    maximum_output: usize,
+    bytes: &mut Vec<u8>,
+) -> Result<crate::parallel::deflate::Chunk, NativeError> {
+    let byte_start = task.search_start_bit / 8;
+    let byte_end = task.read_end_bit.div_ceil(8);
+    let length = usize::try_from(byte_end.saturating_sub(byte_start))
+        .map_err(|_| NativeError::UnexpectedEof)?;
+    read_range_reuse(source, byte_start, length, bytes).map_err(|_| NativeError::UnexpectedEof)?;
+    let base_bit = byte_start
+        .checked_mul(8)
+        .ok_or(NativeError::UnexpectedEof)?;
+    let local_search_start = usize::try_from(task.search_start_bit.saturating_sub(base_bit))
+        .map_err(|_| NativeError::UnexpectedEof)?;
+    let local_search_end = usize::try_from(task.search_end_bit.saturating_sub(base_bit))
+        .map_err(|_| NativeError::UnexpectedEof)?;
+    let local_stop = usize::try_from(task.estimated_stop_bit.saturating_sub(base_bit))
+        .map_err(|_| NativeError::UnexpectedEof)?;
+    if task.exact_start {
+        let tail = inflate_tail(
+            bytes,
+            local_search_start,
+            local_stop,
+            &Window::empty(),
+            maximum_output,
+            false,
+        )?;
+        return Ok(crate::parallel::deflate::Chunk {
+            start_bit: usize::try_from(task.search_start_bit)
+                .map_err(|_| NativeError::UnexpectedEof)?,
+            end_bit: tail
+                .end_bit
+                .checked_add(usize::try_from(base_bit).map_err(|_| NativeError::UnexpectedEof)?)
+                .ok_or(NativeError::UnexpectedEof)?,
+            output: crate::parallel::deflate::ChunkOutput::from_clean(tail.output),
+            reached_stream_end: tail.reached_stream_end,
+            backend_continuation: None,
+        });
+    }
+    let mut search_bit = local_search_start;
+
+    loop {
+        let local_start = find_next_structural_candidate(bytes, search_bit, local_search_end)
+            .ok_or(NativeError::UnexpectedEof)?;
+        let attempt = (|| {
+            let mut chunk = decode_to_estimated_boundary(
+                bytes,
+                local_start,
+                local_stop,
+                InitialHistory::Unknown,
+                maximum_output,
+            )?;
+            if let Some(window) = chunk.backend_continuation.take() {
+                let remaining = maximum_output.saturating_sub(chunk.output.len());
+                let tail =
+                    inflate_tail(bytes, chunk.end_bit, local_stop, &window, remaining, false)?;
+                chunk.output.append_clean(tail.output);
+                chunk.end_bit = tail.end_bit;
+                chunk.reached_stream_end = tail.reached_stream_end;
+            }
+            Ok::<_, NativeError>(chunk)
+        })();
+        match attempt {
+            Ok(mut chunk) => {
+                chunk.start_bit +=
+                    usize::try_from(base_bit).map_err(|_| NativeError::UnexpectedEof)?;
+                chunk.end_bit +=
+                    usize::try_from(base_bit).map_err(|_| NativeError::UnexpectedEof)?;
+                return Ok(chunk);
+            }
+            Err(_) => search_bit = local_start.saturating_add(1),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_native_chunk<O: Output>(
+    chunk: crate::parallel::deflate::Chunk,
+    config: &Config,
+    output: &mut O,
+    current_bit: &mut u64,
+    window: &mut Window,
+    accounting: &mut MemberAccounting,
+    total_output: &mut u64,
+) -> Result<bool, DecodeError> {
+    let reached_stream_end = chunk.reached_stream_end;
+    let end_bit = chunk.end_bit as u64;
+    let (marked, clean, backend_tail) =
+        chunk
+            .output
+            .resolve_parts(window)
+            .map_err(|_| DecodeError::InvalidDeflate {
+                bit_offset: *current_bit,
+                reason: DeflateErrorKind::InvalidData,
+            })?;
+    let decoded_size = marked
+        .len()
+        .saturating_add(clean.len())
+        .saturating_add(backend_tail.len()) as u64;
+    let next_total =
+        total_output
+            .checked_add(decoded_size)
+            .ok_or(DecodeError::OutputLimitExceeded {
+                limit: config.output_limit.unwrap_or(u64::MAX),
+            })?;
+    if config.output_limit.is_some_and(|limit| next_total > limit) {
+        return Err(DecodeError::OutputLimitExceeded {
+            limit: config.output_limit.expect("checked as some"),
+        });
+    }
+
+    *window = window.advanced_by(&marked);
+    *window = window.advanced_by(&clean);
+    *window = window.advanced_by(&backend_tail);
+    emit_accounted(marked, config, output, accounting, total_output)?;
+    emit_accounted(clean, config, output, accounting, total_output)?;
+    emit_accounted(backend_tail, config, output, accounting, total_output)?;
+    *current_bit = end_bit;
+    Ok(reached_stream_end)
+}
+
+fn validate_footer<R: ReadAt + ?Sized>(
+    cursor: &mut SourceCursor<'_, R>,
+    footer_offset: u64,
+    member: u64,
+    accounting: &MemberAccounting,
+) -> Result<u64, DecodeError> {
+    const MAX_BACKEND_READ_AHEAD: u64 = 16;
+    let actual_crc = accounting.crc.finish();
+    let actual_size = accounting.size;
+    let mut reported_footer = None;
+    let mut first_error = None;
+
+    for read_ahead in 0..=MAX_BACKEND_READ_AHEAD {
+        let candidate = footer_offset.saturating_sub(read_ahead);
+        if candidate.saturating_add(8) > cursor.length() {
+            continue;
+        }
+        if let Err(error) = cursor.seek(candidate) {
+            first_error.get_or_insert(error);
+            continue;
+        }
+        let footer = match cursor.read_exact::<8>(candidate) {
+            Ok(footer) => footer,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        let expected_crc = u32::from_le_bytes(footer[..4].try_into().expect("four bytes"));
+        let expected_size = u32::from_le_bytes(footer[4..].try_into().expect("four bytes"));
+        if read_ahead == 0 {
+            reported_footer = Some((expected_crc, expected_size));
+        }
+        if expected_crc == actual_crc && expected_size == actual_size {
+            return Ok(candidate);
+        }
+    }
+
+    let Some((expected_crc, expected_size)) = reported_footer else {
+        return Err(first_error.unwrap_or(DecodeError::InvalidGzip {
+            offset: footer_offset,
+            reason: GzipErrorKind::Truncated,
+        }));
+    };
+    if expected_crc != actual_crc {
+        return Err(DecodeError::ChecksumMismatch {
+            member,
+            expected: expected_crc,
+            actual: actual_crc,
+        });
+    }
+    if expected_size != actual_size {
+        return Err(DecodeError::SizeMismatch {
+            member,
+            expected: expected_size,
+            actual_mod32: actual_size,
+        });
+    }
+    unreachable!("a matching footer would have returned from the search")
+}
+
+fn decode_rapidgzip_estimated<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    compressed_chunk_size: usize,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    const SEARCH_BYTES: u64 = 512 * 1024;
+    const LOOKAHEAD_BYTES: u64 = 512 * 1024;
+    // This cursor touches only gzip headers and footers. Large pages would
+    // copy compressed payload that the positional workers read independently.
+    let mut frame_cursor = SourceCursor::new(source, config.input_page_size.min(256))?;
+    if frame_cursor.at_end() {
+        return Ok(DecodeReport {
+            compressed_bytes: 0,
+            decompressed_bytes: 0,
+            member_count: 0,
+            decoder_threads: config.decoder_threads,
+        });
+    }
+
+    let first_header = parse_member_header(&mut frame_cursor, true)?;
+    let first_deflate_bit = first_header.deflate_start.saturating_mul(8);
+    let length_bits = frame_cursor.length().saturating_mul(8);
+    let spacing_bits = (compressed_chunk_size as u64).saturating_mul(8);
+    let task_count = usize::try_from(
+        length_bits
+            .saturating_sub(first_deflate_bit)
+            .div_ceil(spacing_bits),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
+    let tasks: Vec<_> = (0..task_count)
+        .map(|index| {
+            let estimated_start =
+                first_deflate_bit.saturating_add((index as u64).saturating_mul(spacing_bits));
+            let estimated_stop = estimated_start.saturating_add(spacing_bits);
+            EstimatedTask {
+                search_start_bit: estimated_start,
+                search_end_bit: if index == 0 {
+                    estimated_start
+                } else {
+                    estimated_start
+                        .saturating_add(SEARCH_BYTES.saturating_mul(8))
+                        .min(estimated_stop)
+                        .min(length_bits)
+                },
+                estimated_stop_bit: estimated_stop,
+                read_end_bit: estimated_stop
+                    .saturating_add(LOOKAHEAD_BYTES.saturating_mul(8))
+                    .min(length_bits),
+                exact_start: index == 0,
+            }
+        })
+        .collect();
+    let maximum_output = config
+        .decoded_chunk_size
+        .max(compressed_chunk_size.saturating_mul(20));
+
+    let task_queue = Arc::new(Injector::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let available_tasks = Arc::new(AtomicUsize::new(0));
+    let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
+    let task_window = config
+        .in_flight_chunks
+        .max(config.decoder_threads)
+        .min(tasks.len());
+    for index in 0..task_window {
+        task_queue.push(index);
+    }
+    available_tasks.store(task_window, Ordering::Release);
+    let (sender, receiver) = mpsc::sync_channel::<NativeResult>(task_window);
+
+    let mut member_count = 0_u64;
+    let mut total_output = 0_u64;
+    let mut current_bit = first_deflate_bit;
+    let mut next_to_schedule = task_window;
+    let mut next_to_emit = 0_usize;
+    let mut pending = BTreeMap::new();
+
+    let scoped_result = thread::scope(|scope| -> Result<(), DecodeError> {
+        let _stop_on_exit = StopGuard(&stopped);
+        let worker_count = config.decoder_threads.min(tasks.len());
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&task_queue);
+            let sender = sender.clone();
+            let stopped = Arc::clone(&stopped);
+            let available_tasks = Arc::clone(&available_tasks);
+            let work_signal = Arc::clone(&work_signal);
+            let tasks = &tasks;
+            scope.spawn(move || {
+                let mut compressed = Vec::new();
+                loop {
+                    if stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match queue.steal() {
+                        Steal::Success(index) => {
+                            available_tasks.fetch_sub(1, Ordering::AcqRel);
+                            let result = run_estimated_task(
+                                source,
+                                &tasks[index],
+                                maximum_output,
+                                &mut compressed,
+                            );
+                            send_native_result(&sender, &stopped, NativeResult { index, result });
+                        }
+                        Steal::Retry => std::hint::spin_loop(),
+                        Steal::Empty => {
+                            let (lock, signal) = &*work_signal;
+                            let guard = lock.lock().expect("estimated work mutex poisoned");
+                            let _ = signal
+                                .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                                    available_tasks.load(Ordering::Acquire) == 0
+                                        && !stopped.load(Ordering::Relaxed)
+                                })
+                                .expect("estimated work mutex poisoned");
+                        }
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        let mut window = Window::empty();
+        let mut accounting = MemberAccounting::new();
+        let mut footer_offset = None;
+        let mut bridge_compressed = Vec::new();
+
+        'decode: loop {
+            if let Some(offset) = footer_offset.take() {
+                let actual_footer =
+                    validate_footer(&mut frame_cursor, offset, member_count, &accounting)?;
+                member_count += 1;
+                if actual_footer.saturating_add(8) == frame_cursor.length() {
+                    break 'decode;
+                }
+
+                let header = parse_member_header(&mut frame_cursor, false)?;
+                current_bit = header.deflate_start.saturating_mul(8);
+                window = Window::empty();
+                accounting = MemberAccounting::new();
+
+                // Use the first file-wide grid point strictly after this
+                // member header. The exact bridge chunk ends at the same
+                // independently discovered boundary where that regular task
+                // begins. Workers can therefore keep useful later-member
+                // tasks in flight while framing and history reset here.
+                let target_index = usize::try_from(
+                    current_bit
+                        .saturating_sub(first_deflate_bit)
+                        .div_euclid(spacing_bits)
+                        .saturating_add(1),
+                )
+                .unwrap_or(usize::MAX);
+                if target_index >= tasks.len() {
+                    footer_offset = Some(inflate_from_block(
+                        source,
+                        config,
+                        cancelled,
+                        output,
+                        current_bit,
+                        &window,
+                        &mut accounting,
+                        &mut total_output,
+                    )?);
+                    continue 'decode;
+                }
+
+                pending.retain(|index, _| *index >= target_index);
+                next_to_emit = target_index;
+                if next_to_schedule < target_index {
+                    next_to_schedule = target_index;
+                }
+                let schedule_end = target_index.saturating_add(task_window).min(tasks.len());
+                if next_to_schedule < schedule_end {
+                    let (lock, signal) = &*work_signal;
+                    let _guard = lock.lock().expect("estimated work mutex poisoned");
+                    while next_to_schedule < schedule_end {
+                        task_queue.push(next_to_schedule);
+                        available_tasks.fetch_add(1, Ordering::Release);
+                        next_to_schedule += 1;
+                    }
+                    signal.notify_all();
+                }
+
+                let bridge_stop = tasks[target_index].search_start_bit;
+                let bridge = EstimatedTask {
+                    search_start_bit: current_bit,
+                    search_end_bit: current_bit,
+                    estimated_stop_bit: bridge_stop,
+                    read_end_bit: bridge_stop
+                        .saturating_add(LOOKAHEAD_BYTES.saturating_mul(8))
+                        .min(length_bits),
+                    exact_start: true,
+                };
+                match run_estimated_task(source, &bridge, maximum_output, &mut bridge_compressed) {
+                    Ok(chunk) if chunk.start_bit as u64 == current_bit => {
+                        let reached_stream_end = commit_native_chunk(
+                            chunk,
+                            config,
+                            output,
+                            &mut current_bit,
+                            &mut window,
+                            &mut accounting,
+                            &mut total_output,
+                        )?;
+                        if reached_stream_end {
+                            footer_offset = Some(current_bit / 8);
+                        }
+                    }
+                    Ok(_) | Err(_) => {
+                        footer_offset = Some(inflate_from_block(
+                            source,
+                            config,
+                            cancelled,
+                            output,
+                            current_bit,
+                            &window,
+                            &mut accounting,
+                            &mut total_output,
+                        )?);
+                    }
+                }
+                continue 'decode;
+            }
+
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(DecodeError::Cancelled);
+            }
+            let result = loop {
+                if let Some(result) = pending.remove(&next_to_emit) {
+                    break result;
+                }
+                match receiver.recv_timeout(Duration::from_millis(10)) {
+                    Ok(result) if result.index < next_to_emit => {}
+                    Ok(result) => {
+                        pending.insert(result.index, result.result);
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return Err(DecodeError::Cancelled);
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(DecodeError::WorkerPanicked);
+                    }
+                }
+            };
+
+            match result {
+                Ok(chunk) if chunk.start_bit as u64 == current_bit => {
+                    let reached_stream_end = commit_native_chunk(
+                        chunk,
+                        config,
+                        output,
+                        &mut current_bit,
+                        &mut window,
+                        &mut accounting,
+                        &mut total_output,
+                    )?;
+                    next_to_emit += 1;
+                    let schedule_end = next_to_emit.saturating_add(task_window).min(tasks.len());
+                    if next_to_schedule < schedule_end {
+                        let (lock, signal) = &*work_signal;
+                        let _guard = lock.lock().expect("estimated work mutex poisoned");
+                        while next_to_schedule < schedule_end {
+                            task_queue.push(next_to_schedule);
+                            available_tasks.fetch_add(1, Ordering::Release);
+                            next_to_schedule += 1;
+                        }
+                        signal.notify_all();
+                    }
+                    if reached_stream_end {
+                        footer_offset = Some(current_bit / 8);
+                    } else if next_to_emit >= tasks.len() {
+                        footer_offset = Some(inflate_from_block(
+                            source,
+                            config,
+                            cancelled,
+                            output,
+                            current_bit,
+                            &window,
+                            &mut accounting,
+                            &mut total_output,
+                        )?);
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    footer_offset = Some(inflate_from_block(
+                        source,
+                        config,
+                        cancelled,
+                        output,
+                        current_bit,
+                        &window,
+                        &mut accounting,
+                        &mut total_output,
+                    )?);
+                }
+            }
+        }
+
+        stopped.store(true, Ordering::Relaxed);
+        work_signal.1.notify_all();
+        Ok(())
+    });
+    stopped.store(true, Ordering::Relaxed);
+    work_signal.1.notify_all();
+    scoped_result?;
+
+    let final_length = source
+        .len()
+        .map_err(|error| DecodeError::input_io(frame_cursor.position(), error))?;
+    if final_length != frame_cursor.length() {
+        return Err(DecodeError::input_io(
+            frame_cursor.position(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed source length changed during decoding",
+            ),
+        ));
+    }
+    Ok(DecodeReport {
+        compressed_bytes: frame_cursor.position(),
+        decompressed_bytes: total_output,
+        member_count,
+        decoder_threads: config.decoder_threads,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompressedRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BgzfRange {
+    start: u64,
+    deflate_start: u64,
+    end: u64,
+}
+
+fn index_bgzf<R: ReadAt + ?Sized>(
+    source: &R,
+    page_size: usize,
+) -> Result<Option<Vec<BgzfRange>>, DecodeError> {
+    let mut cursor = SourceCursor::new(source, page_size)?;
+    if cursor.at_end() {
+        return Ok(None);
+    }
+    let first = parse_member_header(&mut cursor, true)?;
+    let Some(first_size) = first.bgzf_block_size else {
+        return Ok(None);
+    };
+
+    let mut ranges = Vec::new();
+    let mut header = first;
+    let mut block_size = first_size;
+    loop {
+        let end = header.start.checked_add(u64::from(block_size) + 1).ok_or(
+            DecodeError::InvalidGzip {
+                offset: header.start,
+                reason: GzipErrorKind::Truncated,
+            },
+        )?;
+        if end > cursor.length() || end < header.deflate_start.saturating_add(8) {
+            return Ok(None);
+        }
+        ranges.push(BgzfRange {
+            start: header.start,
+            deflate_start: header.deflate_start,
+            end,
+        });
+        if end == cursor.length() {
+            break;
+        }
+        cursor.seek(end)?;
+        header = match parse_member_header(&mut cursor, false) {
+            Ok(header) => header,
+            Err(DecodeError::InvalidGzip { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(next_size) = header.bgzf_block_size else {
+            return Ok(None);
+        };
+        block_size = next_size;
+    }
+    Ok(Some(ranges))
+}
+
+struct BgzfResult {
+    index: usize,
+    result: Result<Vec<u8>, DecodeError>,
+}
+
+fn decode_bgzf_block_into<R: ReadAt + ?Sized>(
+    source: &R,
+    range: BgzfRange,
+    member: u64,
+    compressed: &mut Vec<u8>,
+    output: &mut Vec<u8>,
+    inflater: &mut RawInflater,
+) -> Result<(), DecodeError> {
+    const MAX_BGZF_OUTPUT: usize = 64 * 1024;
+    let compressed_length =
+        usize::try_from(range.end.saturating_sub(range.start)).map_err(|_| {
+            DecodeError::InvalidGzip {
+                offset: range.start,
+                reason: GzipErrorKind::Truncated,
+            }
+        })?;
+    read_range_reuse(source, range.start, compressed_length, compressed)?;
+    let local_deflate =
+        usize::try_from(range.deflate_start.saturating_sub(range.start)).map_err(|_| {
+            DecodeError::InvalidGzip {
+                offset: range.start,
+                reason: GzipErrorKind::Truncated,
+            }
+        })?;
+    let footer_start = compressed_length
+        .checked_sub(8)
+        .ok_or(DecodeError::InvalidGzip {
+            offset: range.start,
+            reason: GzipErrorKind::Truncated,
+        })?;
+    let payload = compressed
+        .get(local_deflate..footer_start)
+        .ok_or(DecodeError::InvalidGzip {
+            offset: range.start,
+            reason: GzipErrorKind::Truncated,
+        })?;
+    let footer = &compressed[footer_start..];
+    let expected_crc = u32::from_le_bytes(footer[..4].try_into().expect("four bytes"));
+    let expected_size = u32::from_le_bytes(footer[4..].try_into().expect("four bytes"));
+    let decoded_length = usize::try_from(expected_size).map_err(|_| DecodeError::InvalidGzip {
+        offset: range.start,
+        reason: GzipErrorKind::Truncated,
+    })?;
+    if decoded_length > MAX_BGZF_OUTPUT {
+        return Err(DecodeError::InvalidGzip {
+            offset: range.start,
+            reason: GzipErrorKind::Truncated,
+        });
+    }
+
+    inflater.reset(range.deflate_start.saturating_mul(8))?;
+    let old_length = output.len();
+    let writable = decoded_length.saturating_add(1);
+    output.reserve(writable);
+    let spare = output.spare_capacity_mut();
+    inflater.stream.next_in = payload.as_ptr();
+    inflater.stream.avail_in = payload.len() as u32;
+    inflater.stream.next_out = spare.as_mut_ptr().cast::<u8>();
+    inflater.stream.avail_out = writable as u32;
+    let input_before = inflater.stream.avail_in;
+    let output_before = inflater.stream.avail_out;
+
+    // SAFETY: `payload` remains live for the call and fits BGZF's 64 KiB
+    // compressed-block bound. `output.reserve` provided at least `writable`
+    // bytes of valid uninitialized spare capacity, exactly matching
+    // `avail_out`; zlib writes them before Rust observes them.
+    let status = unsafe { z::inflate(&mut inflater.stream, z::Z_FINISH) };
+    let consumed =
+        usize::try_from(input_before - inflater.stream.avail_in).expect("zlib uInt fits usize");
+    let produced =
+        usize::try_from(output_before - inflater.stream.avail_out).expect("zlib uInt fits usize");
+    if status != z::Z_STREAM_END || consumed != payload.len() || produced != decoded_length {
+        return Err(DecodeError::InvalidDeflate {
+            bit_offset: range.deflate_start.saturating_mul(8),
+            reason: if status == z::Z_DATA_ERROR {
+                DeflateErrorKind::InvalidData
+            } else {
+                DeflateErrorKind::BackendStatus(status)
+            },
+        });
+    }
+    // SAFETY: zlib reported `produced` bytes written through `next_out`, and
+    // that pointer covered `writable` bytes in this vector's spare capacity.
+    unsafe {
+        output.set_len(old_length + produced);
+    }
+    let mut crc = Crc32::new();
+    crc.update(&output[old_length..]);
+    let actual_crc = crc.finish();
+    if actual_crc != expected_crc {
+        return Err(DecodeError::ChecksumMismatch {
+            member,
+            expected: expected_crc,
+            actual: actual_crc,
+        });
+    }
+    Ok(())
+}
+
+fn send_bgzf_result(
+    sender: &mpsc::SyncSender<BgzfResult>,
+    stopped: &AtomicBool,
+    mut result: BgzfResult,
+) {
+    loop {
+        if stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        match sender.try_send(result) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(returned)) => {
+                result = returned;
+                thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn decode_bgzf_parallel<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    ranges: &[BgzfRange],
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    const BLOCKS_PER_TASK: usize = 8;
+    let task_count = ranges.len().div_ceil(BLOCKS_PER_TASK);
+    let worker_count = config.decoder_threads.min(task_count);
+    let task_queue = Arc::new(Injector::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let available_tasks = Arc::new(AtomicUsize::new(0));
+    let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
+    let task_window = worker_count;
+    let pending_limit = config.in_flight_chunks.max(worker_count);
+    for index in 0..task_window {
+        task_queue.push(index);
+    }
+    available_tasks.store(task_window, Ordering::Release);
+    let (sender, receiver) = mpsc::sync_channel::<BgzfResult>(pending_limit);
+    let mut next_to_schedule = task_window;
+    let mut next_to_emit = 0;
+    let mut running = task_window;
+    let mut reordered = BTreeMap::new();
+    let mut total_output = 0_u64;
+
+    let scoped_result = thread::scope(|scope| -> Result<(), DecodeError> {
+        let _stop_on_exit = StopGuard(&stopped);
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&task_queue);
+            let worker_stopped = Arc::clone(&stopped);
+            let available_tasks = Arc::clone(&available_tasks);
+            let work_signal = Arc::clone(&work_signal);
+            let sender = sender.clone();
+            scope.spawn(move || {
+                let mut compressed = Vec::new();
+                let mut inflater = None;
+
+                while !worker_stopped.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed)
+                {
+                    let index = loop {
+                        match queue.steal() {
+                            Steal::Success(index) => {
+                                available_tasks.fetch_sub(1, Ordering::AcqRel);
+                                break index;
+                            }
+                            Steal::Retry => std::hint::spin_loop(),
+                            Steal::Empty => {
+                                if worker_stopped.load(Ordering::Relaxed)
+                                    || cancelled.load(Ordering::Relaxed)
+                                {
+                                    return;
+                                }
+                                let (lock, signal) = &*work_signal;
+                                let guard = lock.lock().expect("BGZF work mutex poisoned");
+                                let _ = signal
+                                    .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                                        available_tasks.load(Ordering::Acquire) == 0
+                                            && !worker_stopped.load(Ordering::Relaxed)
+                                            && !cancelled.load(Ordering::Relaxed)
+                                    })
+                                    .expect("BGZF work mutex poisoned");
+                            }
+                        }
+                    };
+                    let first_block = index * BLOCKS_PER_TASK;
+                    let past_last_block = (first_block + BLOCKS_PER_TASK).min(ranges.len());
+                    let mut decoded = Vec::with_capacity(
+                        (past_last_block - first_block).saturating_mul(64 * 1024),
+                    );
+                    let result = (|| {
+                        if inflater.is_none() {
+                            inflater = Some(RawInflater::new()?);
+                        }
+                        let inflater = inflater
+                            .as_mut()
+                            .expect("the inflater was initialized immediately above");
+                        for (range_index, &range) in ranges
+                            .iter()
+                            .enumerate()
+                            .take(past_last_block)
+                            .skip(first_block)
+                        {
+                            if cancelled.load(Ordering::Relaxed) {
+                                return Err(DecodeError::Cancelled);
+                            }
+                            decode_bgzf_block_into(
+                                source,
+                                range,
+                                range_index as u64,
+                                &mut compressed,
+                                &mut decoded,
+                                inflater,
+                            )?;
+                        }
+                        Ok(decoded)
+                    })();
+                    send_bgzf_result(&sender, &worker_stopped, BgzfResult { index, result });
+                }
+            });
+        }
+        drop(sender);
+
+        while next_to_emit < task_count {
+            if cancelled.load(Ordering::Relaxed) {
+                stopped.store(true, Ordering::Relaxed);
+                return Err(DecodeError::Cancelled);
+            }
+            let result = match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => {
+                    running = running.saturating_sub(1);
+                    result
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    stopped.store(true, Ordering::Relaxed);
+                    return Err(DecodeError::WorkerPanicked);
+                }
+            };
+            reordered.insert(result.index, result.result);
+
+            while let Some(result) = reordered.remove(&next_to_emit) {
+                let decoded = match result {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        stopped.store(true, Ordering::Relaxed);
+                        return Err(error);
+                    }
+                };
+                let next_total = total_output.checked_add(decoded.len() as u64).ok_or(
+                    DecodeError::OutputLimitExceeded {
+                        limit: config.output_limit.unwrap_or(u64::MAX),
+                    },
+                )?;
+                if config.output_limit.is_some_and(|limit| next_total > limit) {
+                    stopped.store(true, Ordering::Relaxed);
+                    return Err(DecodeError::OutputLimitExceeded {
+                        limit: config.output_limit.expect("checked as some"),
+                    });
+                }
+                total_output = next_total;
+                if !decoded.is_empty() {
+                    output.emit(decoded)?;
+                }
+                next_to_emit += 1;
+            }
+
+            while running < worker_count
+                && next_to_schedule < task_count
+                && reordered.len() < pending_limit
+            {
+                let (lock, signal) = &*work_signal;
+                let _guard = lock.lock().expect("BGZF work mutex poisoned");
+                task_queue.push(next_to_schedule);
+                available_tasks.fetch_add(1, Ordering::Release);
+                next_to_schedule += 1;
+                running += 1;
+                signal.notify_one();
+            }
+        }
+        stopped.store(true, Ordering::Relaxed);
+        Ok(())
+    });
+    stopped.store(true, Ordering::Relaxed);
+    scoped_result?;
+
+    let final_length = source.len().map_err(|error| {
+        DecodeError::input_io(ranges.last().map_or(0, |range| range.end), error)
+    })?;
+    let compressed_bytes = ranges.last().map_or(0, |range| range.end);
+    if final_length != compressed_bytes {
+        return Err(DecodeError::input_io(
+            compressed_bytes,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed source length changed during decoding",
+            ),
+        ));
+    }
+
+    Ok(DecodeReport {
+        compressed_bytes,
+        decompressed_bytes: total_output,
+        member_count: ranges.len() as u64,
+        decoder_threads: config.decoder_threads,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MemberAccounting, SourceCursor, Window, inflate_tail, validate_footer};
+
+    #[test]
+    fn zlib_rs_tail_stops_at_exact_stored_block_boundary() {
+        let encoded = [
+            0, 5, 0, 250, 255, b'h', b'e', b'l', b'l', b'o', 1, 5, 0, 250, 255, b'w', b'o', b'r',
+            b'l', b'd',
+        ];
+        let first_block_end = 10 * 8;
+        let tail =
+            inflate_tail(&encoded, 0, first_block_end, &Window::empty(), 1024, true).unwrap();
+        assert_eq!(tail.output, b"hello");
+        assert_eq!(tail.end_bit, first_block_end);
+        assert!(!tail.reached_stream_end);
+    }
+
+    #[test]
+    fn footer_validation_recovers_backend_read_ahead() {
+        let mut accounting = MemberAccounting::new();
+        accounting.crc.update(b"hello");
+        accounting.size = 5;
+
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&accounting.crc.finish().to_le_bytes());
+        encoded.extend_from_slice(&accounting.size.to_le_bytes());
+        encoded.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+
+        let mut cursor = SourceCursor::new(encoded.as_slice(), 4).unwrap();
+        assert_eq!(validate_footer(&mut cursor, 6, 0, &accounting).unwrap(), 0);
+        assert_eq!(cursor.position(), 8);
+    }
+}

@@ -1,0 +1,5 @@
+/target/
+/benchmark-results/
+*.profraw
+*.profdata
+/perf.data
