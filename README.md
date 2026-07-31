@@ -29,12 +29,14 @@ io::copy(&mut input, &mut io::sink())?;
 paraseq. Parallel input is expressed through the documented `ReadAt` trait;
 files, byte vectors, slices, `Arc<T>`, and `Box<T>` are supported.
 
-The implementation meets the zlib-ng C++ parity gate for single-member gzip,
-ordinary concatenated gzip, and BGZF at 1, 4, 16, and 44 workers on the current
-validation machine. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the implementation and
-[BENCHMARKING.md](BENCHMARKING.md) for reproducible comparisons and exact
-measurements.
+The implementation meets the provisional zlib-ng C++ gate on the synthetic
+single-member, concatenated-member, and BGZF validation corpus. A public FASTQ
+benchmark also exposed a substantial generic-stream scaling gap against
+ISA-L-enabled C++ rapidgzip; that is the next performance milestone. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the implementation,
+[BENCHMARKING.md](BENCHMARKING.md) for reproducible measurements, and
+[PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md) for the evidence and proposed
+optimization order.
 
 ## Releasing
 
