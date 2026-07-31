@@ -84,9 +84,9 @@ The 362 MB decoded corpus is intentionally realistic but too small to saturate
 44 cores, so the high-thread results include material startup, allocation, and
 NUMA overhead.
 
-The Rust binary was commit `d0d2c0334ed6b18d5190986853c1eb9ef1e4065e`,
-rustc 1.91.1, zlib-rs/libz-rs-sys 0.6.6, thin LTO, and one codegen unit. Both
-C++ binaries were rapidgzip 0.16.0 at commit
+The Rust binary was the optimized source represented by this snapshot, built
+with rustc 1.91.1, zlib-rs/libz-rs-sys 0.6.6, thin LTO, and one codegen unit.
+Both C++ binaries were rapidgzip 0.16.0 at commit
 `d2350e9c9ba54398cd64e45bfc8c631beec017f0`; one enabled its vendored ISA-L and
 zlib-ng, and the control disabled ISA-L while retaining zlib-ng. gzippy was
 0.8.0 at commit `fa2862a44af0c3123758c2d8990e934da9b55971` in its pure-Rust
@@ -108,48 +108,50 @@ taskset -c 0-43 env \
 Each cell had two warmups and nine measured runs. Rust used `-t`; both C++
 builds used `-t --verify`; gzippy used `-d -c` to a discard sink because its
 `--test` path did not honor the requested one-thread budget in this build.
-Normal gzippy decompression verifies the gzip footer. Median decoded throughput
-in MiB/s is:
+Normal gzippy decompression verifies the gzip footer. Thread columns are
+requested worker budgets. The generic Rust marker pipeline deliberately caps
+its active decode/resolve window at 16 tasks: on this dual-socket machine,
+larger speculative windows increased memory traffic and reduced throughput.
+Other Rust paths may use the complete budget. Median decoded throughput in
+MiB/s is:
 
 | decoder | 1 | 4 | 16 | 44 |
 |---|---:|---:|---:|---:|
-| rapidgzip-rust, zlib-rs | 605.8 | 328.2 | 396.5 | 272.5 |
-| C++ rapidgzip, ISA-L enabled | 711.8 | 621.2 | 1,578.4 | 1,489.9 |
-| C++ rapidgzip, zlib-ng only | 289.3 | 556.0 | 1,467.7 | 1,348.5 |
-| gzippy | 786.2 | 759.5 | 1,972.3 | 1,379.1 |
+| rapidgzip-rust, zlib-rs | 631.4 | 777.1 | 1,725.9 | 1,660.7 |
+| C++ rapidgzip, ISA-L enabled | 710.9 | 621.7 | 1,602.0 | 1,547.3 |
+| C++ rapidgzip, zlib-ng only | 291.4 | 559.9 | 1,421.3 | 1,451.6 |
+| gzippy | 800.2 | 765.1 | 1,952.8 | 1,477.7 |
 
 Median wall time in seconds, with the measured minimum--maximum in parentheses:
 
 | decoder | 1 | 4 | 16 | 44 |
 |---|---:|---:|---:|---:|
-| rapidgzip-rust, zlib-rs | 0.570 (0.541--0.592) | 1.051 (0.976--1.155) | 0.870 (0.835--0.969) | 1.266 (1.199--1.342) |
-| C++ rapidgzip, ISA-L enabled | 0.485 (0.475--0.520) | 0.556 (0.547--0.590) | 0.219 (0.203--0.242) | 0.232 (0.211--0.292) |
-| C++ rapidgzip, zlib-ng only | 1.193 (1.178--1.253) | 0.621 (0.593--0.641) | 0.235 (0.222--0.248) | 0.256 (0.196--0.274) |
-| gzippy | 0.439 (0.388--0.460) | 0.454 (0.444--0.488) | 0.175 (0.166--0.188) | 0.250 (0.199--0.401) |
+| rapidgzip-rust, zlib-rs | 0.547 (0.531--0.599) | 0.444 (0.412--0.478) | 0.200 (0.195--0.221) | 0.208 (0.201--0.220) |
+| C++ rapidgzip, ISA-L enabled | 0.485 (0.464--0.524) | 0.555 (0.543--0.605) | 0.215 (0.196--0.236) | 0.223 (0.196--0.299) |
+| C++ rapidgzip, zlib-ng only | 1.184 (1.162--1.222) | 0.616 (0.605--0.662) | 0.243 (0.211--0.289) | 0.238 (0.207--0.417) |
+| gzippy | 0.431 (0.380--0.445) | 0.451 (0.432--0.478) | 0.177 (0.158--0.207) | 0.234 (0.182--0.293) |
 
-Median peak RSS in KiB was:
+The maximum peak RSS observed across the nine measured runs, in KiB, was:
 
 | decoder | 1 | 4 | 16 | 44 |
 |---|---:|---:|---:|---:|
-| rapidgzip-rust, zlib-rs | 7,776 | 109,068 | 308,032 | 535,628 |
-| C++ rapidgzip, ISA-L enabled | 49,916 | 170,732 | 474,528 | 697,276 |
-| C++ rapidgzip, zlib-ng only | 55,292 | 170,608 | 486,892 | 698,032 |
-| gzippy | 23,944 | 203,624 | 370,176 | 606,356 |
+| rapidgzip-rust, zlib-rs | 7,972 | 129,848 | 388,876 | 384,548 |
+| C++ rapidgzip, ISA-L enabled | 50,112 | 228,580 | 503,796 | 723,632 |
+| C++ rapidgzip, zlib-ng only | 55,356 | 210,224 | 517,068 | 737,824 |
+| gzippy | 24,096 | 207,596 | 550,392 | 762,416 |
 
-At one thread, Rust reaches 85.1% of ISA-L-enabled rapidgzip and is 2.09 times
-the zlib-ng-only control. At 4, 16, and 44 workers it reaches only 52.8%, 25.1%,
-and 18.3% of the ISA-L-enabled result. Median Rust user CPU rises from 0.54 s at
-one worker to 4.44, 5.64, and 6.99 s respectively, so this is redundant or
-inefficient decode work rather than output or storage throughput. Upstream
-rapidgzip specifically identifies long LZ77 backreferences in this FASTQ as a
-case where speculative chunks cannot readily fall back to ISA-L. The local
-profile and proposed response are in
-[PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md).
+Against the zlib-ng-only C++ control, Rust reaches 216.7%, 138.8%, 121.4%, and
+114.4% at budgets 1, 4, 16, and 44, for a 143.0% geometric mean. This clears
+the intermediate FASTQ gate of at least 95% in every cell and at least 100%
+geometric mean. Its maximum observed RSS is also lower in every cell.
 
-gzippy is the fastest program at 1, 4, and 16 workers on this corpus. That is
-important evidence that an ISA-L-class result does not inherently require an
-ISA-L binding. The 44-worker gzippy and both rapidgzip results are more variable,
-as expected for such a small corpus on a two-socket host.
+Against ISA-L-enabled rapidgzip, Rust reaches 88.8%, 125.0%, 107.7%, and
+107.3%, for a 106.4% geometric mean. The remaining ISA-L parity failure is now
+confined to the one-worker cell. gzippy's 800.2 MiB/s one-worker result is
+further evidence that closing it does not inherently require an ISA-L binding.
+The 44-budget competitor results are variable, as expected for this corpus on
+a two-socket host. Implementation evidence and the next optimization targets
+are recorded in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md).
 
 ## 2026-07-31 synthetic parity snapshot
 

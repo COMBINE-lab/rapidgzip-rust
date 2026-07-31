@@ -59,7 +59,11 @@ impl Default for DecoderBuilder {
 }
 
 impl DecoderBuilder {
-    /// Sets the exact number of decoder workers.
+    /// Sets the maximum decoder-worker budget.
+    ///
+    /// Individual paths may use fewer active workers when the input exposes
+    /// less parallelism or when a larger speculative window would reduce
+    /// throughput through memory pressure.
     pub const fn decoder_threads(mut self, threads: usize) -> Self {
         self.config.decoder_threads = threads;
         self.config.in_flight_chunks = threads.saturating_add(2);

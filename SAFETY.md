@@ -38,10 +38,13 @@ decode from an output-buffer exhaustion condition, including empty EOF blocks.
 
 ## Native DEFLATE bit loads
 
-The hot bit reader performs an unaligned `u64` load only after proving that
-eight bytes remain beginning at the requested offset. `read_unaligned` removes
-the alignment requirement; conversion with `to_le` gives the RFC 1951 stream
-bit order on every target. The short end-of-input path is entirely safe Rust.
+The hot bit reader and Huffman peek perform an unaligned `u64` load only after
+proving that eight bytes remain beginning at the requested offset.
+`read_unaligned` removes the alignment requirement; conversion with `to_le`
+gives the RFC 1951 stream bit order on every target. A read requests at most 24
+bits and a peek at most 15, so either fits in the loaded word even at the
+largest seven-bit starting shift. The short end-of-input path is entirely safe
+Rust and retains the authoritative EOF checks.
 
 ## SIMD marker replacement
 
@@ -53,3 +56,10 @@ containing any marker use the scalar checked mapper.
 The AArch64 implementation relies on baseline NEON. Its eight-lane loads and
 stores use the same chunk bounds. Both implementations are differentially
 tested against scalar replacement with mixed literal/marker input.
+
+Large marker buffers with a complete predecessor window use a branch-free
+64 KiB lookup table. The output vector reserves exactly one byte per input
+symbol. A safe loop writes every corresponding `MaybeUninit<u8>` slot in its
+spare capacity exactly once; only then does one `Vec::set_len` expose precisely
+that initialized count. The allocation does not move during the loop and no
+uninitialized byte is read.

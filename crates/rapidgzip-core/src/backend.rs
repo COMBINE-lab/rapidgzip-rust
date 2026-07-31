@@ -3,7 +3,7 @@ use crate::crc32::Crc32;
 use crate::gzip::{SourceCursor, parse_member_header};
 use crate::parallel::Window;
 use crate::parallel::deflate::{
-    Error as NativeError, InitialHistory, decode_to_estimated_boundary,
+    ChunkOutput, Error as NativeError, InitialHistory, ResolvedParts, decode_to_estimated_boundary,
     find_next_structural_candidate,
 };
 use crate::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ReadAt};
@@ -849,10 +849,40 @@ struct NativeResult {
     result: Result<crate::parallel::deflate::Chunk, NativeError>,
 }
 
+struct ResolveTask {
+    sequence: usize,
+    predecessor: Window,
+    output: ChunkOutput,
+}
+
+struct ResolveResult {
+    sequence: usize,
+    result: Result<ResolvedParts, crate::parallel::MarkerError>,
+}
+
 fn send_native_result(
     sender: &mpsc::SyncSender<NativeResult>,
     stopped: &AtomicBool,
     mut result: NativeResult,
+) {
+    loop {
+        if stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        match sender.try_send(result) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(returned)) => {
+                result = returned;
+                thread::park_timeout(Duration::from_micros(25));
+            }
+        }
+    }
+}
+
+fn send_resolve_result(
+    sender: &mpsc::SyncSender<ResolveResult>,
+    stopped: &AtomicBool,
+    mut result: ResolveResult,
 ) {
     loop {
         if stopped.load(Ordering::Relaxed) {
@@ -1016,7 +1046,7 @@ fn run_estimated_task<R: ReadAt + ?Sized>(
             maximum_output,
             false,
         )?;
-        return Ok(crate::parallel::deflate::Chunk {
+        let chunk = crate::parallel::deflate::Chunk {
             start_bit: usize::try_from(task.search_start_bit)
                 .map_err(|_| NativeError::UnexpectedEof)?,
             end_bit: tail
@@ -1026,7 +1056,8 @@ fn run_estimated_task<R: ReadAt + ?Sized>(
             output: crate::parallel::deflate::ChunkOutput::from_clean(tail.output),
             reached_stream_end: tail.reached_stream_end,
             backend_continuation: None,
-        });
+        };
+        return Ok(chunk);
     }
     let mut search_bit = local_search_start;
 
@@ -1064,50 +1095,147 @@ fn run_estimated_task<R: ReadAt + ?Sized>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn commit_native_chunk<O: Output>(
+struct PreparedNativeChunk {
+    task: ResolveTask,
+    next_window: Window,
+    end_bit: u64,
+    reached_stream_end: bool,
+    decoded_size: usize,
+}
+
+fn prepare_native_chunk(
     chunk: crate::parallel::deflate::Chunk,
-    config: &Config,
-    output: &mut O,
-    current_bit: &mut u64,
-    window: &mut Window,
-    accounting: &mut MemberAccounting,
-    total_output: &mut u64,
-) -> Result<bool, DecodeError> {
-    let reached_stream_end = chunk.reached_stream_end;
-    let end_bit = chunk.end_bit as u64;
-    let (marked, clean, backend_tail) =
+    sequence: usize,
+    predecessor: &Window,
+    bit_offset: u64,
+) -> Result<PreparedNativeChunk, DecodeError> {
+    let decoded_size = chunk.output.len();
+    let next_window =
         chunk
             .output
-            .resolve_parts(window)
+            .window_after(predecessor)
             .map_err(|_| DecodeError::InvalidDeflate {
-                bit_offset: *current_bit,
+                bit_offset,
                 reason: DeflateErrorKind::InvalidData,
             })?;
-    let decoded_size = marked
-        .len()
-        .saturating_add(clean.len())
-        .saturating_add(backend_tail.len()) as u64;
-    let next_total =
-        total_output
-            .checked_add(decoded_size)
-            .ok_or(DecodeError::OutputLimitExceeded {
-                limit: config.output_limit.unwrap_or(u64::MAX),
-            })?;
+    Ok(PreparedNativeChunk {
+        task: ResolveTask {
+            sequence,
+            predecessor: predecessor.clone(),
+            output: chunk.output,
+        },
+        next_window,
+        end_bit: chunk.end_bit as u64,
+        reached_stream_end: chunk.reached_stream_end,
+        decoded_size,
+    })
+}
+
+fn emit_resolved_parts<O: Output>(
+    parts: ResolvedParts,
+    config: &Config,
+    output: &mut O,
+    accounting: &mut MemberAccounting,
+    total_output: &mut u64,
+) -> Result<(), DecodeError> {
+    let (marked, clean, backend_tail) = parts;
+    emit_accounted(marked, config, output, accounting, total_output)?;
+    emit_accounted(clean, config, output, accounting, total_output)?;
+    emit_accounted(backend_tail, config, output, accounting, total_output)?;
+    Ok(())
+}
+
+fn wait_for_resolved(
+    receiver: &mpsc::Receiver<ResolveResult>,
+    pending: &mut BTreeMap<usize, Result<ResolvedParts, crate::parallel::MarkerError>>,
+    next_sequence: usize,
+    cancelled: &AtomicBool,
+    bit_offset: u64,
+) -> Result<ResolvedParts, DecodeError> {
+    let result = loop {
+        if let Some(result) = pending.remove(&next_sequence) {
+            break result;
+        }
+        match receiver.recv_timeout(Duration::from_millis(10)) {
+            Ok(result) if result.sequence < next_sequence => {}
+            Ok(result) => {
+                pending.insert(result.sequence, result.result);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(DecodeError::Cancelled);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(DecodeError::WorkerPanicked);
+            }
+        }
+    };
+    result.map_err(|_| DecodeError::InvalidDeflate {
+        bit_offset,
+        reason: DeflateErrorKind::InvalidData,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_native_resolution(
+    chunk: crate::parallel::deflate::Chunk,
+    config: &Config,
+    current_bit: &mut u64,
+    window: &mut Window,
+    prepared_total: &mut u64,
+    next_sequence: &mut usize,
+    outstanding: &mut usize,
+    queue: &Injector<ResolveTask>,
+    available_resolve_tasks: &AtomicUsize,
+    work_signal: &(Mutex<()>, Condvar),
+) -> Result<bool, DecodeError> {
+    let prepared = prepare_native_chunk(chunk, *next_sequence, window, *current_bit)?;
+    let next_total = prepared_total
+        .checked_add(prepared.decoded_size as u64)
+        .ok_or(DecodeError::OutputLimitExceeded {
+            limit: config.output_limit.unwrap_or(u64::MAX),
+        })?;
     if config.output_limit.is_some_and(|limit| next_total > limit) {
         return Err(DecodeError::OutputLimitExceeded {
             limit: config.output_limit.expect("checked as some"),
         });
     }
 
-    *window = window.advanced_by(&marked);
-    *window = window.advanced_by(&clean);
-    *window = window.advanced_by(&backend_tail);
-    emit_accounted(marked, config, output, accounting, total_output)?;
-    emit_accounted(clean, config, output, accounting, total_output)?;
-    emit_accounted(backend_tail, config, output, accounting, total_output)?;
-    *current_bit = end_bit;
+    let reached_stream_end = prepared.reached_stream_end;
+    *prepared_total = next_total;
+    *current_bit = prepared.end_bit;
+    *window = prepared.next_window;
+    *next_sequence += 1;
+    *outstanding += 1;
+    let (lock, signal) = work_signal;
+    let _guard = lock.lock().expect("estimated work mutex poisoned");
+    queue.push(prepared.task);
+    available_resolve_tasks.fetch_add(1, Ordering::Release);
+    signal.notify_all();
     Ok(reached_stream_end)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_native_resolutions<O: Output>(
+    receiver: &mpsc::Receiver<ResolveResult>,
+    pending: &mut BTreeMap<usize, Result<ResolvedParts, crate::parallel::MarkerError>>,
+    next_sequence: &mut usize,
+    outstanding: &mut usize,
+    cancelled: &AtomicBool,
+    bit_offset: u64,
+    config: &Config,
+    output: &mut O,
+    accounting: &mut MemberAccounting,
+    total_output: &mut u64,
+) -> Result<(), DecodeError> {
+    while *outstanding != 0 {
+        let parts = wait_for_resolved(receiver, pending, *next_sequence, cancelled, bit_offset)?;
+        emit_resolved_parts(parts, config, output, accounting, total_output)?;
+        *next_sequence += 1;
+        *outstanding -= 1;
+    }
+    Ok(())
 }
 
 fn validate_footer<R: ReadAt + ?Sized>(
@@ -1184,6 +1312,11 @@ where
 {
     const SEARCH_BYTES: u64 = 512 * 1024;
     const LOOKAHEAD_BYTES: u64 = 512 * 1024;
+    // A native result stores speculative symbols as u16 until its predecessor
+    // window is known. Bounding both the active workers and combined
+    // decode/resolve pipeline avoids memory-bandwidth collapse and prevents
+    // high thread budgets from faulting hundreds of MiB on NUMA hosts.
+    const MAX_NATIVE_TASK_WINDOW: usize = 16;
     // This cursor touches only gzip headers and footers. Large pages would
     // copy compressed payload that the positional workers read independently.
     let mut frame_cursor = SourceCursor::new(source, config.input_page_size.min(256))?;
@@ -1233,20 +1366,23 @@ where
     let maximum_output = config
         .decoded_chunk_size
         .max(compressed_chunk_size.saturating_mul(20));
-
     let task_queue = Arc::new(Injector::new());
+    let resolve_queue = Arc::new(Injector::<ResolveTask>::new());
     let stopped = Arc::new(AtomicBool::new(false));
-    let available_tasks = Arc::new(AtomicUsize::new(0));
+    let available_decode_tasks = Arc::new(AtomicUsize::new(0));
+    let available_resolve_tasks = Arc::new(AtomicUsize::new(0));
     let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
     let task_window = config
         .in_flight_chunks
         .max(config.decoder_threads)
+        .min(MAX_NATIVE_TASK_WINDOW)
         .min(tasks.len());
     for index in 0..task_window {
         task_queue.push(index);
     }
-    available_tasks.store(task_window, Ordering::Release);
+    available_decode_tasks.store(task_window, Ordering::Release);
     let (sender, receiver) = mpsc::sync_channel::<NativeResult>(task_window);
+    let (resolve_sender, resolve_receiver) = mpsc::sync_channel::<ResolveResult>(task_window);
 
     let mut member_count = 0_u64;
     let mut total_output = 0_u64;
@@ -1254,15 +1390,23 @@ where
     let mut next_to_schedule = task_window;
     let mut next_to_emit = 0_usize;
     let mut pending = BTreeMap::new();
+    let mut prepared_total_output = 0_u64;
+    let mut next_resolve_sequence = 0_usize;
+    let mut next_resolve_to_emit = 0_usize;
+    let mut outstanding_resolves = 0_usize;
+    let mut resolve_pending = BTreeMap::new();
 
     let scoped_result = thread::scope(|scope| -> Result<(), DecodeError> {
         let _stop_on_exit = StopGuard(&stopped);
-        let worker_count = config.decoder_threads.min(tasks.len());
+        let worker_count = config.decoder_threads.min(tasks.len()).min(task_window);
         for _ in 0..worker_count {
             let queue = Arc::clone(&task_queue);
+            let resolve_queue = Arc::clone(&resolve_queue);
             let sender = sender.clone();
+            let resolve_sender = resolve_sender.clone();
             let stopped = Arc::clone(&stopped);
-            let available_tasks = Arc::clone(&available_tasks);
+            let available_decode_tasks = Arc::clone(&available_decode_tasks);
+            let available_resolve_tasks = Arc::clone(&available_resolve_tasks);
             let work_signal = Arc::clone(&work_signal);
             let tasks = &tasks;
             scope.spawn(move || {
@@ -1271,9 +1415,29 @@ where
                     if stopped.load(Ordering::Relaxed) {
                         break;
                     }
+                    match resolve_queue.steal() {
+                        Steal::Success(task) => {
+                            available_resolve_tasks.fetch_sub(1, Ordering::AcqRel);
+                            let result = task.output.resolve_parts(&task.predecessor);
+                            send_resolve_result(
+                                &resolve_sender,
+                                &stopped,
+                                ResolveResult {
+                                    sequence: task.sequence,
+                                    result,
+                                },
+                            );
+                            continue;
+                        }
+                        Steal::Retry => {
+                            std::hint::spin_loop();
+                            continue;
+                        }
+                        Steal::Empty => {}
+                    }
                     match queue.steal() {
                         Steal::Success(index) => {
-                            available_tasks.fetch_sub(1, Ordering::AcqRel);
+                            available_decode_tasks.fetch_sub(1, Ordering::AcqRel);
                             let result = run_estimated_task(
                                 source,
                                 &tasks[index],
@@ -1281,23 +1445,28 @@ where
                                 &mut compressed,
                             );
                             send_native_result(&sender, &stopped, NativeResult { index, result });
+                            continue;
                         }
-                        Steal::Retry => std::hint::spin_loop(),
-                        Steal::Empty => {
-                            let (lock, signal) = &*work_signal;
-                            let guard = lock.lock().expect("estimated work mutex poisoned");
-                            let _ = signal
-                                .wait_timeout_while(guard, Duration::from_millis(1), |_| {
-                                    available_tasks.load(Ordering::Acquire) == 0
-                                        && !stopped.load(Ordering::Relaxed)
-                                })
-                                .expect("estimated work mutex poisoned");
+                        Steal::Retry => {
+                            std::hint::spin_loop();
+                            continue;
                         }
+                        Steal::Empty => {}
                     }
+                    let (lock, signal) = &*work_signal;
+                    let guard = lock.lock().expect("estimated work mutex poisoned");
+                    let _ = signal
+                        .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                            available_decode_tasks.load(Ordering::Acquire) == 0
+                                && available_resolve_tasks.load(Ordering::Acquire) == 0
+                                && !stopped.load(Ordering::Relaxed)
+                        })
+                        .expect("estimated work mutex poisoned");
                 }
             });
         }
         drop(sender);
+        drop(resolve_sender);
 
         let mut window = Window::empty();
         let mut accounting = MemberAccounting::new();
@@ -1306,6 +1475,18 @@ where
 
         'decode: loop {
             if let Some(offset) = footer_offset.take() {
+                drain_native_resolutions(
+                    &resolve_receiver,
+                    &mut resolve_pending,
+                    &mut next_resolve_to_emit,
+                    &mut outstanding_resolves,
+                    cancelled,
+                    current_bit,
+                    config,
+                    output,
+                    &mut accounting,
+                    &mut total_output,
+                )?;
                 let actual_footer =
                     validate_footer(&mut frame_cursor, offset, member_count, &accounting)?;
                 member_count += 1;
@@ -1341,6 +1522,7 @@ where
                         &mut accounting,
                         &mut total_output,
                     )?);
+                    prepared_total_output = total_output;
                     continue 'decode;
                 }
 
@@ -1355,7 +1537,7 @@ where
                     let _guard = lock.lock().expect("estimated work mutex poisoned");
                     while next_to_schedule < schedule_end {
                         task_queue.push(next_to_schedule);
-                        available_tasks.fetch_add(1, Ordering::Release);
+                        available_decode_tasks.fetch_add(1, Ordering::Release);
                         next_to_schedule += 1;
                     }
                     signal.notify_all();
@@ -1371,17 +1553,40 @@ where
                         .min(length_bits),
                     exact_start: true,
                 };
-                match run_estimated_task(source, &bridge, maximum_output, &mut bridge_compressed) {
+                let bridge_result =
+                    run_estimated_task(source, &bridge, maximum_output, &mut bridge_compressed);
+                match bridge_result {
                     Ok(chunk) if chunk.start_bit as u64 == current_bit => {
-                        let reached_stream_end = commit_native_chunk(
+                        let reached_stream_end = enqueue_native_resolution(
                             chunk,
                             config,
-                            output,
                             &mut current_bit,
                             &mut window,
-                            &mut accounting,
-                            &mut total_output,
+                            &mut prepared_total_output,
+                            &mut next_resolve_sequence,
+                            &mut outstanding_resolves,
+                            &resolve_queue,
+                            &available_resolve_tasks,
+                            &work_signal,
                         )?;
+                        if outstanding_resolves >= task_window {
+                            let parts = wait_for_resolved(
+                                &resolve_receiver,
+                                &mut resolve_pending,
+                                next_resolve_to_emit,
+                                cancelled,
+                                current_bit,
+                            )?;
+                            emit_resolved_parts(
+                                parts,
+                                config,
+                                output,
+                                &mut accounting,
+                                &mut total_output,
+                            )?;
+                            next_resolve_to_emit += 1;
+                            outstanding_resolves -= 1;
+                        }
                         if reached_stream_end {
                             footer_offset = Some(current_bit / 8);
                         }
@@ -1397,6 +1602,7 @@ where
                             &mut accounting,
                             &mut total_output,
                         )?);
+                        prepared_total_output = total_output;
                     }
                 }
                 continue 'decode;
@@ -1427,15 +1633,36 @@ where
 
             match result {
                 Ok(chunk) if chunk.start_bit as u64 == current_bit => {
-                    let reached_stream_end = commit_native_chunk(
+                    let reached_stream_end = enqueue_native_resolution(
                         chunk,
                         config,
-                        output,
                         &mut current_bit,
                         &mut window,
-                        &mut accounting,
-                        &mut total_output,
+                        &mut prepared_total_output,
+                        &mut next_resolve_sequence,
+                        &mut outstanding_resolves,
+                        &resolve_queue,
+                        &available_resolve_tasks,
+                        &work_signal,
                     )?;
+                    if outstanding_resolves >= task_window {
+                        let parts = wait_for_resolved(
+                            &resolve_receiver,
+                            &mut resolve_pending,
+                            next_resolve_to_emit,
+                            cancelled,
+                            current_bit,
+                        )?;
+                        emit_resolved_parts(
+                            parts,
+                            config,
+                            output,
+                            &mut accounting,
+                            &mut total_output,
+                        )?;
+                        next_resolve_to_emit += 1;
+                        outstanding_resolves -= 1;
+                    }
                     next_to_emit += 1;
                     let schedule_end = next_to_emit.saturating_add(task_window).min(tasks.len());
                     if next_to_schedule < schedule_end {
@@ -1443,7 +1670,7 @@ where
                         let _guard = lock.lock().expect("estimated work mutex poisoned");
                         while next_to_schedule < schedule_end {
                             task_queue.push(next_to_schedule);
-                            available_tasks.fetch_add(1, Ordering::Release);
+                            available_decode_tasks.fetch_add(1, Ordering::Release);
                             next_to_schedule += 1;
                         }
                         signal.notify_all();
@@ -1451,6 +1678,18 @@ where
                     if reached_stream_end {
                         footer_offset = Some(current_bit / 8);
                     } else if next_to_emit >= tasks.len() {
+                        drain_native_resolutions(
+                            &resolve_receiver,
+                            &mut resolve_pending,
+                            &mut next_resolve_to_emit,
+                            &mut outstanding_resolves,
+                            cancelled,
+                            current_bit,
+                            config,
+                            output,
+                            &mut accounting,
+                            &mut total_output,
+                        )?;
                         footer_offset = Some(inflate_from_block(
                             source,
                             config,
@@ -1461,9 +1700,22 @@ where
                             &mut accounting,
                             &mut total_output,
                         )?);
+                        prepared_total_output = total_output;
                     }
                 }
                 Ok(_) | Err(_) => {
+                    drain_native_resolutions(
+                        &resolve_receiver,
+                        &mut resolve_pending,
+                        &mut next_resolve_to_emit,
+                        &mut outstanding_resolves,
+                        cancelled,
+                        current_bit,
+                        config,
+                        output,
+                        &mut accounting,
+                        &mut total_output,
+                    )?;
                     footer_offset = Some(inflate_from_block(
                         source,
                         config,
@@ -1474,6 +1726,7 @@ where
                         &mut accounting,
                         &mut total_output,
                     )?);
+                    prepared_total_output = total_output;
                 }
             }
         }

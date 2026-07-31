@@ -65,26 +65,26 @@ impl<'a> BitReader<'a> {
 
     #[inline(always)]
     fn word_at(&self, byte_offset: usize) -> u64 {
-        if self.bytes.len().saturating_sub(byte_offset) >= 8 {
-            // SAFETY: the preceding length check proves that eight initialized
-            // bytes beginning at `byte_offset` are within `self.bytes`.
-            // `read_unaligned` imposes no alignment requirement and the loaded
-            // integer is normalized to little endian before bit extraction.
-            return unsafe {
-                std::ptr::read_unaligned(self.bytes.as_ptr().add(byte_offset).cast::<u64>())
-            }
-            .to_le();
-        }
-        let mut word = 0_u64;
-        for (index, &byte) in self.bytes[byte_offset..].iter().take(8).enumerate() {
-            word |= u64::from(byte) << (index * 8);
-        }
-        word
+        word_at(self.bytes, byte_offset)
     }
 
     #[inline(always)]
     fn read_bits(&mut self, count: u8) -> Result<u32, Error> {
         debug_assert!(count <= 24);
+        let byte_offset = self.bit_offset / 8;
+        let shift = self.bit_offset % 8;
+        if self.bytes.len().saturating_sub(byte_offset) >= 8 {
+            // SAFETY: the length check proves that eight initialized bytes are
+            // available. With `shift <= 7` and `count <= 24`, every requested
+            // bit is contained in that word, so advancing cannot pass EOF.
+            let word = unsafe {
+                std::ptr::read_unaligned(self.bytes.as_ptr().add(byte_offset).cast::<u64>())
+            }
+            .to_le();
+            self.bit_offset += usize::from(count);
+            let mask = if count == 0 { 0 } else { (1_u64 << count) - 1 };
+            return Ok(((word >> shift) & mask) as u32);
+        }
         if self
             .bit_offset
             .checked_add(usize::from(count))
@@ -92,8 +92,6 @@ impl<'a> BitReader<'a> {
         {
             return Err(Error::UnexpectedEof);
         }
-        let byte_offset = self.bit_offset / 8;
-        let shift = self.bit_offset % 8;
         let word = self.word_at(byte_offset);
         self.bit_offset += usize::from(count);
         let mask = if count == 0 { 0 } else { (1_u64 << count) - 1 };
@@ -102,14 +100,25 @@ impl<'a> BitReader<'a> {
 
     #[inline(always)]
     fn peek_bits_padded(&self, count: u8) -> (u32, u8) {
+        let byte_offset = self.bit_offset / 8;
+        let shift = self.bit_offset % 8;
+        if self.bytes.len().saturating_sub(byte_offset) >= 8 {
+            // SAFETY: the length check proves that the unaligned eight-byte
+            // load is within `bytes`. Huffman peeks request at most 15 bits,
+            // which fit in the word even at the largest seven-bit shift.
+            let word = unsafe {
+                std::ptr::read_unaligned(self.bytes.as_ptr().add(byte_offset).cast::<u64>())
+            }
+            .to_le();
+            let mask = if count == 0 { 0 } else { (1_u64 << count) - 1 };
+            return (((word >> shift) & mask) as u32, count);
+        }
         let available = self
             .bytes
             .len()
             .saturating_mul(8)
             .saturating_sub(self.bit_offset)
             .min(usize::from(count));
-        let byte_offset = self.bit_offset / 8;
-        let shift = self.bit_offset % 8;
         let word = self.word_at(byte_offset);
         let mask = if count == 0 { 0 } else { (1_u64 << count) - 1 };
         (((word >> shift) & mask) as u32, available as u8)
@@ -121,11 +130,28 @@ impl<'a> BitReader<'a> {
     }
 }
 
+#[inline(always)]
+fn word_at(bytes: &[u8], byte_offset: usize) -> u64 {
+    if bytes.len().saturating_sub(byte_offset) >= 8 {
+        // SAFETY: the preceding length check proves that eight initialized
+        // bytes beginning at `byte_offset` are within `bytes`.
+        // `read_unaligned` imposes no alignment requirement and the loaded
+        // integer is normalized to little endian before bit extraction.
+        return unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(byte_offset).cast::<u64>()) }
+            .to_le();
+    }
+    let mut word = 0_u64;
+    for (index, &byte) in bytes[byte_offset..].iter().take(8).enumerate() {
+        word |= u64::from(byte) << (index * 8);
+    }
+    word
+}
+
 #[derive(Clone)]
 struct Huffman {
-    // Packed as `(bit_length << 16) | symbol`, indexed by the next
+    // Packed as `(bit_length << 9) | symbol`, indexed by the next
     // `maximum_length` stream bits.
-    table: Vec<u32>,
+    table: Vec<u16>,
     maximum_length: u8,
 }
 
@@ -171,7 +197,7 @@ impl Huffman {
         for &length in lengths {
             maximum_length = maximum_length.max(length);
         }
-        let mut table = vec![u32::MAX; 1_usize << maximum_length];
+        let mut table = vec![u16::MAX; 1_usize << maximum_length];
         for (symbol, &length) in lengths.iter().enumerate() {
             if length == 0 {
                 continue;
@@ -180,11 +206,11 @@ impl Huffman {
             let canonical = next_code[length_index];
             next_code[length_index] += 1;
             let reversed = usize::from(reverse_low_bits(canonical, length_index));
-            let packed = (u32::from(length) << 16) | symbol as u32;
+            let packed = (u16::from(length) << 9) | symbol as u16;
             let suffix_count = 1_usize << (usize::from(maximum_length) - length_index);
             for suffix in 0..suffix_count {
                 let index = reversed | (suffix << length_index);
-                if table[index] != u32::MAX {
+                if table[index] != u16::MAX {
                     return Err(Error::InvalidHuffmanTree);
                 }
                 table[index] = packed;
@@ -200,15 +226,15 @@ impl Huffman {
     fn decode(&self, reader: &mut BitReader<'_>) -> Result<usize, Error> {
         let (bits, available) = reader.peek_bits_padded(self.maximum_length);
         let packed = self.table[bits as usize];
-        if packed == u32::MAX {
+        if packed == u16::MAX {
             return Err(Error::InvalidSymbol);
         }
-        let length = (packed >> 16) as u8;
+        let length = (packed >> 9) as u8;
         if length > available {
             return Err(Error::UnexpectedEof);
         }
         reader.bit_offset += usize::from(length);
-        Ok((packed & 0xFFFF) as usize)
+        Ok(usize::from(packed & 0x01FF))
     }
 }
 
@@ -419,10 +445,205 @@ impl DecodedBuffer {
             backend_tail: Vec::new(),
         }
     }
+
+    fn from_marked(marked: Vec<Symbol>) -> Self {
+        Self {
+            marked,
+            clean: Vec::new(),
+        }
+    }
+}
+
+/// Appends an LZ77 match to speculative output without maintaining a second
+/// 32 KiB history ring.
+///
+/// Output before the chunk start is represented by the same marker values as
+/// [`History::unknown`]. Once a match points into output produced by this
+/// chunk, `Vec::extend_from_within` copies whole runs. The final doubling loop
+/// preserves DEFLATE overlap semantics while reducing short-distance matches
+/// to logarithmically many bulk copies.
+fn copy_match_unknown(
+    output: &mut Vec<Symbol>,
+    distance: usize,
+    length: usize,
+    output_limit: usize,
+) -> Result<(), Error> {
+    if distance == 0 || distance > WINDOW_SIZE {
+        return Err(Error::InvalidDistance);
+    }
+    if length > output_limit.saturating_sub(output.len()) {
+        return Err(Error::OutputLimit);
+    }
+
+    output.reserve(length);
+    let match_start = output.len();
+    let mut copied = 0;
+
+    if distance > match_start {
+        let from_window = (distance - match_start).min(length);
+        let first_index = WINDOW_SIZE + match_start - distance;
+        output.extend(
+            (0..from_window)
+                .map(|offset| Symbol::from_encoded((WINDOW_SIZE + first_index + offset) as u16)),
+        );
+        copied = from_window;
+    }
+
+    let first_period = distance.min(length);
+    if copied < first_period {
+        let count = first_period - copied;
+        let source = output.len() - distance;
+        output.extend_from_within(source..source + count);
+        copied += count;
+    }
+
+    while copied < length {
+        let count = copied.min(length - copied);
+        output.extend_from_within(match_start..match_start + count);
+        copied += count;
+    }
+    Ok(())
+}
+
+fn decode_compressed_block_unknown(
+    reader: &mut BitReader<'_>,
+    literal: &Huffman,
+    distance: &Huffman,
+    output: &mut Vec<Symbol>,
+    output_limit: usize,
+) -> Result<(), Error> {
+    loop {
+        let symbol = literal.decode(reader)?;
+        match symbol {
+            0..=255 => {
+                if output.len() >= output_limit {
+                    return Err(Error::OutputLimit);
+                }
+                output.push(Symbol::literal(symbol as u8));
+            }
+            END_OF_BLOCK => return Ok(()),
+            257..=285 => {
+                let length_index = symbol - 257;
+                let length = LENGTH_BASE[length_index]
+                    + reader.read_bits(LENGTH_EXTRA[length_index])? as usize;
+                let distance_symbol = distance.decode(reader)?;
+                if distance_symbol >= DISTANCE_BASE.len() {
+                    return Err(Error::InvalidDistance);
+                }
+                let copy_distance = DISTANCE_BASE[distance_symbol]
+                    + reader.read_bits(DISTANCE_EXTRA[distance_symbol])? as usize;
+                copy_match_unknown(output, copy_distance, length, output_limit)?;
+            }
+            _ => return Err(Error::InvalidSymbol),
+        }
+    }
+}
+
+fn decode_stored_block_unknown(
+    reader: &mut BitReader<'_>,
+    output: &mut Vec<Symbol>,
+    output_limit: usize,
+) -> Result<(), Error> {
+    reader.align_to_byte();
+    let length = reader.read_bits(16)? as u16;
+    let complement = reader.read_bits(16)? as u16;
+    if length != !complement {
+        return Err(Error::InvalidStoredLength);
+    }
+    if usize::from(length) > output_limit.saturating_sub(output.len()) {
+        return Err(Error::OutputLimit);
+    }
+    output.reserve(usize::from(length));
+    for _ in 0..length {
+        output.push(Symbol::literal(reader.read_bits(8)? as u8));
+    }
+    Ok(())
+}
+
+fn marker_free_window(output: &[Symbol]) -> Option<Window> {
+    let window = output.get(output.len().checked_sub(WINDOW_SIZE)?..)?;
+    if window.iter().any(|symbol| symbol.as_literal().is_none()) {
+        return None;
+    }
+    let bytes = window
+        .iter()
+        .map(|symbol| symbol.as_literal().expect("window was checked as literal"))
+        .collect();
+    Some(Window::new(bytes).expect("DEFLATE window has exactly 32 KiB"))
+}
+
+fn decode_to_estimated_boundary_unknown(
+    bytes: &[u8],
+    start_bit: usize,
+    estimated_stop_bit: usize,
+    maximum_output: usize,
+) -> Result<Chunk, Error> {
+    if estimated_stop_bit <= start_bit {
+        return Err(Error::BoundaryMismatch);
+    }
+    let mut reader = BitReader::at(bytes, start_bit)?;
+    let mut marked = Vec::new();
+
+    loop {
+        let reached_stream_end = reader.read_bits(1)? != 0;
+        match reader.read_bits(2)? {
+            0 => decode_stored_block_unknown(&mut reader, &mut marked, maximum_output)?,
+            1 => {
+                let (literal, distance) = fixed_trees();
+                decode_compressed_block_unknown(
+                    &mut reader,
+                    literal,
+                    distance,
+                    &mut marked,
+                    maximum_output,
+                )?;
+            }
+            2 => {
+                let (literal, distance) = dynamic_trees(&mut reader)?;
+                decode_compressed_block_unknown(
+                    &mut reader,
+                    &literal,
+                    &distance,
+                    &mut marked,
+                    maximum_output,
+                )?;
+            }
+            _ => return Err(Error::InvalidBlockType),
+        }
+
+        if reached_stream_end {
+            reader.align_to_byte();
+            return Ok(Chunk {
+                start_bit,
+                end_bit: reader.position(),
+                output: DecodedBuffer::from_marked(marked).finish(),
+                reached_stream_end: true,
+                backend_continuation: None,
+            });
+        }
+        if reader.position() >= estimated_stop_bit {
+            return Ok(Chunk {
+                start_bit,
+                end_bit: reader.position(),
+                output: DecodedBuffer::from_marked(marked).finish(),
+                reached_stream_end: false,
+                backend_continuation: None,
+            });
+        }
+        if let Some(window) = marker_free_window(&marked) {
+            return Ok(Chunk {
+                start_bit,
+                end_bit: reader.position(),
+                output: DecodedBuffer::from_marked(marked).finish(),
+                reached_stream_end: false,
+                backend_continuation: Some(window),
+            });
+        }
+    }
 }
 
 #[inline(always)]
-fn emit(
+fn emit_marked(
     symbol: Symbol,
     history: &mut History,
     output: &mut DecodedBuffer,
@@ -432,14 +653,26 @@ fn emit(
         return Err(Error::OutputLimit);
     }
     history.push(symbol);
-    if history.contains_markers() {
-        output.marked.push(symbol);
-    } else {
-        output.clean.push(
-            symbol
-                .as_literal()
-                .expect("marker-free history yields literals"),
-        );
+    output.marked.push(symbol);
+    Ok(())
+}
+
+#[inline(always)]
+fn copy_match_marked(
+    length: usize,
+    distance: usize,
+    history: &mut History,
+    output: &mut DecodedBuffer,
+    output_limit: usize,
+) -> Result<(), Error> {
+    if length > output_limit.saturating_sub(output.len()) {
+        return Err(Error::OutputLimit);
+    }
+    output.marked.reserve(length);
+    for _ in 0..length {
+        let copied = history.get_distance(distance)?;
+        history.push(copied);
+        output.marked.push(copied);
     }
     Ok(())
 }
@@ -465,7 +698,7 @@ fn decode_compressed_block(
     loop {
         let symbol = literal.decode(reader)?;
         match symbol {
-            0..=255 => emit(Symbol::literal(symbol as u8), history, output, output_limit)?,
+            0..=255 => emit_marked(Symbol::literal(symbol as u8), history, output, output_limit)?,
             END_OF_BLOCK => return Ok(()),
             257..=285 => {
                 let length_index = symbol - 257;
@@ -477,10 +710,7 @@ fn decode_compressed_block(
                 }
                 let copy_distance = DISTANCE_BASE[distance_symbol]
                     + reader.read_bits(DISTANCE_EXTRA[distance_symbol])? as usize;
-                for _ in 0..length {
-                    let copied = history.get_distance(copy_distance)?;
-                    emit(copied, history, output, output_limit)?;
-                }
+                copy_match_marked(length, copy_distance, history, output, output_limit)?;
             }
             _ => return Err(Error::InvalidSymbol),
         }
@@ -498,18 +728,9 @@ fn decode_compressed_block(
 }
 
 #[inline(always)]
-fn emit_clean(
-    byte: u8,
-    history: &mut History,
-    output: &mut DecodedBuffer,
-    output_limit: usize,
-) -> Result<(), Error> {
-    if output.len() >= output_limit {
-        return Err(Error::OutputLimit);
-    }
+fn emit_clean_unchecked(byte: u8, history: &mut History, output: &mut DecodedBuffer) {
     output.clean.push(byte);
     history.push_clean(byte);
-    Ok(())
 }
 
 fn decode_compressed_block_clean(
@@ -524,7 +745,12 @@ fn decode_compressed_block_clean(
     loop {
         let symbol = literal.decode(reader)?;
         match symbol {
-            0..=255 => emit_clean(symbol as u8, history, output, output_limit)?,
+            0..=255 => {
+                if output.len() >= output_limit {
+                    return Err(Error::OutputLimit);
+                }
+                emit_clean_unchecked(symbol as u8, history, output);
+            }
             END_OF_BLOCK => return Ok(()),
             257..=285 => {
                 let length_index = symbol - 257;
@@ -536,9 +762,13 @@ fn decode_compressed_block_clean(
                 }
                 let copy_distance = DISTANCE_BASE[distance_symbol]
                     + reader.read_bits(DISTANCE_EXTRA[distance_symbol])? as usize;
+                if length > output_limit.saturating_sub(output.len()) {
+                    return Err(Error::OutputLimit);
+                }
+                output.clean.reserve(length);
                 for _ in 0..length {
                     let copied = history.get_distance_byte(copy_distance)?;
-                    emit_clean(copied, history, output, output_limit)?;
+                    emit_clean_unchecked(copied, history, output);
                 }
             }
             _ => return Err(Error::InvalidSymbol),
@@ -560,7 +790,14 @@ fn decode_stored_block(
     }
     for _ in 0..length {
         let byte = reader.read_bits(8)? as u8;
-        emit(Symbol::literal(byte), history, output, output_limit)?;
+        if history.contains_markers() {
+            emit_marked(Symbol::literal(byte), history, output, output_limit)?;
+        } else {
+            if output.len() >= output_limit {
+                return Err(Error::OutputLimit);
+            }
+            emit_clean_unchecked(byte, history, output);
+        }
     }
     Ok(())
 }
@@ -581,7 +818,7 @@ pub(crate) struct ChunkOutput {
     backend_tail: Vec<u8>,
 }
 
-type ResolvedParts = (Vec<u8>, Vec<u8>, Vec<u8>);
+pub(crate) type ResolvedParts = (Vec<u8>, Vec<u8>, Vec<u8>);
 
 impl ChunkOutput {
     pub(crate) fn from_clean(bytes: Vec<u8>) -> Self {
@@ -609,6 +846,29 @@ impl ChunkOutput {
 
     pub(crate) fn len(&self) -> usize {
         self.marked.symbols().len() + self.clean.len() + self.backend_tail.len()
+    }
+
+    pub(crate) fn window_after(
+        &self,
+        predecessor: &Window,
+    ) -> Result<Window, super::marker::MarkerError> {
+        let total = self.len();
+        let skip = total.saturating_sub(WINDOW_SIZE);
+        let marked_end = self.marked.len();
+        let clean_end = marked_end + self.clean.len();
+        let mut suffix = Vec::with_capacity(total.min(WINDOW_SIZE));
+
+        if skip < marked_end {
+            self.marked
+                .append_resolved_range(skip..marked_end, &mut suffix, predecessor)?;
+        }
+        if skip < clean_end {
+            let clean_start = skip.saturating_sub(marked_end);
+            suffix.extend_from_slice(&self.clean[clean_start..]);
+        }
+        let backend_start = skip.saturating_sub(clean_end);
+        suffix.extend_from_slice(&self.backend_tail[backend_start..]);
+        Ok(predecessor.advanced_by(&suffix))
     }
 
     pub(crate) fn append_clean(&mut self, bytes: Vec<u8>) {
@@ -801,11 +1061,7 @@ fn valid_precode_shape(bytes: &[u8], block_offset: usize) -> bool {
     }
     let byte_offset = precode_offset / 8;
     let shift = precode_offset % 8;
-    let reader = BitReader {
-        bytes,
-        bit_offset: precode_offset,
-    };
-    let low = reader.word_at(byte_offset);
+    let low = word_at(bytes, byte_offset);
     let bits = if shift == 0 {
         low
     } else {
@@ -851,6 +1107,14 @@ pub(crate) fn decode_to_estimated_boundary(
     initial_history: InitialHistory<'_>,
     maximum_output: usize,
 ) -> Result<Chunk, Error> {
+    if matches!(initial_history, InitialHistory::Unknown) {
+        return decode_to_estimated_boundary_unknown(
+            bytes,
+            start_bit,
+            estimated_stop_bit,
+            maximum_output,
+        );
+    }
     if estimated_stop_bit <= start_bit {
         return Err(Error::BoundaryMismatch);
     }
@@ -925,8 +1189,11 @@ pub(crate) fn decode_to_estimated_boundary(
 
 #[cfg(test)]
 mod tests {
-    use super::{InitialHistory, WINDOW_SIZE, decode_chunk, find_dynamic_candidates};
-    use crate::parallel::Window;
+    use super::{
+        ChunkOutput, InitialHistory, Symbol, WINDOW_SIZE, copy_match_unknown, decode_chunk,
+        find_dynamic_candidates,
+    };
+    use crate::parallel::{MarkerBuffer, Window};
 
     fn hex(text: &str) -> Vec<u8> {
         text.as_bytes()
@@ -985,5 +1252,76 @@ mod tests {
         let empty = Window::empty();
         let chunk = decode_chunk(&encoded, 0, InitialHistory::Known(&empty), 1, 1024).unwrap();
         assert_eq!(chunk.output.resolve(&empty).unwrap(), b"hellohellohello");
+    }
+
+    #[test]
+    fn bulk_unknown_match_matches_a_naive_window_for_overlap_and_wraparound() {
+        let prefixes = [0, 1, 7, 257, WINDOW_SIZE - 1, WINDOW_SIZE, WINDOW_SIZE + 19];
+        let lengths = [1, 2, 7, 31, 258];
+        for prefix_length in prefixes {
+            let prefix: Vec<_> = (0..prefix_length)
+                .map(|index| Symbol::literal(index as u8))
+                .collect();
+            for distance in [1, 2, 7, 31, 257, 4096, WINDOW_SIZE] {
+                for length in lengths {
+                    let mut expected_history: Vec<_> = (0..WINDOW_SIZE)
+                        .map(|index| Symbol::from_encoded((WINDOW_SIZE + index) as u16))
+                        .chain(prefix.iter().copied())
+                        .collect();
+                    for _ in 0..length {
+                        let source = expected_history.len() - distance;
+                        let symbol = expected_history[source];
+                        expected_history.push(symbol);
+                    }
+                    let expected = &expected_history[WINDOW_SIZE..];
+
+                    let mut actual = prefix.clone();
+                    copy_match_unknown(&mut actual, distance, length, usize::MAX).unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "prefix={prefix_length} d={distance} l={length}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_suffix_produces_the_same_window_as_full_resolution() {
+        let predecessor = Window::new(
+            (0..WINDOW_SIZE)
+                .map(|index| index.wrapping_mul(17) as u8)
+                .collect(),
+        )
+        .unwrap();
+        for (marked_len, clean_len, backend_len) in [
+            (127, 0, 0),
+            (40_000, 0, 0),
+            (40_000, 9000, 0),
+            (9000, 9000, 20_000),
+        ] {
+            let make_output = || {
+                let marked = (0..marked_len)
+                    .map(|index| {
+                        if index % 3 == 0 {
+                            Symbol::marker(index % WINDOW_SIZE).unwrap()
+                        } else {
+                            Symbol::literal(index as u8)
+                        }
+                    })
+                    .collect();
+                ChunkOutput {
+                    marked: MarkerBuffer::new(marked),
+                    clean: (0..clean_len).map(|index| (index * 3) as u8).collect(),
+                    backend_tail: (0..backend_len).map(|index| (index * 5) as u8).collect(),
+                }
+            };
+
+            let actual = make_output().window_after(&predecessor).unwrap();
+            let (mut resolved, clean, backend) = make_output().resolve_parts(&predecessor).unwrap();
+            resolved.extend_from_slice(&clean);
+            resolved.extend_from_slice(&backend);
+            assert_eq!(actual, predecessor.advanced_by(&resolved));
+        }
     }
 }

@@ -109,8 +109,29 @@ impl MarkerBuffer {
         self.symbols.len()
     }
 
+    pub(crate) fn append_resolved_range(
+        &self,
+        range: std::ops::Range<usize>,
+        output: &mut Vec<u8>,
+        window: &Window,
+    ) -> Result<(), MarkerError> {
+        let symbols = self
+            .symbols
+            .get(range)
+            .ok_or(MarkerError::IndexOutOfRange(self.symbols.len()))?;
+        output.reserve(symbols.len());
+        for &symbol in symbols {
+            output.push(resolve_symbol(symbol, window)?);
+        }
+        Ok(())
+    }
+
     /// Resolves marker references without re-decoding the chunk.
     pub fn resolve(self, window: &Window) -> Result<Vec<u8>, MarkerError> {
+        if self.symbols.len() >= 128 * 1024 && window.0.len() == WINDOW_SIZE {
+            let output = resolve_lut(&self.symbols, window);
+            return Ok(output);
+        }
         let mut output = vec![0_u8; self.len()];
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("sse4.1") {
@@ -130,6 +151,30 @@ impl MarkerBuffer {
         resolve_scalar(&self.symbols, &mut output, window)?;
         Ok(output)
     }
+}
+
+/// Resolves a large marker buffer through a branch-free 16-bit lookup table.
+///
+/// The low 256 entries preserve literal bytes and the high 32 Ki entries map
+/// marker encodings directly into the full predecessor window. Speculative
+/// chunks are normally several MiB, so amortizing the 64 KiB table setup avoids
+/// a marker/literal branch for every decoded byte.
+fn resolve_lut(symbols: &[Symbol], window: &Window) -> Vec<u8> {
+    debug_assert_eq!(window.0.len(), WINDOW_SIZE);
+
+    let mut lookup = [0_u8; u16::MAX as usize + 1];
+    for (value, byte) in lookup[..=u8::MAX as usize].iter_mut().enumerate() {
+        *byte = value as u8;
+    }
+    lookup[WINDOW_SIZE..].copy_from_slice(&window.0);
+    let mut output = Vec::with_capacity(symbols.len());
+    for (target, symbol) in output.spare_capacity_mut().iter_mut().zip(symbols) {
+        target.write(lookup[usize::from(symbol.encoded())]);
+    }
+    // SAFETY: the loop above writes exactly one initialized byte for every
+    // symbol into distinct slots of the vector's allocated spare capacity.
+    unsafe { output.set_len(symbols.len()) };
+    output
 }
 
 fn resolve_symbol(symbol: Symbol, window: &Window) -> Result<u8, MarkerError> {

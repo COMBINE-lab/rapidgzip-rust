@@ -14,7 +14,7 @@ use std::process::ExitCode;
     about = "Parallel, verified gzip decompression"
 )]
 struct Arguments {
-    /// Exact number of decoder workers.
+    /// Maximum decoder-worker budget.
     #[arg(short = 'P', long = "threads", value_name = "THREADS")]
     threads: Option<usize>,
 

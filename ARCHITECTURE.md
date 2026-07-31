@@ -46,15 +46,23 @@ candidate is rejected by complete DEFLATE decoding or by the coordinator's
 exact predecessor/successor boundary check; decoding then resumes with zlib-rs
 from the last authoritative position.
 
-While unknown history can propagate, output remains 16-bit marker symbols.
+While unknown history can propagate, output remains 16-bit marker symbols. The
+native unknown-history decoder uses that output itself as its LZ77 history:
+cross-boundary references become predecessor markers, and in-chunk matches use
+bulk `Vec::extend_from_within` copies with geometric doubling to preserve
+overlap semantics. It does not maintain a second per-byte 32 KiB symbol ring.
+
 Once a complete block leaves a marker-free 32 KiB window, the rest of that
 independent chunk is decoded by zlib-rs using `inflatePrime`,
 `inflateSetDictionary`, and `Z_BLOCK`. Successful speculative output is not
-decoded again. It is resolved against the previous chunk's real window,
-emitted, and used to construct the next window. Exact member starts are
-decoded directly by zlib-rs. False boundaries and chunks exceeding their
-speculative allowance fall back to zlib-rs from the last authoritative
-position.
+decoded again. To advance dependencies, the coordinator resolves only the
+final 32 KiB needed for the successor window. Full marker replacement is a
+separate ordered task in the same bounded worker pool, overlapped with later
+native decode. Large full-window buffers use a branch-free 16-bit lookup table;
+small buffers retain runtime-dispatched SSE4.1 on x86-64, baseline NEON on
+AArch64, and a scalar fallback. Exact member starts are decoded directly by
+zlib-rs. False boundaries and chunks exceeding their speculative allowance
+fall back to zlib-rs from the last authoritative position.
 
 ## Members and BGZF
 
@@ -79,13 +87,20 @@ reuse their initialized zlib-rs stream with `inflateReset`.
 ## Scheduling and memory
 
 The BGZF, stored, and native paths use a `crossbeam-deque::Injector`, a sliding
-task window, scoped workers, and bounded result channels. Native workers and
-their estimated grid persist across all members in a file. At each ordinary
-gzip member transition, the coordinator resets history/accounting and decodes
-an exact bridge from the new header to the first later file-wide grid point;
-already-running tasks beyond that point remain useful. Results are reordered
-by ordinal before being committed. No speculative worker calls the user's
-output object.
+task window, scoped workers, and bounded result channels. For generic native
+decoding, the configured thread count is a budget and the combined active
+decode/resolve window is capped at 16. Each speculative result commonly owns
+several MiB of `u16` symbols; larger windows reduced throughput and sharply
+increased memory pressure on the measured dual-socket host. All active native
+workers dynamically take marker-resolution work first and boundary-decode work
+second. BGZF and stored paths retain their format-specific worker counts.
+
+Native workers and their estimated grid persist across all members in a file.
+At each ordinary gzip member transition, the coordinator resets
+history/accounting and decodes an exact bridge from the new header to the first
+later file-wide grid point; already-running tasks beyond that point remain
+useful. Results and resolved buffers are reordered by ordinal before being
+committed. No speculative worker calls the user's output object.
 
 Input is paged with positional reads. Speculative output is capped per task;
 oversized regions continue through zlib-rs instead. `DecoderReader` adds at most

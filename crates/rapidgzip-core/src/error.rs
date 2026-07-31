@@ -245,6 +245,6 @@ pub struct DecodeReport {
     pub decompressed_bytes: u64,
     /// Number of verified gzip members.
     pub member_count: u64,
-    /// Configured decoder worker count.
+    /// Configured decoder-worker budget.
     pub decoder_threads: usize,
 }
