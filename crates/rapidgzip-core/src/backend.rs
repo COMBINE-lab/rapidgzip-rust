@@ -898,25 +898,40 @@ struct ResolveResult {
 
 /// Admission control shared by the generic decode and marker-resolution work.
 ///
-/// The full requested worker pool remains available, but only the empirically
-/// selected stable prefix may execute memory-intensive work. Stable ranks keep
-/// per-worker compressed buffers local instead of rotating every parked thread
-/// through the active set. Admission is one atomic rank check per task; the
-/// controller mutex is touched only when ordered output advances.
+/// Worker ranks are created lazily as upward probes request them. Stable ranks
+/// keep per-worker compressed buffers local instead of rotating parked threads
+/// through the active set. Candidate measurements count native completions
+/// before ordered output handoff, and stable operation costs one atomic rank
+/// check per task without touching the controller mutex.
 struct AdaptiveWorkers {
     controller: Mutex<AdaptiveConcurrency>,
     current_limit: AtomicUsize,
+    generation: AtomicUsize,
+    calibrating: AtomicBool,
+    worker_pool_limit: usize,
     limit_mutex: Mutex<()>,
     limit_signal: Condvar,
 }
 
 impl AdaptiveWorkers {
-    fn new(maximum: usize, machine_parallelism: usize, sample_bytes: usize) -> Self {
-        let controller = AdaptiveConcurrency::new(maximum, machine_parallelism, sample_bytes);
+    fn new(
+        maximum: usize,
+        machine_parallelism: usize,
+        sample_bytes: usize,
+        work_items: usize,
+    ) -> Self {
+        let controller =
+            AdaptiveConcurrency::new(maximum, machine_parallelism, sample_bytes, work_items);
         let current_limit = controller.current_limit();
+        let generation = controller.generation();
+        let calibrating = !controller.is_stable();
+        let worker_pool_limit = controller.worker_pool_limit();
         Self {
             controller: Mutex::new(controller),
             current_limit: AtomicUsize::new(current_limit),
+            generation: AtomicUsize::new(generation),
+            calibrating: AtomicBool::new(calibrating),
+            worker_pool_limit,
             limit_mutex: Mutex::new(()),
             limit_signal: Condvar::new(),
         }
@@ -928,6 +943,14 @@ impl AdaptiveWorkers {
 
     fn worker_enabled(&self, worker_index: usize) -> bool {
         worker_index < self.current_limit()
+    }
+
+    const fn worker_pool_limit(&self) -> usize {
+        self.worker_pool_limit
+    }
+
+    fn is_calibrating(&self) -> bool {
+        self.calibrating.load(Ordering::Acquire)
     }
 
     fn wait_until_enabled(&self, worker_index: usize, stopped: &AtomicBool) {
@@ -943,15 +966,34 @@ impl AdaptiveWorkers {
             .expect("adaptive limit mutex poisoned");
     }
 
-    fn observe_progress(&self, decoded_bytes: usize) -> bool {
+    fn start_work(&self) -> Option<usize> {
+        if !self.calibrating.load(Ordering::Acquire) {
+            return None;
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        self.controller
+            .lock()
+            .expect("adaptive worker mutex poisoned")
+            .start_work(generation, Instant::now());
+        Some(generation)
+    }
+
+    fn observe_work(&self, generation: Option<usize>, decoded_bytes: usize) -> bool {
+        let Some(generation) = generation else {
+            return false;
+        };
         let mut controller = self
             .controller
             .lock()
             .expect("adaptive worker mutex poisoned");
-        let changed = controller.observe_progress(decoded_bytes, Instant::now());
+        let changed = controller.observe_work(generation, decoded_bytes, Instant::now());
         if changed {
             self.current_limit
                 .store(controller.current_limit(), Ordering::Release);
+            self.generation
+                .store(controller.generation(), Ordering::Release);
+            self.calibrating
+                .store(!controller.is_stable(), Ordering::Release);
             self.limit_signal.notify_all();
         }
         changed
@@ -994,6 +1036,88 @@ fn send_resolve_result(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_estimated_worker<'scope, 'env: 'scope, R>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    worker_index: usize,
+    source: &'env R,
+    tasks: &'env [EstimatedTask],
+    maximum_output: usize,
+    queue: Arc<Injector<usize>>,
+    resolve_queue: Arc<Injector<ResolveTask>>,
+    sender: mpsc::SyncSender<NativeResult>,
+    resolve_sender: mpsc::SyncSender<ResolveResult>,
+    stopped: Arc<AtomicBool>,
+    available_decode_tasks: Arc<AtomicUsize>,
+    available_resolve_tasks: Arc<AtomicUsize>,
+    work_signal: Arc<(Mutex<()>, Condvar)>,
+    adaptive_workers: Arc<AdaptiveWorkers>,
+) where
+    R: ReadAt + ?Sized + 'env,
+{
+    scope.spawn(move || {
+        let mut compressed = Vec::new();
+        loop {
+            if stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            if !adaptive_workers.worker_enabled(worker_index) {
+                adaptive_workers.wait_until_enabled(worker_index, &stopped);
+                continue;
+            }
+            match resolve_queue.steal() {
+                Steal::Success(task) => {
+                    available_resolve_tasks.fetch_sub(1, Ordering::AcqRel);
+                    let result = task.output.resolve_parts(&task.predecessor);
+                    send_resolve_result(
+                        &resolve_sender,
+                        &stopped,
+                        ResolveResult {
+                            sequence: task.sequence,
+                            result,
+                        },
+                    );
+                    continue;
+                }
+                Steal::Retry => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                Steal::Empty => {}
+            }
+            match queue.steal() {
+                Steal::Success(index) => {
+                    available_decode_tasks.fetch_sub(1, Ordering::AcqRel);
+                    let generation = adaptive_workers.start_work();
+                    let result =
+                        run_estimated_task(source, &tasks[index], maximum_output, &mut compressed);
+                    let decoded_bytes = result.as_ref().map_or(0, |chunk| chunk.output.len());
+                    if adaptive_workers.observe_work(generation, decoded_bytes) {
+                        work_signal.1.notify_all();
+                    }
+                    send_native_result(&sender, &stopped, NativeResult { index, result });
+                    continue;
+                }
+                Steal::Retry => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                Steal::Empty => {}
+            }
+            let (lock, signal) = &*work_signal;
+            let guard = lock.lock().expect("estimated work mutex poisoned");
+            let _ = signal
+                .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                    (available_decode_tasks.load(Ordering::Acquire) == 0
+                        && available_resolve_tasks.load(Ordering::Acquire) == 0
+                        || !adaptive_workers.worker_enabled(worker_index))
+                        && !stopped.load(Ordering::Relaxed)
+                })
+                .expect("estimated work mutex poisoned");
+        }
+    });
 }
 
 struct BackendTail {
@@ -1246,13 +1370,12 @@ fn emit_resolved_parts<O: Output>(
     output: &mut O,
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
-) -> Result<usize, DecodeError> {
+) -> Result<(), DecodeError> {
     let (marked, clean, backend_tail) = parts;
-    let decoded_bytes = marked.len() + clean.len() + backend_tail.len();
     emit_accounted(marked, config, output, accounting, total_output)?;
     emit_accounted(clean, config, output, accounting, total_output)?;
     emit_accounted(backend_tail, config, output, accounting, total_output)?;
-    Ok(decoded_bytes)
+    Ok(())
 }
 
 fn wait_for_resolved(
@@ -1478,20 +1601,31 @@ where
     let available_resolve_tasks = Arc::new(AtomicUsize::new(0));
     let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
     let worker_count = config.decoder_threads.min(tasks.len());
-    let hard_task_window = config.in_flight_chunks.max(worker_count).min(tasks.len());
     let machine_parallelism = thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let adaptive_workers = Arc::new(AdaptiveWorkers::new(
         worker_count,
         machine_parallelism,
-        compressed_chunk_size.saturating_mul(32),
+        compressed_chunk_size.saturating_mul(16),
+        tasks.len(),
     ));
-    let initial_task_window = adaptive_workers.current_limit().min(hard_task_window);
+    let worker_pool_count = adaptive_workers.worker_pool_limit().min(worker_count);
+    // Result channels need spare slots beyond the active ranks because the
+    // same pool executes marker resolution. If every worker blocks while
+    // publishing speculative decode, no rank remains to resolve an exact
+    // member bridge. The configured window carries the usual two-slot slack;
+    // the scheduling horizon below still follows the adaptive active limit, so
+    // this capacity does not admit extra speculative tasks.
+    let pipeline_capacity = config
+        .in_flight_chunks
+        .max(worker_pool_count)
+        .min(tasks.len());
+    let initial_task_window = adaptive_workers.current_limit().min(pipeline_capacity);
     for index in 0..initial_task_window {
         task_queue.push(index);
     }
     available_decode_tasks.store(initial_task_window, Ordering::Release);
-    let (sender, receiver) = mpsc::sync_channel::<NativeResult>(hard_task_window);
-    let (resolve_sender, resolve_receiver) = mpsc::sync_channel::<ResolveResult>(hard_task_window);
+    let (sender, receiver) = mpsc::sync_channel::<NativeResult>(pipeline_capacity);
+    let (resolve_sender, resolve_receiver) = mpsc::sync_channel::<ResolveResult>(pipeline_capacity);
 
     let mut member_count = 0_u64;
     let mut total_output = 0_u64;
@@ -1511,80 +1645,9 @@ where
             work_signal: &work_signal.1,
             limit_signal: &adaptive_workers.limit_signal,
         };
-        for worker_index in 0..worker_count {
-            let queue = Arc::clone(&task_queue);
-            let resolve_queue = Arc::clone(&resolve_queue);
-            let sender = sender.clone();
-            let resolve_sender = resolve_sender.clone();
-            let stopped = Arc::clone(&stopped);
-            let available_decode_tasks = Arc::clone(&available_decode_tasks);
-            let available_resolve_tasks = Arc::clone(&available_resolve_tasks);
-            let work_signal = Arc::clone(&work_signal);
-            let adaptive_workers = Arc::clone(&adaptive_workers);
-            let tasks = &tasks;
-            scope.spawn(move || {
-                let mut compressed = Vec::new();
-                loop {
-                    if stopped.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if !adaptive_workers.worker_enabled(worker_index) {
-                        adaptive_workers.wait_until_enabled(worker_index, &stopped);
-                        continue;
-                    }
-                    match resolve_queue.steal() {
-                        Steal::Success(task) => {
-                            available_resolve_tasks.fetch_sub(1, Ordering::AcqRel);
-                            let result = task.output.resolve_parts(&task.predecessor);
-                            send_resolve_result(
-                                &resolve_sender,
-                                &stopped,
-                                ResolveResult {
-                                    sequence: task.sequence,
-                                    result,
-                                },
-                            );
-                            continue;
-                        }
-                        Steal::Retry => {
-                            std::hint::spin_loop();
-                            continue;
-                        }
-                        Steal::Empty => {}
-                    }
-                    match queue.steal() {
-                        Steal::Success(index) => {
-                            available_decode_tasks.fetch_sub(1, Ordering::AcqRel);
-                            let result = run_estimated_task(
-                                source,
-                                &tasks[index],
-                                maximum_output,
-                                &mut compressed,
-                            );
-                            send_native_result(&sender, &stopped, NativeResult { index, result });
-                            continue;
-                        }
-                        Steal::Retry => {
-                            std::hint::spin_loop();
-                            continue;
-                        }
-                        Steal::Empty => {}
-                    }
-                    let (lock, signal) = &*work_signal;
-                    let guard = lock.lock().expect("estimated work mutex poisoned");
-                    let _ = signal
-                        .wait_timeout_while(guard, Duration::from_millis(1), |_| {
-                            (available_decode_tasks.load(Ordering::Acquire) == 0
-                                && available_resolve_tasks.load(Ordering::Acquire) == 0
-                                || !adaptive_workers.worker_enabled(worker_index))
-                                && !stopped.load(Ordering::Relaxed)
-                        })
-                        .expect("estimated work mutex poisoned");
-                }
-            });
-        }
-        drop(sender);
-        drop(resolve_sender);
+        let mut sender_template = Some(sender);
+        let mut resolve_sender_template = Some(resolve_sender);
+        let mut spawned_workers = 0_usize;
 
         let mut window = Window::empty();
         let mut accounting = MemberAccounting::new();
@@ -1592,6 +1655,37 @@ where
         let mut bridge_compressed = Vec::new();
 
         'decode: loop {
+            let spawn_target = adaptive_workers.current_limit().min(worker_pool_count);
+            while spawned_workers < spawn_target {
+                spawn_estimated_worker(
+                    scope,
+                    spawned_workers,
+                    source,
+                    &tasks,
+                    maximum_output,
+                    Arc::clone(&task_queue),
+                    Arc::clone(&resolve_queue),
+                    sender_template
+                        .as_ref()
+                        .expect("worker sender remains while calibration can grow")
+                        .clone(),
+                    resolve_sender_template
+                        .as_ref()
+                        .expect("resolve sender remains while calibration can grow")
+                        .clone(),
+                    Arc::clone(&stopped),
+                    Arc::clone(&available_decode_tasks),
+                    Arc::clone(&available_resolve_tasks),
+                    Arc::clone(&work_signal),
+                    Arc::clone(&adaptive_workers),
+                );
+                spawned_workers += 1;
+            }
+            if !adaptive_workers.is_calibrating() {
+                drop(sender_template.take());
+                drop(resolve_sender_template.take());
+            }
+
             if let Some(offset) = footer_offset.take() {
                 drain_native_resolutions(
                     &resolve_receiver,
@@ -1649,7 +1743,7 @@ where
                 if next_to_schedule < target_index {
                     next_to_schedule = target_index;
                 }
-                let task_window = adaptive_workers.current_limit().min(hard_task_window);
+                let task_window = adaptive_workers.current_limit().min(pipeline_capacity);
                 let schedule_end = target_index.saturating_add(task_window).min(tasks.len());
                 if next_to_schedule < schedule_end {
                     let (lock, signal) = &*work_signal;
@@ -1688,7 +1782,8 @@ where
                             &available_resolve_tasks,
                             &work_signal,
                         )?;
-                        let resolve_window = adaptive_workers.current_limit().min(hard_task_window);
+                        let resolve_window =
+                            adaptive_workers.current_limit().min(pipeline_capacity);
                         if outstanding_resolves >= resolve_window {
                             let parts = wait_for_resolved(
                                 &resolve_receiver,
@@ -1697,16 +1792,13 @@ where
                                 cancelled,
                                 current_bit,
                             )?;
-                            let decoded_bytes = emit_resolved_parts(
+                            emit_resolved_parts(
                                 parts,
                                 config,
                                 output,
                                 &mut accounting,
                                 &mut total_output,
                             )?;
-                            if adaptive_workers.observe_progress(decoded_bytes) {
-                                work_signal.1.notify_all();
-                            }
                             next_resolve_to_emit += 1;
                             outstanding_resolves -= 1;
                         }
@@ -1768,7 +1860,7 @@ where
                         &available_resolve_tasks,
                         &work_signal,
                     )?;
-                    let resolve_window = adaptive_workers.current_limit().min(hard_task_window);
+                    let resolve_window = adaptive_workers.current_limit().min(pipeline_capacity);
                     if outstanding_resolves >= resolve_window {
                         let parts = wait_for_resolved(
                             &resolve_receiver,
@@ -1777,21 +1869,18 @@ where
                             cancelled,
                             current_bit,
                         )?;
-                        let decoded_bytes = emit_resolved_parts(
+                        emit_resolved_parts(
                             parts,
                             config,
                             output,
                             &mut accounting,
                             &mut total_output,
                         )?;
-                        if adaptive_workers.observe_progress(decoded_bytes) {
-                            work_signal.1.notify_all();
-                        }
                         next_resolve_to_emit += 1;
                         outstanding_resolves -= 1;
                     }
                     next_to_emit += 1;
-                    let task_window = adaptive_workers.current_limit().min(hard_task_window);
+                    let task_window = adaptive_workers.current_limit().min(pipeline_capacity);
                     let schedule_end = next_to_emit.saturating_add(task_window).min(tasks.len());
                     if next_to_schedule < schedule_end {
                         let (lock, signal) = &*work_signal;

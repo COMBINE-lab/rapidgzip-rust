@@ -94,21 +94,35 @@ The BGZF, stored, and native paths use a `crossbeam-deque::Injector`, a sliding
 task window, scoped workers, and bounded result channels. For generic native
 decoding, the configured thread count is a maximum budget rather than a fixed
 active count. The controller reads `available_parallelism`, which respects the
-process affinity mask on supported platforms. Small pools and budgets no
-larger than half the visible machine start fully enabled. A larger machine-wide
-budget starts at roughly one third of visible parallelism, then compares that
-baseline with one additional worker using warmup and measured intervals of
-ordered decoded output. It keeps the neighbor only when throughput improves by
-more than a 3% noise margin. Thus the active limit is derived from both the
-machine and the current input instead of a compiled-in constant.
+process affinity mask on supported platforms and bounds active ranks by that
+value. A budget below the machine seed starts fully enabled. Larger budgets
+share a starting point at the ceiling of twice the square root of visible
+parallelism, so increasing the requested maximum never causes an abrupt jump
+or drop in bootstrap concurrency.
+This grows with the machine without multiplying speculative memory linearly by
+every processor. Streams with fewer than sixteen initial worker-waves retain
+that machine-derived bootstrap: calibrating a short decode costs more than an
+optimum found near EOF can recover.
+
+Longer streams measure native worker completions before ordered output handoff,
+so `DecoderReader` backpressure or parser speed cannot bias the decoder limit.
+Each candidate uses the median of three intervals. Work carries a controller
+generation, and completions begun under an earlier limit do not inflate the new
+candidate's byte count. The search probes downward first, preferring a lower
+setting within a 3% noise margin, or climbs in quarter-bootstrap steps while
+throughput materially improves. Its empirical search extent is at most twice
+the bootstrap and never exceeds the configured budget. This bounds calibration
+and speculative-memory exposure without a compiled-in worker cap.
 
 The active limit also controls the decode/resolve scheduling horizon because
 each speculative result commonly owns several MiB of `u16` symbols. Workers
-have stable ranks: only the enabled prefix touches per-worker buffers, while
-the remaining requested workers sleep on a separate condition variable and do
-not wake for ordinary queue activity. All enabled workers dynamically take
-marker-resolution work first and boundary-decode work second. BGZF and stored
-paths retain their format-specific worker counts.
+have stable ranks and are created lazily as upward probes require them. Ranks
+disabled by a later downward decision sleep on a separate condition variable
+and do not wake for ordinary queue activity. All enabled workers dynamically
+take marker-resolution work first and boundary-decode work second. Result
+channels retain two slots of scheduling slack so every worker cannot block
+publishing native results while an exact member bridge awaits resolution. BGZF
+and stored paths retain their format-specific worker counts.
 
 Native workers and their estimated grid persist across all members in a file.
 At each ordinary gzip member transition, the coordinator resets

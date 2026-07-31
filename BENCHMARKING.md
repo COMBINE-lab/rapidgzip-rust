@@ -110,7 +110,8 @@ builds used `-t --verify`; gzippy used `-d -c` to a discard sink because its
 `--test` path did not honor the requested one-thread budget in this build.
 Normal gzippy decompression verifies the gzip footer. Thread columns are
 requested worker budgets. The generic Rust marker pipeline treats that value
-as a maximum. For the 44-budget cell, its affinity-aware empirical controller
+as a maximum. This historical snapshot used the first affinity-aware empirical
+controller from commit `78a5fb2`. For the 44-budget cell, that controller
 started with 15 active worker ranks and compared the neighboring 16-worker
 setting using ordered output throughput; other Rust paths may use the complete
 budget. Median decoded throughput in MiB/s is:

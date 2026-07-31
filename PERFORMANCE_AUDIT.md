@@ -46,12 +46,13 @@ The accepted changes are:
   reader has a proven eight-byte fast path and retains checked safe-Rust tail
   handling.
 - Native decode/resolve concurrency is empirically controlled rather than
-  capped at a compiled-in value. The process-affinity-aware initial limit is
-  measured against its next worker using ordered output throughput, and the
-  scheduling horizon follows the selected limit. Stable worker ranks keep
-  disabled threads parked without allocating their buffers. On this 44-core
-  affinity mask the controller calibrates around 15--16 active workers. BGZF
-  and stored paths keep their format-specific parallelism.
+  capped at a compiled-in value. A process-affinity-aware square-root bootstrap
+  is capped monotonically by the requested worker budget and avoids linear
+  speculative-memory growth. Long inputs search both downward and upward using
+  generation-tagged native worker throughput; short inputs do not pay a
+  calibration cost they cannot amortize. The scheduling horizon follows the
+  selected limit, and worker ranks are created lazily. BGZF and stored paths
+  keep their format-specific parallelism.
 
 Correct overlapping-copy behavior is covered across predecessor references,
 short-distance overlap, and 32 KiB wraparound. Suffix-only window derivation is
@@ -68,11 +69,21 @@ marker replacement, 11.0% to `memcpy`, 4.7% to structural-candidate search,
 does not reduce the work per byte; it prevents that work from becoming slower
 and more memory-intensive when spread across this host's two sockets.
 
-The latest matrix confirms the distinction. At budget 16, Rust uses median
-1.98 s user and 0.39 s system CPU and finishes in 0.207 s. At budget 44, where
-the controller calibrates around 15--16 active workers, it uses 1.95 s user and
-0.39 s system CPU and finishes in 0.214 s. The earlier unrestricted 44-worker
-experiments used more CPU and memory while taking longer.
+The public FASTQ matrix originally confirmed the benefit of a bounded native
+window, but its first empirical controller overfit that 44-core case: it could
+only compare a one-third-machine bootstrap with one additional worker. On an
+88-CPU host a 64-budget request therefore began around 30, could not search
+downward, created all 64 requested threads, and regressed FASTQ median and tail
+performance while materially increasing RSS.
+
+The replacement controller resolves that failure mode. In a same-host
+diagnostic on the public FASTQ, the 64-budget median improved from 1,491 MiB/s
+with the first controller to 1,747 MiB/s, and median RSS fell from roughly
+585 MiB to 426 MiB. The parent fixed-16 implementation reached 1,662 MiB/s in
+the comparison run. Under the release 44-CPU affinity mask, the replacement's
+14-rank short-input bootstrap reached 1,602 MiB/s, retaining parity with the
+published C++ ISA-L and zlib-ng cells. A low-compression 256 MiB fixture reached
+1,762 MiB/s at a 64-worker budget versus 1,567 MiB/s for the fixed-16 parent.
 
 ## Rejected experiments
 
