@@ -21,6 +21,11 @@ use std::time::Duration;
 
 pub(crate) trait Output {
     fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError>;
+
+    fn emit_reusable(&mut self, chunk: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
+        self.emit(chunk)?;
+        Ok(Vec::new())
+    }
 }
 
 pub(crate) struct DirectOutput<'a, W> {
@@ -38,6 +43,14 @@ impl<W: Write> Output for DirectOutput<'_, W> {
         self.writer
             .write_all(&chunk)
             .map_err(DecodeError::output_io)
+    }
+
+    fn emit_reusable(&mut self, mut chunk: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
+        self.writer
+            .write_all(&chunk)
+            .map_err(DecodeError::output_io)?;
+        chunk.clear();
+        Ok(chunk)
     }
 }
 
@@ -476,6 +489,7 @@ where
         let mut inflater = RawInflater::new()?;
         let mut crc = Crc32::new();
         let mut member_output = 0_u32;
+        let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
 
         loop {
             if cancelled.load(Ordering::Relaxed) {
@@ -492,12 +506,14 @@ where
                 let input = cursor.available()?;
                 (input.as_ptr(), input.len().min(u32::MAX as usize))
             };
-            let mut decoded = vec![0_u8; config.decoded_chunk_size];
+            if decoded.capacity() < config.decoded_chunk_size {
+                decoded.reserve_exact(config.decoded_chunk_size - decoded.capacity());
+            }
 
             inflater.stream.next_in = input_pointer;
             inflater.stream.avail_in = input_length as u32;
-            inflater.stream.next_out = decoded.as_mut_ptr();
-            inflater.stream.avail_out = decoded.len() as u32;
+            inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+            inflater.stream.avail_out = decoded.capacity() as u32;
             let input_before = inflater.stream.avail_in;
             let output_before = inflater.stream.avail_out;
 
@@ -505,8 +521,9 @@ where
             // - `inflater.stream` was initialized and is uniquely borrowed.
             // - `next_in/avail_in` describe the current immutable cursor page,
             //   which is not moved or mutated until this call returns.
-            // - `next_out/avail_out` describe the initialized, uniquely owned
-            //   `decoded` allocation.
+            // - `next_out/avail_out` describe the uniquely owned spare
+            //   capacity of `decoded`. The backend reports how many bytes it
+            //   initialized before that length is exposed below.
             let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
 
             let consumed = usize::try_from(input_before - inflater.stream.avail_in)
@@ -514,7 +531,11 @@ where
             let produced = usize::try_from(output_before - inflater.stream.avail_out)
                 .expect("zlib uInt fits usize");
             cursor.advance(consumed);
-            decoded.truncate(produced);
+            // SAFETY: `output_before` was exactly `decoded.capacity()` and
+            // zlib-rs can only reduce `avail_out` after initializing those
+            // output bytes. Therefore `produced <= capacity`, and precisely
+            // the first `produced` bytes are initialized.
+            unsafe { decoded.set_len(produced) };
 
             if !decoded.is_empty() {
                 let new_total = total_output.checked_add(decoded.len() as u64).ok_or(
@@ -530,7 +551,7 @@ where
                 total_output = new_total;
                 member_output = member_output.wrapping_add(decoded.len() as u32);
                 crc.update(&decoded);
-                output.emit(decoded)?;
+                decoded = output.emit_reusable(decoded)?;
             }
 
             match status {

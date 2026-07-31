@@ -99,24 +99,51 @@ assumption is required.
 
 ## Closing the remaining ISA-L gap
 
-The next work should start with a paired one-worker profile of Rust, C++
-rapidgzip with ISA-L, and gzippy. In priority order:
+The paired one-worker follow-up attributed the gap more precisely:
 
-1. Attribute the approximately 80 MiB/s gap among DEFLATE decode, CRC32, input
-   paging/copying, zlib ABI calls, and process/setup overhead. Compare cycles,
-   instructions, branch misses, and bytes per backend call.
-2. Tune the existing zlib-rs route's input and output buffer sizes and reuse
-   inflater/output state where the profile supports it. This requires no new
-   dependency.
-3. Evaluate the safe zlib-rs Rust API against the current zlib-compatible ABI
-   only if it exposes meaningful state or buffer advantages. That is an API and
-   crate-surface choice and must be discussed before changing dependencies.
-4. Compare one native worker against authoritative zlib-rs. The native decoder
-   is now competitive in parallel, but its scalar symbol loop may still lose at
-   one worker; measurements should decide whether a hybrid route is useful.
-5. Only after those changes, revisit wider/multi-symbol Huffman decode with a
-   microbenchmark representative of FASTQ codes. The rejected generic two-level
-   design is not a basis for shipping more unsafe code.
+| counter | Rust/zlib-rs | C++/ISA-L | gzippy |
+|---|---:|---:|---:|
+| task-clock | 546.8 ms | 478.5 ms | 396.9 ms |
+| cycles | 1.906 billion | 1.661 billion | 1.370 billion |
+| instructions | 4.183 billion | 3.363 billion | 3.535 billion |
+| branches | 668.5 million | 511.0 million | 575.4 million |
+| branch misses | 26.9 million | 19.0 million | 16.6 million |
+
+In Rust, 88.8% of sampled cycles are in
+[zlib-rs](https://github.com/trifectatechfoundation/zlib-rs)'s runtime-dispatched
+`inflate_fast_help_avx2`, 4.2% in its PCLMULQDQ CRC, 3.1% in output zero-fill,
+2.6% in Huffman table construction, and less than 1% in the surrounding
+inflate state machine. The C++ profile is dominated by ISA-L's assembly decode
+and copy loops. gzippy's measured binary uses its default
+[Linux/x86-64 whole-fast-loop assembly kernel](https://github.com/jackdanger/gzippy/blob/fa2862a44af0c3123758c2d8990e934da9b55971/src/decompress/parallel/asm_kernel.rs)
+with multi-literal Huffman decoding; its result is not produced by a portable
+scalar Rust inflater.
+
+Removing the redundant output zero-fill and recycling the direct writer's
+allocation lowered Rust to roughly 1.84 billion cycles. In a subsequent
+portable 15-run interleaved comparison, Rust reached a 0.510 s median and
+676.3 MiB/s versus ISA-L's 0.464 s and 743.2 MiB/s, or 91.0%. Larger input and
+output buffers, fat LTO, and a diagnostic `target-cpu=native` build were neutral
+within run variance; the latter improved by less than 1%, confirming that the
+shipped runtime dispatch is already selecting the important hardware path.
+
+The next architectural work, in priority order, is:
+
+1. Keep zlib-rs as the default and prototype an upstreamable multi-symbol fast
+   loop or more efficient match-copy path in zlib-rs. The profile says changes
+   around its Rust API or our ABI adapter cannot recover the remaining 9%.
+2. Evaluate a faster CRC fold. Even eliminating CRC entirely would only just
+   cross the 95% threshold, so CRC work must accompany an inflater improvement
+   and remain verified on every member.
+3. If a second backend is acceptable, evaluate it behind an explicit feature
+   without changing the default. The observed gzippy path cannot be adopted as
+   a drop-in crate call: it owns the complete input/output and its fastest
+   kernel is Linux/x86-64-specific. Reusing its algorithm would require design
+   work for resumable output and non-x86 fallbacks.
+4. Otherwise, build an in-tree whole-loop x86-64 kernel with runtime dispatch,
+   plus safe scalar and AArch64 paths. This is likely capable of closing the
+   gap, but it is a substantially larger unsafe surface than the current
+   localized loads and marker replacement.
 
 The formal remaining gate is at least 95% of ISA-L-enabled rapidgzip in the
 one-worker FASTQ cell while preserving at least 100% geometric mean across all
