@@ -104,6 +104,20 @@ fn member_with_optional_header(bytes: &[u8]) -> Vec<u8> {
     header
 }
 
+fn padded_empty_member(total_size: usize) -> Vec<u8> {
+    const FIXED_SIZE: usize = 10 + 2 + 5 + 8;
+    assert!((FIXED_SIZE..=FIXED_SIZE + u16::MAX as usize).contains(&total_size));
+    let extra_size = total_size - FIXED_SIZE;
+    let mut encoded = b"\x1f\x8b\x08\x04\0\0\0\0\x00\xff".to_vec();
+    encoded.extend_from_slice(&(extra_size as u16).to_le_bytes());
+    encoded.resize(encoded.len() + extra_size, 0);
+    encoded.extend_from_slice(&stored_deflate(b""));
+    encoded.extend_from_slice(&0_u32.to_le_bytes());
+    encoded.extend_from_slice(&0_u32.to_le_bytes());
+    assert_eq!(encoded.len(), total_size);
+    encoded
+}
+
 #[test]
 fn decodes_single_member() {
     let compressed = member(b"the quick brown fox");
@@ -218,6 +232,41 @@ fn speculative_marker_path_decodes_dynamic_multiblock_members() {
     let report = decoder.decode(&compressed, &mut decoded).unwrap();
     assert_eq!(decoded, expected);
     assert_eq!(report.member_count, 2);
+}
+
+#[test]
+fn parallel_bridge_recognizes_a_final_block_beyond_the_last_grid_point() {
+    const MIB: usize = 1024 * 1024;
+    const MAX_PADDED_MEMBER: usize = 25 + u16::MAX as usize;
+    let (member, expected_member) = dynamic_multiblock_fixture();
+    let mut compressed = member.clone();
+
+    // Place the final member's two-block DEFLATE payload across the ninth
+    // 1 MiB grid point. Header-only padding keeps this regression fixture
+    // deterministic and compact in source while reproducing issue #1's
+    // position-dependent final-member transition.
+    let grid = 10 + 9 * MIB;
+    let final_header = grid - 80 - 10;
+    while compressed.len() < final_header {
+        let remaining = final_header - compressed.len();
+        let mut member_size = remaining.min(MAX_PADDED_MEMBER);
+        let tail = remaining - member_size;
+        if tail != 0 && tail < 25 {
+            member_size -= 25 - tail;
+        }
+        compressed.extend(padded_empty_member(member_size));
+    }
+    assert_eq!(compressed.len(), final_header);
+    compressed.extend_from_slice(&member);
+
+    let decoder = Decoder::builder().decoder_threads(4).build().unwrap();
+    let mut decoded = Vec::new();
+    let report = decoder.decode(&compressed, &mut decoded).unwrap();
+    assert_eq!(
+        decoded,
+        [expected_member.as_slice(), expected_member.as_slice()].concat()
+    );
+    assert_eq!(report.member_count, 146);
 }
 
 #[test]

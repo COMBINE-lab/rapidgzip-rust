@@ -3,6 +3,7 @@
 //! These types are public only as a module for architectural documentation and
 //! focused benchmarking; the stable decoder API does not expose block indexes.
 
+pub(crate) mod adaptive;
 pub(crate) mod deflate;
 mod marker;
 

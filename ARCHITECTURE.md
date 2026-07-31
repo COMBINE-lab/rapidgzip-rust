@@ -70,6 +70,10 @@ Member ends come only from an actual `BFINAL`, byte alignment, and a verified
 eight-byte footer. Optimized raw inflate can read several bytes beyond the
 DEFLATE end, so footer recovery examines at most the preceding 16 bytes and
 accepts only a location matching both the already computed CRC32 and ISIZE.
+With `Z_BLOCK`, zlib may return `Z_OK` at the final end-of-block before a later
+call would return `Z_STREAM_END`; the decoder recognizes zlib's last-block
+`data_type` flag and byte-aligns that boundary instead of treating the footer
+as another resumable DEFLATE block.
 The next header is parsed at that verified offset; gzip magic inside compressed
 bytes is never accepted as a member boundary.
 
@@ -88,12 +92,23 @@ reuse their initialized zlib-rs stream with `inflateReset`.
 
 The BGZF, stored, and native paths use a `crossbeam-deque::Injector`, a sliding
 task window, scoped workers, and bounded result channels. For generic native
-decoding, the configured thread count is a budget and the combined active
-decode/resolve window is capped at 16. Each speculative result commonly owns
-several MiB of `u16` symbols; larger windows reduced throughput and sharply
-increased memory pressure on the measured dual-socket host. All active native
-workers dynamically take marker-resolution work first and boundary-decode work
-second. BGZF and stored paths retain their format-specific worker counts.
+decoding, the configured thread count is a maximum budget rather than a fixed
+active count. The controller reads `available_parallelism`, which respects the
+process affinity mask on supported platforms. Small pools and budgets no
+larger than half the visible machine start fully enabled. A larger machine-wide
+budget starts at roughly one third of visible parallelism, then compares that
+baseline with one additional worker using warmup and measured intervals of
+ordered decoded output. It keeps the neighbor only when throughput improves by
+more than a 3% noise margin. Thus the active limit is derived from both the
+machine and the current input instead of a compiled-in constant.
+
+The active limit also controls the decode/resolve scheduling horizon because
+each speculative result commonly owns several MiB of `u16` symbols. Workers
+have stable ranks: only the enabled prefix touches per-worker buffers, while
+the remaining requested workers sleep on a separate condition variable and do
+not wake for ordinary queue activity. All enabled workers dynamically take
+marker-resolution work first and boundary-decode work second. BGZF and stored
+paths retain their format-specific worker counts.
 
 Native workers and their estimated grid persist across all members in a file.
 At each ordinary gzip member transition, the coordinator resets

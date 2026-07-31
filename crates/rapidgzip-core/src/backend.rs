@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::crc32::Crc32;
 use crate::gzip::{SourceCursor, parse_member_header};
 use crate::parallel::Window;
+use crate::parallel::adaptive::AdaptiveConcurrency;
 use crate::parallel::deflate::{
     ChunkOutput, Error as NativeError, InitialHistory, ResolvedParts, decode_to_estimated_boundary,
     find_next_structural_candidate,
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) trait Output {
     fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError>;
@@ -295,6 +296,20 @@ struct StopGuard<'a>(&'a AtomicBool);
 impl Drop for StopGuard<'_> {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+struct SignalledStopGuard<'a> {
+    stopped: &'a AtomicBool,
+    work_signal: &'a Condvar,
+    limit_signal: &'a Condvar,
+}
+
+impl Drop for SignalledStopGuard<'_> {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        self.work_signal.notify_all();
+        self.limit_signal.notify_all();
     }
 }
 
@@ -881,6 +896,68 @@ struct ResolveResult {
     result: Result<ResolvedParts, crate::parallel::MarkerError>,
 }
 
+/// Admission control shared by the generic decode and marker-resolution work.
+///
+/// The full requested worker pool remains available, but only the empirically
+/// selected stable prefix may execute memory-intensive work. Stable ranks keep
+/// per-worker compressed buffers local instead of rotating every parked thread
+/// through the active set. Admission is one atomic rank check per task; the
+/// controller mutex is touched only when ordered output advances.
+struct AdaptiveWorkers {
+    controller: Mutex<AdaptiveConcurrency>,
+    current_limit: AtomicUsize,
+    limit_mutex: Mutex<()>,
+    limit_signal: Condvar,
+}
+
+impl AdaptiveWorkers {
+    fn new(maximum: usize, machine_parallelism: usize, sample_bytes: usize) -> Self {
+        let controller = AdaptiveConcurrency::new(maximum, machine_parallelism, sample_bytes);
+        let current_limit = controller.current_limit();
+        Self {
+            controller: Mutex::new(controller),
+            current_limit: AtomicUsize::new(current_limit),
+            limit_mutex: Mutex::new(()),
+            limit_signal: Condvar::new(),
+        }
+    }
+
+    fn current_limit(&self) -> usize {
+        self.current_limit.load(Ordering::Acquire)
+    }
+
+    fn worker_enabled(&self, worker_index: usize) -> bool {
+        worker_index < self.current_limit()
+    }
+
+    fn wait_until_enabled(&self, worker_index: usize, stopped: &AtomicBool) {
+        let guard = self
+            .limit_mutex
+            .lock()
+            .expect("adaptive limit mutex poisoned");
+        let _guard = self
+            .limit_signal
+            .wait_while(guard, |_| {
+                !self.worker_enabled(worker_index) && !stopped.load(Ordering::Relaxed)
+            })
+            .expect("adaptive limit mutex poisoned");
+    }
+
+    fn observe_progress(&self, decoded_bytes: usize) -> bool {
+        let mut controller = self
+            .controller
+            .lock()
+            .expect("adaptive worker mutex poisoned");
+        let changed = controller.observe_progress(decoded_bytes, Instant::now());
+        if changed {
+            self.current_limit
+                .store(controller.current_limit(), Ordering::Release);
+            self.limit_signal.notify_all();
+        }
+        changed
+    }
+}
+
 fn send_native_result(
     sender: &mpsc::SyncSender<NativeResult>,
     stopped: &AtomicBool,
@@ -1013,6 +1090,17 @@ fn inflate_tail(
             return Err(NativeError::InvalidSymbol);
         }
         if inflater.stream.data_type & 0x80 != 0 {
+            // zlib's Z_BLOCK contract sets bit 6 after decoding an end-of-block
+            // code for a BFINAL block, even though this call can still return
+            // Z_OK rather than Z_STREAM_END. There is no following block to
+            // resume from; DEFLATE instead pads the stream to the next byte.
+            if inflater.stream.data_type & 0x40 != 0 {
+                return Ok(BackendTail {
+                    output,
+                    end_bit: position.div_ceil(8).saturating_mul(8),
+                    reached_stream_end: true,
+                });
+            }
             match position.cmp(&stop_bit) {
                 std::cmp::Ordering::Equal => {
                     return Ok(BackendTail {
@@ -1158,12 +1246,13 @@ fn emit_resolved_parts<O: Output>(
     output: &mut O,
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
-) -> Result<(), DecodeError> {
+) -> Result<usize, DecodeError> {
     let (marked, clean, backend_tail) = parts;
+    let decoded_bytes = marked.len() + clean.len() + backend_tail.len();
     emit_accounted(marked, config, output, accounting, total_output)?;
     emit_accounted(clean, config, output, accounting, total_output)?;
     emit_accounted(backend_tail, config, output, accounting, total_output)?;
-    Ok(())
+    Ok(decoded_bytes)
 }
 
 fn wait_for_resolved(
@@ -1333,11 +1422,6 @@ where
 {
     const SEARCH_BYTES: u64 = 512 * 1024;
     const LOOKAHEAD_BYTES: u64 = 512 * 1024;
-    // A native result stores speculative symbols as u16 until its predecessor
-    // window is known. Bounding both the active workers and combined
-    // decode/resolve pipeline avoids memory-bandwidth collapse and prevents
-    // high thread budgets from faulting hundreds of MiB on NUMA hosts.
-    const MAX_NATIVE_TASK_WINDOW: usize = 16;
     // This cursor touches only gzip headers and footers. Large pages would
     // copy compressed payload that the positional workers read independently.
     let mut frame_cursor = SourceCursor::new(source, config.input_page_size.min(256))?;
@@ -1393,22 +1477,26 @@ where
     let available_decode_tasks = Arc::new(AtomicUsize::new(0));
     let available_resolve_tasks = Arc::new(AtomicUsize::new(0));
     let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
-    let task_window = config
-        .in_flight_chunks
-        .max(config.decoder_threads)
-        .min(MAX_NATIVE_TASK_WINDOW)
-        .min(tasks.len());
-    for index in 0..task_window {
+    let worker_count = config.decoder_threads.min(tasks.len());
+    let hard_task_window = config.in_flight_chunks.max(worker_count).min(tasks.len());
+    let machine_parallelism = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let adaptive_workers = Arc::new(AdaptiveWorkers::new(
+        worker_count,
+        machine_parallelism,
+        compressed_chunk_size.saturating_mul(32),
+    ));
+    let initial_task_window = adaptive_workers.current_limit().min(hard_task_window);
+    for index in 0..initial_task_window {
         task_queue.push(index);
     }
-    available_decode_tasks.store(task_window, Ordering::Release);
-    let (sender, receiver) = mpsc::sync_channel::<NativeResult>(task_window);
-    let (resolve_sender, resolve_receiver) = mpsc::sync_channel::<ResolveResult>(task_window);
+    available_decode_tasks.store(initial_task_window, Ordering::Release);
+    let (sender, receiver) = mpsc::sync_channel::<NativeResult>(hard_task_window);
+    let (resolve_sender, resolve_receiver) = mpsc::sync_channel::<ResolveResult>(hard_task_window);
 
     let mut member_count = 0_u64;
     let mut total_output = 0_u64;
     let mut current_bit = first_deflate_bit;
-    let mut next_to_schedule = task_window;
+    let mut next_to_schedule = initial_task_window;
     let mut next_to_emit = 0_usize;
     let mut pending = BTreeMap::new();
     let mut prepared_total_output = 0_u64;
@@ -1418,9 +1506,12 @@ where
     let mut resolve_pending = BTreeMap::new();
 
     let scoped_result = thread::scope(|scope| -> Result<(), DecodeError> {
-        let _stop_on_exit = StopGuard(&stopped);
-        let worker_count = config.decoder_threads.min(tasks.len()).min(task_window);
-        for _ in 0..worker_count {
+        let _stop_on_exit = SignalledStopGuard {
+            stopped: &stopped,
+            work_signal: &work_signal.1,
+            limit_signal: &adaptive_workers.limit_signal,
+        };
+        for worker_index in 0..worker_count {
             let queue = Arc::clone(&task_queue);
             let resolve_queue = Arc::clone(&resolve_queue);
             let sender = sender.clone();
@@ -1429,12 +1520,17 @@ where
             let available_decode_tasks = Arc::clone(&available_decode_tasks);
             let available_resolve_tasks = Arc::clone(&available_resolve_tasks);
             let work_signal = Arc::clone(&work_signal);
+            let adaptive_workers = Arc::clone(&adaptive_workers);
             let tasks = &tasks;
             scope.spawn(move || {
                 let mut compressed = Vec::new();
                 loop {
                     if stopped.load(Ordering::Relaxed) {
                         break;
+                    }
+                    if !adaptive_workers.worker_enabled(worker_index) {
+                        adaptive_workers.wait_until_enabled(worker_index, &stopped);
+                        continue;
                     }
                     match resolve_queue.steal() {
                         Steal::Success(task) => {
@@ -1478,8 +1574,9 @@ where
                     let guard = lock.lock().expect("estimated work mutex poisoned");
                     let _ = signal
                         .wait_timeout_while(guard, Duration::from_millis(1), |_| {
-                            available_decode_tasks.load(Ordering::Acquire) == 0
+                            (available_decode_tasks.load(Ordering::Acquire) == 0
                                 && available_resolve_tasks.load(Ordering::Acquire) == 0
+                                || !adaptive_workers.worker_enabled(worker_index))
                                 && !stopped.load(Ordering::Relaxed)
                         })
                         .expect("estimated work mutex poisoned");
@@ -1552,6 +1649,7 @@ where
                 if next_to_schedule < target_index {
                     next_to_schedule = target_index;
                 }
+                let task_window = adaptive_workers.current_limit().min(hard_task_window);
                 let schedule_end = target_index.saturating_add(task_window).min(tasks.len());
                 if next_to_schedule < schedule_end {
                     let (lock, signal) = &*work_signal;
@@ -1590,7 +1688,8 @@ where
                             &available_resolve_tasks,
                             &work_signal,
                         )?;
-                        if outstanding_resolves >= task_window {
+                        let resolve_window = adaptive_workers.current_limit().min(hard_task_window);
+                        if outstanding_resolves >= resolve_window {
                             let parts = wait_for_resolved(
                                 &resolve_receiver,
                                 &mut resolve_pending,
@@ -1598,13 +1697,16 @@ where
                                 cancelled,
                                 current_bit,
                             )?;
-                            emit_resolved_parts(
+                            let decoded_bytes = emit_resolved_parts(
                                 parts,
                                 config,
                                 output,
                                 &mut accounting,
                                 &mut total_output,
                             )?;
+                            if adaptive_workers.observe_progress(decoded_bytes) {
+                                work_signal.1.notify_all();
+                            }
                             next_resolve_to_emit += 1;
                             outstanding_resolves -= 1;
                         }
@@ -1666,7 +1768,8 @@ where
                         &available_resolve_tasks,
                         &work_signal,
                     )?;
-                    if outstanding_resolves >= task_window {
+                    let resolve_window = adaptive_workers.current_limit().min(hard_task_window);
+                    if outstanding_resolves >= resolve_window {
                         let parts = wait_for_resolved(
                             &resolve_receiver,
                             &mut resolve_pending,
@@ -1674,17 +1777,21 @@ where
                             cancelled,
                             current_bit,
                         )?;
-                        emit_resolved_parts(
+                        let decoded_bytes = emit_resolved_parts(
                             parts,
                             config,
                             output,
                             &mut accounting,
                             &mut total_output,
                         )?;
+                        if adaptive_workers.observe_progress(decoded_bytes) {
+                            work_signal.1.notify_all();
+                        }
                         next_resolve_to_emit += 1;
                         outstanding_resolves -= 1;
                     }
                     next_to_emit += 1;
+                    let task_window = adaptive_workers.current_limit().min(hard_task_window);
                     let schedule_end = next_to_emit.saturating_add(task_window).min(tasks.len());
                     if next_to_schedule < schedule_end {
                         let (lock, signal) = &*work_signal;
@@ -2173,6 +2280,16 @@ mod tests {
         assert_eq!(tail.output, b"hello");
         assert_eq!(tail.end_bit, first_block_end);
         assert!(!tail.reached_stream_end);
+    }
+
+    #[test]
+    fn zlib_rs_tail_recognizes_final_z_block_boundary() {
+        // Empty final fixed-Huffman block. Z_BLOCK reaches its end-of-block
+        // before a subsequent inflate call would report Z_STREAM_END.
+        let tail = inflate_tail(&[0x03, 0x00], 0, 1, &Window::empty(), 1024, false).unwrap();
+        assert!(tail.output.is_empty());
+        assert_eq!(tail.end_bit, 16);
+        assert!(tail.reached_stream_end);
     }
 
     #[test]

@@ -4,17 +4,17 @@
 
 The optimized generic marker pipeline now clears the intermediate public-FASTQ
 gate against zlib-ng-only C++ rapidgzip. At requested worker budgets 1, 4, 16,
-and 44, its median throughput is 216.7%, 138.8%, 121.4%, and 114.4% of that
-control, with a 143.0% geometric mean and lower observed peak RSS in every
+and 44, its median throughput is 228.5%, 146.5%, 116.3%, and 99.7% of that
+control, with a 140.4% geometric mean and lower observed peak RSS in every
 cell. The reproducible matrix is in [BENCHMARKING.md](BENCHMARKING.md).
 
-Against ISA-L-enabled rapidgzip, Rust reaches 88.8%, 125.0%, 107.7%, and
-107.3%, with a 106.4% geometric mean. The remaining formal ISA-L failure is
-therefore narrow and specific: the one-worker path is 631.4 MiB/s versus
-710.9 MiB/s. That path is authoritative zlib-rs inflate rather than the native
+Against ISA-L-enabled rapidgzip, Rust reaches 91.7%, 133.9%, 104.5%, and
+100.6%, with a 106.6% geometric mean. The remaining formal ISA-L failure is
+therefore narrow and specific: the one-worker path is 658.7 MiB/s versus
+718.3 MiB/s. That path is authoritative zlib-rs inflate rather than the native
 marker decoder, so further multi-worker marker tuning will not close it.
 
-Pure-Rust gzippy reaches 800.2 MiB/s at one worker on the same file. This is
+Pure-Rust gzippy reaches 798.1 MiB/s at one worker on the same file. This is
 strong evidence that an ISA-L binding is not inherently required, although its
 library/output design differs from this project's incremental `Read + Send`
 contract.
@@ -45,12 +45,13 @@ The accepted changes are:
 - Huffman leaves are packed into `u16`, halving the large direct tables. The bit
   reader has a proven eight-byte fast path and retains checked safe-Rust tail
   handling.
-- The combined native decode/resolve window and active generic worker count are
-  capped at 16. Each task commonly owns 3--4 MiB of `u16` output on this FASTQ;
-  allowing a 44-task active window crossed NUMA boundaries, raised system CPU
-  and peak RSS, and reduced wall throughput. The public thread setting is now
-  documented as a maximum worker budget. BGZF and stored paths keep their
-  format-specific parallelism.
+- Native decode/resolve concurrency is empirically controlled rather than
+  capped at a compiled-in value. The process-affinity-aware initial limit is
+  measured against its next worker using ordered output throughput, and the
+  scheduling horizon follows the selected limit. Stable worker ranks keep
+  disabled threads parked without allocating their buffers. On this 44-core
+  affinity mask the controller calibrates around 15--16 active workers. BGZF
+  and stored paths keep their format-specific parallelism.
 
 Correct overlapping-copy behavior is covered across predecessor references,
 short-distance overlap, and 32 KiB wraparound. Suffix-only window derivation is
@@ -60,18 +61,18 @@ tests remain the release gate.
 
 ## Current profile
 
-A diagnostic 44-budget profile before applying the active-worker cap attributed
+A diagnostic 44-budget profile before bounding active workers attributed
 approximately 60.0% of user cycles to native compressed-block decode, 13.6% to
 marker replacement, 11.0% to `memcpy`, 4.7% to structural-candidate search,
-4.0% to Huffman-table construction, and 2.1% to PCLMULQDQ CRC32. The cap does
-not reduce the work per byte; it prevents that work from becoming slower and
-more memory-intensive when spread across this host's two sockets.
+4.0% to Huffman-table construction, and 2.1% to PCLMULQDQ CRC32. The controller
+does not reduce the work per byte; it prevents that work from becoming slower
+and more memory-intensive when spread across this host's two sockets.
 
 The latest matrix confirms the distinction. At budget 16, Rust uses median
-1.91 s user and 0.46 s system CPU and finishes in 0.200 s. At budget 44, where
-the native active count remains 16, it uses 1.94 s user and 0.50 s system CPU
-and finishes in 0.208 s. The earlier unrestricted 44-worker experiments used
-more CPU and memory while taking longer.
+1.98 s user and 0.39 s system CPU and finishes in 0.207 s. At budget 44, where
+the controller calibrates around 15--16 active workers, it uses 1.95 s user and
+0.39 s system CPU and finishes in 0.214 s. The earlier unrestricted 44-worker
+experiments used more CPU and memory while taking longer.
 
 ## Rejected experiments
 
