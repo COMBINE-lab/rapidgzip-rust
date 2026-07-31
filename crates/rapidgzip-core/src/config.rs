@@ -34,7 +34,13 @@ pub(crate) struct Config {
     pub(crate) output_limit: Option<u64>,
 }
 
-/// Builder for a [`Decoder`].
+/// Builder for an immutable, reusable [`Decoder`].
+///
+/// Defaults use [`std::thread::available_parallelism`] as the maximum decoder
+/// budget, 4 MiB decoded chunks, 1 MiB positional input pages and compressed
+/// grid spacing, `decoder_threads + 2` in-flight chunks, and no output limit.
+/// The defaults favor throughput; applications with tight memory budgets can
+/// reduce the worker budget, decoded chunk size, or in-flight count.
 #[derive(Clone, Debug)]
 pub struct DecoderBuilder {
     config: Config,
@@ -64,19 +70,27 @@ impl DecoderBuilder {
     /// Individual paths may use fewer active workers when the input exposes
     /// less parallelism or when a larger speculative window would reduce
     /// throughput through memory pressure.
+    ///
+    /// This also resets the in-flight chunk count to `threads + 2`. Call
+    /// [`DecoderBuilder::in_flight_chunks`] afterward to override that value.
     pub const fn decoder_threads(mut self, threads: usize) -> Self {
         self.config.decoder_threads = threads;
         self.config.in_flight_chunks = threads.saturating_add(2);
         self
     }
 
-    /// Sets the target decoded chunk size.
+    /// Sets the target decoded chunk size in bytes.
+    ///
+    /// Larger chunks reduce handoff overhead but can increase per-worker and
+    /// queued memory. The value must be non-zero and fit in zlib's `uInt`.
     pub const fn decoded_chunk_size(mut self, bytes: usize) -> Self {
         self.config.decoded_chunk_size = bytes;
         self
     }
 
-    /// Sets the positional input page size.
+    /// Sets the positional input page size in bytes.
+    ///
+    /// The value must be non-zero and fit in zlib's `uInt`.
     pub const fn input_page_size(mut self, bytes: usize) -> Self {
         self.config.input_page_size = bytes;
         self
@@ -92,18 +106,30 @@ impl DecoderBuilder {
     }
 
     /// Sets the maximum number of decoded chunks awaiting consumption.
+    ///
+    /// This bounds reader backpressure and ordered-result buffering at the
+    /// final handoff. The value must be non-zero.
     pub const fn in_flight_chunks(mut self, count: usize) -> Self {
         self.config.in_flight_chunks = count;
         self
     }
 
-    /// Sets or clears the total decoded-output limit.
+    /// Sets or clears the total decoded-output limit in bytes.
+    ///
+    /// On overflow, decoding returns [`DecodeError::OutputLimitExceeded`]
+    /// before emitting bytes beyond the limit. Output already emitted remains
+    /// visible to the caller.
     pub const fn output_limit(mut self, bytes: Option<u64>) -> Self {
         self.config.output_limit = bytes;
         self
     }
 
     /// Validates the configuration and creates a reusable decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when a size or count violates the constraints
+    /// documented on its setter.
     pub fn build(self) -> Result<Decoder, ConfigError> {
         if self.config.decoder_threads == 0 {
             return Err(ConfigError("decoder_threads must be non-zero"));
@@ -139,15 +165,19 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Creates a builder initialized with documented defaults.
+    /// Creates a builder initialized with the [`DecoderBuilder`] defaults.
     pub fn builder() -> DecoderBuilder {
         DecoderBuilder::default()
     }
 
-    /// Decodes all gzip members into `output`.
+    /// Decodes and verifies all gzip members into `output`.
     ///
     /// The writer is used only by the calling thread and need not implement
     /// [`Send`].
+    ///
+    /// The compressed source must keep its length and contents stable for the
+    /// duration of this call. On error, `output` can contain a verified prefix;
+    /// writes are not rolled back.
     pub fn decode<R, W>(&self, source: &R, output: &mut W) -> Result<DecodeReport, DecodeError>
     where
         R: ReadAt + ?Sized,
@@ -160,6 +190,11 @@ impl Decoder {
 
     /// Starts decoding an owned positional source and returns `Read + Send`
     /// decompressed output.
+    ///
+    /// Initial gzip framing is validated before the background coordinator is
+    /// spawned. Later decoding failures are returned as [`std::io::Error`]
+    /// values by [`std::io::Read`], or as [`DecodeError`] by
+    /// [`DecoderReader::finish`].
     pub fn reader<R>(&self, source: R) -> Result<DecoderReader, DecodeError>
     where
         R: ReadAt + 'static,
@@ -169,6 +204,8 @@ impl Decoder {
     }
 
     /// Opens a compressed file and returns a `Read + Send` decompressed stream.
+    ///
+    /// The file is owned by the returned reader and accessed positionally.
     pub fn open<P: AsRef<Path>>(&self, path: P) -> Result<DecoderReader, DecodeError> {
         let file = File::open(path).map_err(|error| DecodeError::input_io(0, error))?;
         self.reader(file)

@@ -4,14 +4,20 @@ use std::sync::Arc;
 
 /// Thread-safe positional compressed input.
 ///
-/// Implementations must return `Ok(0)` only at or beyond [`ReadAt::len`], and
-/// callers must keep both the snapshotted length and contents stable during a
-/// decode.
+/// Calls to [`ReadAt::read_at`] can occur concurrently and must not mutate a
+/// shared stream cursor. Implementations may return short reads, but must not
+/// return `Ok(0)` before the requested offset reaches [`ReadAt::len`]. The
+/// reported length and every byte before it must remain stable for the complete
+/// decode. Violating these requirements can cause an ordinary decoding error,
+/// but cannot violate memory safety because the trait is safe.
 pub trait ReadAt: Send + Sync {
     /// Returns the current source length in bytes.
     fn len(&self) -> io::Result<u64>;
 
-    /// Reads bytes beginning at `offset` without changing shared cursor state.
+    /// Reads at most `buffer.len()` bytes beginning at `offset`.
+    ///
+    /// An empty buffer returns zero. A non-empty buffer returns zero only when
+    /// `offset` is at or beyond the current source length.
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize>;
 
     /// Returns whether this source is empty.

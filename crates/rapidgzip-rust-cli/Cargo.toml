@@ -7,6 +7,9 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords = ["gzip", "deflate", "parallel", "bgzf", "cli"]
+categories = ["compression", "command-line-utilities"]
 
 [[bin]]
 name = "rapidgzip-rust"

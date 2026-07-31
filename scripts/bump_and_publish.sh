@@ -12,7 +12,8 @@ usage() {
 Usage: scripts/bump_and_publish.sh [--dry-run] [--yes] VERSION
 
 Arguments:
-  VERSION    SemVer release number without a leading "v" (for example, 0.2.0)
+  VERSION    SemVer release number without a leading "v" (for example, 0.2.0).
+             For an initial release, this may equal the workspace version.
 
 Options:
   --dry-run  Validate and package the release, then restore version files
@@ -111,18 +112,19 @@ if [[ -z "$current_version" ]]; then
     echo "error: could not read workspace.package.version from Cargo.toml" >&2
     exit 1
 fi
-if [[ "$version" == "$current_version" ]]; then
-    echo "error: workspace version is already $version" >&2
-    exit 1
-fi
 if git rev-parse --verify --quiet "refs/tags/v$version" >/dev/null; then
     echo "error: tag v$version already exists" >&2
     exit 1
 fi
 
+version_changed=true
+if [[ "$version" == "$current_version" ]]; then
+    version_changed=false
+fi
+
 release_committed=false
 restore_version_files() {
-    if [[ "$release_committed" == false ]]; then
+    if [[ "$release_committed" == false && "$version_changed" == true ]]; then
         git restore -- Cargo.toml Cargo.lock
     fi
 }
@@ -131,7 +133,8 @@ if [[ "$dry_run" == true ]]; then
     trap restore_version_files EXIT
 fi
 
-CURRENT_VERSION="$current_version" TARGET_VERSION="$version" python3 - <<'PY'
+if [[ "$version_changed" == true ]]; then
+    CURRENT_VERSION="$current_version" TARGET_VERSION="$version" python3 - <<'PY'
 import os
 import re
 from pathlib import Path
@@ -175,9 +178,14 @@ if package_updates != 1 or dependency_updates != 1:
 
 path.write_text("".join(lines), encoding="utf-8")
 PY
+fi
 
-echo "Preparing rapidgzip-rust $current_version -> $version"
-cargo check --workspace
+if [[ "$version_changed" == true ]]; then
+    echo "Preparing rapidgzip-rust $current_version -> $version"
+else
+    echo "Preparing initial rapidgzip-rust v$version release"
+fi
+cargo check --workspace --locked
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
@@ -191,7 +199,11 @@ fi
 
 if [[ "$assume_yes" == false ]]; then
     echo
-    echo "The checks passed. This will commit and tag v$version, push both to origin,"
+    if [[ "$version_changed" == true ]]; then
+        echo "The checks passed. This will commit and tag v$version, push both to origin,"
+    else
+        echo "The checks passed. This will tag the current commit as v$version, push it to origin,"
+    fi
     echo "and publish the workspace crates to crates.io."
     read -r -p "Continue? [y/N] " reply
     if [[ ! "$reply" =~ ^[Yy]$ ]]; then
@@ -201,8 +213,10 @@ if [[ "$assume_yes" == false ]]; then
     fi
 fi
 
-git add Cargo.toml Cargo.lock
-git commit -m "Release v$version"
+if [[ "$version_changed" == true ]]; then
+    git add Cargo.toml Cargo.lock
+    git commit -m "Release v$version"
+fi
 git tag -a "v$version" -m "Release v$version"
 release_committed=true
 trap - ERR

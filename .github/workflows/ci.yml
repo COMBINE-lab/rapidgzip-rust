@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,5 +14,31 @@ jobs:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+      - run: cargo test --workspace --doc --locked
+      - run: cmp LICENSE-MIT crates/rapidgzip-core/LICENSE-MIT
+      - run: cmp LICENSE-MIT crates/rapidgzip-rust-cli/LICENSE-MIT
+      - run: cmp LICENSE-BSD-3-CLAUSE crates/rapidgzip-core/LICENSE-BSD-3-CLAUSE
+      - run: cmp LICENSE-BSD-3-CLAUSE crates/rapidgzip-rust-cli/LICENSE-BSD-3-CLAUSE
+      - run: cargo package --workspace --locked
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked

@@ -51,7 +51,13 @@ enum Terminal {
 
 /// Owned parallel decoder output implementing [`Read`] and [`Send`].
 ///
-/// Dropping this value cancels and joins the background pipeline.
+/// Reaching EOF means every gzip member was verified and makes the final
+/// [`DecodeReport`] available through [`DecoderReader::report`]. A decoding
+/// failure is returned as an [`io::Error`] whose source is a [`DecodeError`].
+///
+/// Dropping this value cancels and joins the background pipeline. It does not
+/// verify unread compressed data; use [`DecoderReader::finish`] to discard
+/// unread output while still verifying the complete stream.
 #[must_use]
 pub struct DecoderReader {
     receiver: Option<Receiver<Message>>,
@@ -97,6 +103,8 @@ where
 
 impl DecoderReader {
     /// Returns the report after verified EOF has been observed.
+    ///
+    /// This is `None` while decoding is open and after a terminal failure.
     pub const fn report(&self) -> Option<&DecodeReport> {
         match &self.terminal {
             Terminal::Finished(report) => Some(report),
@@ -105,10 +113,10 @@ impl DecoderReader {
     }
 
     fn join_worker(&mut self) -> Result<(), DecodeError> {
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            return Err(DecodeError::WorkerPanicked);
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                return Err(DecodeError::WorkerPanicked);
+            }
         }
         Ok(())
     }
@@ -150,6 +158,10 @@ impl DecoderReader {
 
     /// Discards unread output, verifies the remaining stream, and returns its
     /// final report.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first decoding, verification, input, or worker failure.
     pub fn finish(mut self) -> Result<DecodeReport, DecodeError> {
         self.current.clear();
         loop {

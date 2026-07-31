@@ -144,16 +144,16 @@ where
     // headers are needed for indexing. A small page avoids reading the
     // complete compressed payload before decoding.
     let bgzf_index = index_bgzf(source, config.input_page_size.min(256))?;
-    if let Some(index) = bgzf_index
-        && index.len() > 1
-    {
-        return decode_bgzf_parallel(source, config, cancelled, output, &index);
+    if let Some(index) = bgzf_index {
+        if index.len() > 1 {
+            return decode_bgzf_parallel(source, config, cancelled, output, &index);
+        }
     }
     if config.decoder_threads > 1 {
-        if let Some(index) = index_stored_stream(source, config.input_page_size.min(256))?
-            && index.tasks.len() > 1
-        {
-            return decode_stored_parallel(source, config, cancelled, output, &index);
+        if let Some(index) = index_stored_stream(source, config.input_page_size.min(256))? {
+            if index.tasks.len() > 1 {
+                return decode_stored_parallel(source, config, cancelled, output, &index);
+            }
         }
         if let Some(index) = index_independent_members(source, config)? {
             return decode_independent_members(source, config, cancelled, output, &index);
