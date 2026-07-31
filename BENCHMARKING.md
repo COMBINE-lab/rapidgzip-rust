@@ -235,3 +235,28 @@ parallel decode was slower than the 605 MB/s one-worker result. The table's
 corresponding medians are 641, 5,016, and 6,173 MB/s. Peak RSS was 18,908 KiB
 at budget 16 and 38,348 KiB at budget 32. A SHA-256 comparison against GNU
 gzip produced the same decoded digest.
+
+### Adjacent-member result collation
+
+A follow-up optimization groups at most four candidate headers per worker and
+collates only separately authenticated, exactly adjacent members. It activates
+only when the prefix averages at least 256 candidates per configured compressed
+grid interval. A fresh comparison against the exact pre-collation commit on the
+372,000-byte-member fixture found essentially neutral throughput: -0.3%, -1.2%,
+and +1.0% at budgets 4, 16, and 32. This confirms that ordinary BCL
+Convert-sized FASTQ members remain on the prior one-member task path.
+
+To expose coordinator overhead directly, a separate stress fixture concatenated
+one million valid one-byte gzip members (23 MiB compressed). Three alternating
+runs of the pre-collation and collating binaries gave these median wall times:
+
+| decoder-worker budget | pre-collation | collating | speedup |
+|---:|---:|---:|---:|
+| 4 | 3.01 s | 2.52 s | 1.19x |
+| 16 | 4.85 s | 1.43 s | 3.39x |
+| 32 | 7.11 s | 2.43 s | 2.93x |
+
+This deliberately pathological fixture is a scheduling diagnostic rather than
+a throughput or release-parity corpus. High-thread measurements were noisy on
+the shared dual-Xeon host, but every run verified all one million trailers and
+the decoded digest matched GNU gzip.

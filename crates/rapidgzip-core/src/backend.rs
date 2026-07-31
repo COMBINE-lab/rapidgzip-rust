@@ -686,6 +686,9 @@ where
 const INDEPENDENT_MEMBER_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const INDEPENDENT_MEMBER_PROBE_BYTES: u64 = 8 * 1024 * 1024;
 const INDEPENDENT_MEMBER_MIN_CANDIDATES: usize = 4;
+// Four amortizes result-channel and coordinator work on tiny members without
+// making a worker task so large that it starves peers or retains large output.
+const INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES: usize = 4;
 
 fn find_gzip_magic(bytes: &[u8], candidate_limit: usize, candidates: &mut Vec<usize>) {
     candidates.clear();
@@ -777,6 +780,122 @@ struct IndependentMemberIndex {
     headers: Vec<MemberHeader>,
     scan_start: u64,
     compressed_size: u64,
+    average_probe_spacing: u64,
+}
+
+/// A bounded group of neighboring header candidates assigned to one worker.
+///
+/// Candidates are not trusted merely because they share a task. The worker
+/// still inflates and authenticates each one separately and only combines
+/// output when the preceding member's verified end is exactly the following
+/// candidate's start.
+struct IndependentMemberTask {
+    headers: [MemberHeader; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
+    header_count: usize,
+}
+
+impl IndependentMemberTask {
+    fn new() -> Self {
+        Self {
+            headers: [MemberHeader {
+                start: 0,
+                deflate_start: 0,
+                bgzf_block_size: None,
+            }; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
+            header_count: 0,
+        }
+    }
+
+    fn push(&mut self, header: MemberHeader) {
+        debug_assert!(self.header_count < self.headers.len());
+        self.headers[self.header_count] = header;
+        self.header_count += 1;
+    }
+
+    fn headers(&self) -> &[MemberHeader] {
+        &self.headers[..self.header_count]
+    }
+}
+
+struct IndependentMemberTaskBuilder {
+    task: IndependentMemberTask,
+    target_compressed_span: u64,
+    maximum_candidates: usize,
+}
+
+impl IndependentMemberTaskBuilder {
+    fn new(target_compressed_span: usize, maximum_candidates: usize) -> Self {
+        Self {
+            task: IndependentMemberTask::new(),
+            target_compressed_span: target_compressed_span as u64,
+            maximum_candidates: maximum_candidates.clamp(1, INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES),
+        }
+    }
+
+    fn push(&mut self, header: MemberHeader) -> Option<IndependentMemberTask> {
+        let should_flush = self.task.headers().first().is_some_and(|first| {
+            self.task.header_count >= self.maximum_candidates
+                || header.start.saturating_sub(first.start) >= self.target_compressed_span
+        });
+        let completed = should_flush.then(|| self.take());
+        self.task.push(header);
+        completed
+    }
+
+    fn finish(mut self) -> Option<IndependentMemberTask> {
+        (self.task.header_count != 0).then(|| self.take())
+    }
+
+    fn take(&mut self) -> IndependentMemberTask {
+        std::mem::replace(&mut self.task, IndependentMemberTask::new())
+    }
+}
+
+fn batch_independent_headers(
+    headers: &[MemberHeader],
+    target_compressed_span: usize,
+    maximum_candidates: usize,
+) -> Vec<IndependentMemberTask> {
+    let mut builder = IndependentMemberTaskBuilder::new(target_compressed_span, maximum_candidates);
+    let mut tasks = Vec::new();
+    for &header in headers {
+        if let Some(task) = builder.push(header) {
+            tasks.push(task);
+        }
+    }
+    if let Some(task) = builder.finish() {
+        tasks.push(task);
+    }
+    tasks
+}
+
+fn independent_member_task_span(
+    probe_bytes: u64,
+    configured_span: usize,
+    worker_count: usize,
+) -> usize {
+    // Seed at least two task waves from the prefix probe. The configured grid
+    // remains the upper bound, while the floor avoids bookkeeping-sized tasks
+    // on machines with very large affinity masks.
+    let desired_initial_tasks = worker_count.saturating_mul(2).max(1) as u64;
+    let parallel_span = probe_bytes.div_ceil(desired_initial_tasks);
+    configured_span
+        .min(usize::try_from(parallel_span).unwrap_or(configured_span))
+        .max(32 * 1024)
+}
+
+fn independent_member_task_candidate_limit(
+    average_probe_spacing: u64,
+    configured_span: usize,
+) -> usize {
+    // Result collation helps only when member bookkeeping dominates inflate.
+    // Preserve one-result-per-member scheduling unless the probe finds at
+    // least 256 members per configured compressed work interval.
+    if average_probe_spacing <= (configured_span / 256) as u64 {
+        INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES
+    } else {
+        1
+    }
 }
 
 fn scan_independent_headers<R, F>(
@@ -897,6 +1016,7 @@ fn index_independent_members<R: ReadAt + ?Sized>(
         headers,
         scan_start: probe_end,
         compressed_size,
+        average_probe_spacing,
     }))
 }
 
@@ -1047,33 +1167,171 @@ fn inflate_independent_member_into<R: ReadAt + ?Sized>(
     }
 }
 
-struct DecodedIndependentMember {
+/// One or more separately authenticated, exactly adjacent gzip members.
+struct DecodedIndependentMembers {
+    start: u64,
     end: u64,
     bytes: Vec<u8>,
+    member_sizes: [usize; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
+    member_count: usize,
+}
+
+impl DecodedIndependentMembers {
+    fn push_member_size(&mut self, size: usize) {
+        debug_assert!(self.member_count < self.member_sizes.len());
+        self.member_sizes[self.member_count] = size;
+        self.member_count += 1;
+    }
+
+    fn member_count(&self) -> usize {
+        self.member_count
+    }
+
+    fn member_size(&self, index: usize) -> usize {
+        self.member_sizes[index]
+    }
+
+    fn member_sizes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.member_sizes[..self.member_count].iter().copied()
+    }
 }
 
 struct IndependentResult {
     start: u64,
-    result: Result<DecodedIndependentMember, DecodeError>,
+    candidate_count: usize,
+    result: Result<DecodedIndependentMembers, DecodeError>,
+}
+
+struct PendingIndependentRun {
+    decoded: DecodedIndependentMembers,
 }
 
 fn send_independent_result(
     sender: &mpsc::SyncSender<IndependentResult>,
     stopped: &AtomicBool,
     mut result: IndependentResult,
-) {
+) -> bool {
     loop {
         if stopped.load(Ordering::Relaxed) {
-            return;
+            return false;
         }
         match sender.try_send(result) {
-            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
             Err(TrySendError::Full(returned)) => {
                 result = returned;
                 thread::park_timeout(Duration::from_millis(1));
             }
         }
     }
+}
+
+fn send_finished_independent_run(
+    active: &mut Option<PendingIndependentRun>,
+    sender: &mpsc::SyncSender<IndependentResult>,
+    stopped: &AtomicBool,
+) -> bool {
+    let Some(run) = active.take() else {
+        return true;
+    };
+    let candidate_count = run.decoded.member_count();
+    send_independent_result(
+        sender,
+        stopped,
+        IndependentResult {
+            start: run.decoded.start,
+            candidate_count,
+            result: Ok(run.decoded),
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_independent_task<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    stopped: &AtomicBool,
+    compressed_size: u64,
+    task: IndependentMemberTask,
+    inflater: &mut RawInflater,
+    compressed: &mut Vec<u8>,
+    sender: &mpsc::SyncSender<IndependentResult>,
+) -> bool {
+    let target_result_size = config
+        .decoded_chunk_size
+        .min(config.compressed_chunk_size / 2);
+    let maximum_collatable_member_size = (target_result_size / 4).max(32 * 1024);
+    let mut active = None::<PendingIndependentRun>;
+
+    for &header in task.headers() {
+        if stopped.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        if active
+            .as_ref()
+            .is_some_and(|run| run.decoded.end != header.start)
+            && !send_finished_independent_run(&mut active, sender, stopped)
+        {
+            return false;
+        }
+
+        let run = active.get_or_insert_with(|| PendingIndependentRun {
+            decoded: DecodedIndependentMembers {
+                start: header.start,
+                end: header.start,
+                bytes: Vec::new(),
+                member_sizes: [0; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
+                member_count: 0,
+            },
+        });
+        let member_output_start = run.decoded.bytes.len();
+        match inflate_independent_member_into(
+            source,
+            config,
+            cancelled,
+            0,
+            header,
+            compressed_size,
+            inflater,
+            compressed,
+            &mut run.decoded.bytes,
+        ) {
+            Ok(end) => {
+                let member_size = run.decoded.bytes.len() - member_output_start;
+                run.decoded.end = end;
+                run.decoded.push_member_size(member_size);
+                if (member_size > maximum_collatable_member_size
+                    || run.decoded.bytes.len() >= target_result_size)
+                    && !send_finished_independent_run(&mut active, sender, stopped)
+                {
+                    return false;
+                }
+            }
+            Err(error) => {
+                run.decoded.bytes.truncate(member_output_start);
+                if run.decoded.member_count() == 0 {
+                    active = None;
+                } else if !send_finished_independent_run(&mut active, sender, stopped) {
+                    return false;
+                }
+                if !send_independent_result(
+                    sender,
+                    stopped,
+                    IndependentResult {
+                        start: header.start,
+                        candidate_count: 1,
+                        result: Err(error),
+                    },
+                ) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    send_finished_independent_run(&mut active, sender, stopped)
 }
 
 enum IndependentOutcome {
@@ -1092,20 +1350,28 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    let queue = Arc::new(Injector::<MemberHeader>::new());
+    let worker_count = config.decoder_threads;
+    let task_compressed_span =
+        independent_member_task_span(index.scan_start, config.compressed_chunk_size, worker_count);
+    let task_candidate_limit = independent_member_task_candidate_limit(
+        index.average_probe_spacing,
+        config.compressed_chunk_size,
+    );
+    let initial_tasks =
+        batch_independent_headers(&index.headers, task_compressed_span, task_candidate_limit);
+    let queue = Arc::new(Injector::<IndependentMemberTask>::new());
     let stopped = Arc::new(AtomicBool::new(false));
-    let available_tasks = Arc::new(AtomicUsize::new(index.headers.len()));
-    let unresolved_tasks = Arc::new(AtomicUsize::new(index.headers.len()));
-    let pending_results = Arc::new(AtomicUsize::new(index.headers.len()));
+    let available_tasks = Arc::new(AtomicUsize::new(initial_tasks.len()));
+    let unresolved_candidates = Arc::new(AtomicUsize::new(index.headers.len()));
+    let pending_candidates = Arc::new(AtomicUsize::new(index.headers.len()));
     let scanner_done = Arc::new(AtomicBool::new(index.scan_start >= index.compressed_size));
     let scanner_error = Arc::new(Mutex::new(None::<DecodeError>));
     let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
     let scan_signal = Arc::new((Mutex::new(()), Condvar::new()));
-    let worker_count = config.decoder_threads;
     let pending_limit = config.in_flight_chunks.max(worker_count).max(1);
     let scan_ahead_limit = pending_limit.saturating_mul(16);
-    for &header in &index.headers {
-        queue.push(header);
+    for task in initial_tasks {
+        queue.push(task);
     }
     let (sender, receiver) = mpsc::sync_channel::<IndependentResult>(pending_limit);
     let mut reordered = BTreeMap::new();
@@ -1119,13 +1385,44 @@ where
             let queue = Arc::clone(&queue);
             let scanner_stopped = Arc::clone(&stopped);
             let available_tasks = Arc::clone(&available_tasks);
-            let unresolved_tasks = Arc::clone(&unresolved_tasks);
-            let pending_results = Arc::clone(&pending_results);
+            let unresolved_candidates = Arc::clone(&unresolved_candidates);
+            let pending_candidates = Arc::clone(&pending_candidates);
             let scanner_done = Arc::clone(&scanner_done);
             let scanner_error = Arc::clone(&scanner_error);
             let work_signal = Arc::clone(&work_signal);
             let scan_signal = Arc::clone(&scan_signal);
             scope.spawn(move || {
+                let enqueue = |task: IndependentMemberTask| {
+                    let candidate_count = task.headers().len();
+                    while unresolved_candidates.load(Ordering::Acquire) != 0
+                        && unresolved_candidates
+                            .load(Ordering::Acquire)
+                            .saturating_add(candidate_count)
+                            > scan_ahead_limit
+                        && !scanner_stopped.load(Ordering::Relaxed)
+                    {
+                        let (lock, signal) = &*scan_signal;
+                        let guard = lock.lock().expect("member scan mutex poisoned");
+                        let _ = signal
+                            .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                                let unresolved = unresolved_candidates.load(Ordering::Acquire);
+                                unresolved != 0
+                                    && unresolved.saturating_add(candidate_count) > scan_ahead_limit
+                                    && !scanner_stopped.load(Ordering::Relaxed)
+                            })
+                            .expect("member scan mutex poisoned");
+                    }
+                    if scanner_stopped.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    unresolved_candidates.fetch_add(candidate_count, Ordering::AcqRel);
+                    pending_candidates.fetch_add(candidate_count, Ordering::AcqRel);
+                    queue.push(task);
+                    available_tasks.fetch_add(1, Ordering::Release);
+                    work_signal.1.notify_one();
+                };
+                let mut builder =
+                    IndependentMemberTaskBuilder::new(task_compressed_span, task_candidate_limit);
                 let result = scan_independent_headers(
                     source,
                     config.input_page_size,
@@ -1133,30 +1430,20 @@ where
                     index.compressed_size,
                     Some(&scanner_stopped),
                     |header| {
-                        while unresolved_tasks.load(Ordering::Acquire) >= scan_ahead_limit
-                            && !scanner_stopped.load(Ordering::Relaxed)
-                        {
-                            let (lock, signal) = &*scan_signal;
-                            let guard = lock.lock().expect("member scan mutex poisoned");
-                            let _ = signal
-                                .wait_timeout_while(guard, Duration::from_millis(1), |_| {
-                                    unresolved_tasks.load(Ordering::Acquire) >= scan_ahead_limit
-                                        && !scanner_stopped.load(Ordering::Relaxed)
-                                })
-                                .expect("member scan mutex poisoned");
+                        if let Some(task) = builder.push(header) {
+                            enqueue(task);
                         }
-                        if scanner_stopped.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        unresolved_tasks.fetch_add(1, Ordering::Release);
-                        pending_results.fetch_add(1, Ordering::Release);
-                        queue.push(header);
-                        available_tasks.fetch_add(1, Ordering::Release);
-                        work_signal.1.notify_one();
                     },
                 );
-                if let Err(error) = result {
-                    *scanner_error.lock().expect("member scanner mutex poisoned") = Some(error);
+                match result {
+                    Ok(()) => {
+                        if let Some(task) = builder.finish() {
+                            enqueue(task);
+                        }
+                    }
+                    Err(error) => {
+                        *scanner_error.lock().expect("member scanner mutex poisoned") = Some(error);
+                    }
                 }
                 scanner_done.store(true, Ordering::Release);
                 work_signal.1.notify_all();
@@ -1174,11 +1461,11 @@ where
                 let mut compressed = Vec::new();
                 while !worker_stopped.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed)
                 {
-                    let header = loop {
+                    let task = loop {
                         match queue.steal() {
-                            Steal::Success(header) => {
+                            Steal::Success(task) => {
                                 available_tasks.fetch_sub(1, Ordering::AcqRel);
-                                break header;
+                                break task;
                             }
                             Steal::Retry => std::hint::spin_loop(),
                             Steal::Empty => {
@@ -1199,38 +1486,46 @@ where
                             }
                         }
                     };
-                    let result = (|| {
-                        if inflater.is_none() {
-                            inflater = Some(RawInflater::new()?);
+                    if inflater.is_none() {
+                        match RawInflater::new() {
+                            Ok(new_inflater) => inflater = Some(new_inflater),
+                            Err(error) => {
+                                let candidate_count = task.headers().len();
+                                let start = task
+                                    .headers()
+                                    .first()
+                                    .expect("independent tasks are never empty")
+                                    .start;
+                                if !send_independent_result(
+                                    &sender,
+                                    &worker_stopped,
+                                    IndependentResult {
+                                        start,
+                                        candidate_count,
+                                        result: Err(error),
+                                    },
+                                ) {
+                                    return;
+                                }
+                                continue;
+                            }
                         }
-                        let inflater = inflater
-                            .as_mut()
-                            .expect("the inflater was initialized immediately above");
-                        let mut decoded = Vec::new();
-                        let end = inflate_independent_member_into(
-                            source,
-                            config,
-                            cancelled,
-                            0,
-                            header,
-                            index.compressed_size,
-                            inflater,
-                            &mut compressed,
-                            &mut decoded,
-                        )?;
-                        Ok(DecodedIndependentMember {
-                            end,
-                            bytes: decoded,
-                        })
-                    })();
-                    send_independent_result(
-                        &sender,
+                    }
+                    if !decode_independent_task(
+                        source,
+                        config,
+                        cancelled,
                         &worker_stopped,
-                        IndependentResult {
-                            start: header.start,
-                            result,
-                        },
-                    );
+                        index.compressed_size,
+                        task,
+                        inflater
+                            .as_mut()
+                            .expect("the inflater was initialized immediately above"),
+                        &mut compressed,
+                        &sender,
+                    ) {
+                        return;
+                    }
                 }
             });
         }
@@ -1242,7 +1537,7 @@ where
             }
             let result = match receiver.recv_timeout(Duration::from_millis(10)) {
                 Ok(result) => {
-                    pending_results.fetch_sub(1, Ordering::AcqRel);
+                    pending_candidates.fetch_sub(result.candidate_count, Ordering::AcqRel);
                     result
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -1254,7 +1549,7 @@ where
                         {
                             return Err(error);
                         }
-                        if pending_results.load(Ordering::Acquire) == 0 {
+                        if pending_candidates.load(Ordering::Acquire) == 0 {
                             stopped.store(true, Ordering::Relaxed);
                             return Ok(IndependentOutcome::SequentialFallback {
                                 offset: expected_start,
@@ -1266,14 +1561,17 @@ where
                 Err(RecvTimeoutError::Disconnected) => return Err(DecodeError::WorkerPanicked),
             };
             if result.start < expected_start {
-                unresolved_tasks.fetch_sub(1, Ordering::AcqRel);
+                unresolved_candidates.fetch_sub(result.candidate_count, Ordering::AcqRel);
                 scan_signal.1.notify_one();
                 continue;
             }
-            reordered.insert(result.start, result.result);
+            if let Some(replaced) = reordered.insert(result.start, result) {
+                unresolved_candidates.fetch_sub(replaced.candidate_count, Ordering::AcqRel);
+            }
 
             while let Some(result) = reordered.remove(&expected_start) {
-                let decoded = match result {
+                let result_candidate_count = result.candidate_count;
+                let mut decoded = match result.result {
                     Ok(decoded) => decoded,
                     Err(_) => {
                         stopped.store(true, Ordering::Relaxed);
@@ -1282,34 +1580,59 @@ where
                         });
                     }
                 };
-                if decoded.end <= expected_start || decoded.end > index.compressed_size {
+                let decoded_size = decoded
+                    .member_sizes()
+                    .try_fold(0_usize, |total, size| total.checked_add(size));
+                if decoded.start != expected_start
+                    || decoded.end <= expected_start
+                    || decoded.end > index.compressed_size
+                    || decoded.member_count() == 0
+                    || decoded_size != Some(decoded.bytes.len())
+                {
                     stopped.store(true, Ordering::Relaxed);
                     return Ok(IndependentOutcome::SequentialFallback {
                         offset: expected_start,
                     });
                 }
-                let next_total = total_output.checked_add(decoded.bytes.len() as u64).ok_or(
-                    DecodeError::OutputLimitExceeded {
-                        limit: config.output_limit.unwrap_or(u64::MAX),
-                    },
-                )?;
-                if config.output_limit.is_some_and(|limit| next_total > limit) {
-                    return Err(DecodeError::OutputLimitExceeded {
-                        limit: config.output_limit.expect("checked as some"),
-                    });
+                debug_assert_eq!(result_candidate_count, decoded.member_count());
+                let mut accepted_bytes = 0_usize;
+                for member_index in 0..decoded.member_count() {
+                    let member_size = decoded.member_size(member_index);
+                    let next_total = total_output.checked_add(member_size as u64);
+                    if next_total.is_none()
+                        || config
+                            .output_limit
+                            .is_some_and(|limit| next_total.is_some_and(|next| next > limit))
+                    {
+                        if accepted_bytes != 0 {
+                            decoded.bytes.truncate(accepted_bytes);
+                            output.emit(decoded.bytes)?;
+                        }
+                        return Err(DecodeError::OutputLimitExceeded {
+                            limit: config.output_limit.unwrap_or(u64::MAX),
+                        });
+                    }
+                    total_output =
+                        next_total.expect("the overflow case returned immediately above");
+                    member_count += 1;
+                    accepted_bytes += member_size;
                 }
-                total_output = next_total;
-                member_count += 1;
-                unresolved_tasks.fetch_sub(1, Ordering::AcqRel);
+                unresolved_candidates.fetch_sub(result_candidate_count, Ordering::AcqRel);
                 expected_start = decoded.end;
                 if !decoded.bytes.is_empty() {
                     output.emit(decoded.bytes)?;
                 }
-                let before_retain = reordered.len();
-                reordered.retain(|start, _| *start >= expected_start);
-                let removed = before_retain - reordered.len();
-                if removed != 0 {
-                    unresolved_tasks.fetch_sub(removed, Ordering::AcqRel);
+                let mut removed_candidates = 0_usize;
+                reordered.retain(|start, result| {
+                    let keep = *start >= expected_start;
+                    if !keep {
+                        removed_candidates =
+                            removed_candidates.saturating_add(result.candidate_count);
+                    }
+                    keep
+                });
+                if removed_candidates != 0 {
+                    unresolved_candidates.fetch_sub(removed_candidates, Ordering::AcqRel);
                 }
                 scan_signal.1.notify_one();
             }
@@ -3049,9 +3372,55 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MemberAccounting, SourceCursor, Window, find_gzip_magic, find_gzip_magic_scalar,
-        inflate_tail, validate_footer,
+        INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES, MemberAccounting, MemberHeader, SourceCursor,
+        Window, batch_independent_headers, find_gzip_magic, find_gzip_magic_scalar,
+        independent_member_task_candidate_limit, inflate_tail, validate_footer,
     };
+
+    fn header(start: u64) -> MemberHeader {
+        MemberHeader {
+            start,
+            deflate_start: start + 10,
+            bgzf_block_size: None,
+        }
+    }
+
+    #[test]
+    fn independent_member_tasks_are_bounded_by_span_and_candidate_count() {
+        let headers = [
+            header(0),
+            header(100),
+            header(999),
+            header(1_000),
+            header(1_100),
+        ];
+        let tasks =
+            batch_independent_headers(&headers, 1_000, INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].headers().len(), 3);
+        assert_eq!(tasks[1].headers().len(), 2);
+
+        let headers = (0..=INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES)
+            .map(|offset| header(offset as u64))
+            .collect::<Vec<_>>();
+        let tasks =
+            batch_independent_headers(&headers, usize::MAX, INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(
+            tasks[0].headers().len(),
+            INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES
+        );
+        assert_eq!(tasks[1].headers().len(), 1);
+
+        assert_eq!(
+            independent_member_task_candidate_limit(4 * 1024, 1024 * 1024),
+            INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES
+        );
+        assert_eq!(
+            independent_member_task_candidate_limit(4 * 1024 + 1, 1024 * 1024),
+            1
+        );
+    }
 
     #[test]
     fn dispatched_gzip_magic_scan_matches_scalar_across_vector_edges() {

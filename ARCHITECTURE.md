@@ -93,6 +93,17 @@ discarded. If a candidate chain is incomplete, corrupt, or exceeds its
 per-member bound, the decoder continues sequentially from the first member it
 has not emitted.
 
+When the prefix averages at least 256 candidates per configured compressed
+grid interval, candidate scheduling groups up to four nearby headers into one
+worker task. Each candidate is still inflated and authenticated independently.
+A worker collates output only while the verified end of one member is exactly
+the next candidate's start, and it records every member's decoded length so the
+coordinator can preserve per-member output-limit and accounting semantics.
+Task span is seeded from the probe size and requested worker budget to expose
+at least two initial waves of work, capped by the configured compressed grid.
+Less-dense streams retain one task and result per member; this prevents larger
+FASTQ members from losing parallelism or inflating result-buffer residency.
+
 CRC32 and modulo-2^32 ISIZE are tracked and checked per member. History resets
 to empty after every footer. Empty members, concatenated gzip, and BGZF EOF
 members therefore use the same semantics.
@@ -109,7 +120,9 @@ reuse their initialized zlib-rs stream with `inflateReset`.
 The BGZF, stored, dense-member, and native paths use a
 `crossbeam-deque::Injector`, scoped workers, and bounded result channels. The
 dense-member scanner is held to sixteen result windows of candidate work so
-its header queue cannot grow with archive size. For generic native
+its header queue cannot grow with archive size. A collated dense-member result
+contains at most four independently verified members and is also bounded by
+the configured decoded/compressed work sizes. For generic native
 decoding, the configured thread count is a maximum budget rather than a fixed
 active count. The controller reads `available_parallelism`, which respects the
 process affinity mask on supported platforms and bounds active ranks by that
