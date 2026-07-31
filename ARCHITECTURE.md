@@ -4,7 +4,7 @@
 
 `rapidgzip-core` accepts an immutable positional `ReadAt` source. A decode
 snapshots its length, parses gzip framing itself, and routes the raw DEFLATE
-payload through one of four bounded paths:
+payload through one of five bounded paths:
 
 1. Standard zlib-rs raw inflate is the authoritative fallback and the
    single-thread path.
@@ -12,7 +12,9 @@ payload through one of four bounded paths:
    ordered worker tasks.
 3. A consistently formed BGZF stream is indexed from `BC/BSIZE` and its
    independently verified members are decoded by ordered worker tasks.
-4. Other streams use a file-wide estimated grid and rapidgzip's marker/window
+4. Ordinary streams with densely spaced members use candidate-header
+   discovery and independently verified member workers.
+5. Other streams use a file-wide estimated grid and rapidgzip's marker/window
    path, with zlib-rs fallback from the last authoritative boundary.
 
 All paths return ordered owned chunks to one coordinator. The coordinator alone
@@ -77,6 +79,20 @@ as another resumable DEFLATE block.
 The next header is parsed at that verified offset; gzip magic inside compressed
 bytes is never accepted as a member boundary.
 
+For dense ordinary multi-member streams, an 8 MiB prefix probe selects a
+member-parallel path only when it exposes at least four plausible headers with
+an average spacing no larger than four compressed grid intervals. A scanner
+then runs concurrently with bounded decode work.
+The common fixed ten-byte header is found with runtime-dispatched AVX2 on
+x86-64, NEON on AArch64, and a scalar fallback; optional headers still go
+through the complete gzip parser. A scanned header is only a candidate: a
+worker must reach an actual `Z_STREAM_END` and verify CRC32 and ISIZE, and the
+coordinator accepts the result only when its start is the exact end reported by
+the preceding verified member. Thus plausible gzip bytes inside DEFLATE are
+discarded. If a candidate chain is incomplete, corrupt, or exceeds its
+per-member bound, the decoder continues sequentially from the first member it
+has not emitted.
+
 CRC32 and modulo-2^32 ISIZE are tracked and checked per member. History resets
 to empty after every footer. Empty members, concatenated gzip, and BGZF EOF
 members therefore use the same semantics.
@@ -90,8 +106,10 @@ reuse their initialized zlib-rs stream with `inflateReset`.
 
 ## Scheduling and memory
 
-The BGZF, stored, and native paths use a `crossbeam-deque::Injector`, a sliding
-task window, scoped workers, and bounded result channels. For generic native
+The BGZF, stored, dense-member, and native paths use a
+`crossbeam-deque::Injector`, scoped workers, and bounded result channels. The
+dense-member scanner is held to sixteen result windows of candidate work so
+its header queue cannot grow with archive size. For generic native
 decoding, the configured thread count is a maximum budget rather than a fixed
 active count. The controller reads `available_parallelism`, which respects the
 process affinity mask on supported platforms and bounds active ranks by that

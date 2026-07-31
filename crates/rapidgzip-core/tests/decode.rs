@@ -56,6 +56,18 @@ fn member_from_raw_deflate(deflate: &[u8], decoded: &[u8]) -> Vec<u8> {
     encoded
 }
 
+fn stored_then_fixed_member(bytes: &[u8]) -> Vec<u8> {
+    assert!(bytes.len() <= u16::MAX as usize);
+    let length = bytes.len() as u16;
+    let mut deflate = vec![0, length as u8, (length >> 8) as u8];
+    deflate.extend_from_slice(&(!length).to_le_bytes());
+    deflate.extend_from_slice(bytes);
+    // Empty final fixed-Huffman block. The non-final stored block above keeps
+    // this fixture off the fully-stored fast path.
+    deflate.extend_from_slice(&[0x03, 0x00]);
+    member_from_raw_deflate(&deflate, bytes)
+}
+
 fn dynamic_multiblock_fixture() -> (Vec<u8>, Vec<u8>) {
     let deflate = hex(
         "ecc3410900000804b06c870f0b5cff2c82393658661b5555555555555555555555555555555555555555555555555555555555555555555555555555f51f000000ffffedc3310d00000803306d640706f0af856336daa4b7195555555555555555555555555555555555555555555555555555555555555555555555555555b51f",
@@ -232,6 +244,97 @@ fn speculative_marker_path_decodes_dynamic_multiblock_members() {
     let report = decoder.decode(&compressed, &mut decoded).unwrap();
     assert_eq!(decoded, expected);
     assert_eq!(report.member_count, 2);
+}
+
+#[test]
+fn parallel_small_member_path_decodes_dense_dynamic_members() {
+    let (member, expected_member) = dynamic_multiblock_fixture();
+    let mut compressed = Vec::new();
+    let mut expected = Vec::new();
+    for _ in 0..64 {
+        compressed.extend_from_slice(&member);
+        expected.extend_from_slice(&expected_member);
+    }
+
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let mut decoded = Vec::new();
+    let report = decoder.decode(&compressed, &mut decoded).unwrap();
+    assert_eq!(decoded, expected);
+    assert_eq!(report.member_count, 64);
+}
+
+#[test]
+fn parallel_small_member_path_ignores_header_magic_inside_deflate() {
+    let mut first_output = vec![0; 8];
+    first_output.extend_from_slice(b"\x1f\x8b\x08\x00\0\0\0\0\x00\xff");
+    first_output.extend_from_slice(b"gzip magic inside stored payload");
+    let first_member = stored_then_fixed_member(&first_output);
+    let (member, expected_member) = dynamic_multiblock_fixture();
+
+    let mut compressed = first_member;
+    let mut expected = first_output;
+    for _ in 0..32 {
+        compressed.extend_from_slice(&member);
+        expected.extend_from_slice(&expected_member);
+    }
+
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let mut decoded = Vec::new();
+    let report = decoder.decode(&compressed, &mut decoded).unwrap();
+    assert_eq!(decoded, expected);
+    assert_eq!(report.member_count, 33);
+}
+
+#[test]
+fn parallel_small_member_path_falls_back_at_a_corrupt_member() {
+    let (member, expected_member) = dynamic_multiblock_fixture();
+    let mut compressed = Vec::new();
+    for index in 0..64 {
+        let start = compressed.len();
+        compressed.extend_from_slice(&member);
+        if index == 20 {
+            let footer = start + member.len() - 8;
+            compressed[footer] ^= 1;
+        }
+    }
+
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let mut decoded = Vec::new();
+    let error = decoder.decode(&compressed, &mut decoded).unwrap_err();
+    assert!(matches!(
+        error,
+        DecodeError::ChecksumMismatch { member: 20, .. }
+    ));
+    assert_eq!(decoded, expected_member.repeat(21));
+}
+
+#[test]
+fn reader_streams_dense_small_members_in_order() {
+    let (member, expected_member) = dynamic_multiblock_fixture();
+    let compressed = member.repeat(64);
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let mut reader = decoder.reader(compressed).unwrap();
+    let mut decoded = Vec::new();
+    reader.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, expected_member.repeat(64));
+    assert_eq!(reader.report().unwrap().member_count, 64);
+}
+
+#[test]
+fn parallel_small_member_path_enforces_global_output_limit() {
+    let (member, expected_member) = dynamic_multiblock_fixture();
+    let compressed = member.repeat(64);
+    let decoder = Decoder::builder()
+        .decoder_threads(8)
+        .output_limit(Some(expected_member.len() as u64 + 1))
+        .build()
+        .unwrap();
+    let mut decoded = Vec::new();
+    assert!(matches!(
+        decoder.decode(&compressed, &mut decoded),
+        Err(DecodeError::OutputLimitExceeded { .. })
+    ));
+    assert_eq!(decoded, expected_member);
 }
 
 #[test]

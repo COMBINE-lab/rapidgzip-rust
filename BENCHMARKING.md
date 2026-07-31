@@ -208,3 +208,30 @@ at 44 workers it was 174,608 KiB versus 225,592 KiB for single-member gzip,
 143,420 KiB for BGZF. These measurements clear the earlier provisional zlib-ng
 throughput and memory gates in every required cell. They do not supersede the
 real-FASTQ ISA-L target above.
+
+## 2026-07-31 dense-member regression diagnostic
+
+This diagnostic targets [issue #2](https://github.com/COMBINE-lab/rapidgzip-rust/issues/2),
+where BCL Convert-style gzip members are too short to reach the next regular
+compressed grid point. It used one 380,928,000-byte random-DNA payload in a
+single member and in members containing 8 MiB, 2 MiB, or 372,000 decoded bytes.
+The smallest form had 1,024 members averaging 109 KiB compressed. This is a
+member-scheduling control, not a replacement for the public FASTQ parity run.
+
+Each result below is median wall-clock throughput after two warmups and five
+measured runs on the same dual-Xeon host as the synthetic parity snapshot.
+Every run verified all trailers and wrote to a discard sink.
+
+| decoded bytes/member | members | 1 | 4 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|
+| one member | 1 | 636 MB/s | 1,315 MB/s | 2,602 MB/s | 2,551 MB/s |
+| 8 MiB | 46 | 636 MB/s | 1,648 MB/s | 2,762 MB/s | 2,944 MB/s |
+| 2 MiB | 182 | 642 MB/s | 1,849 MB/s | 4,398 MB/s | 4,935 MB/s |
+| 372,000 | 1,024 | 641 MB/s | 1,881 MB/s | 5,016 MB/s | 6,173 MB/s |
+
+Before the dense-member path, single measured runs of the 372,000-byte-member
+form took 0.63, 1.09, and 0.99 seconds at budgets 1, 16, and 32 respectively:
+parallel decode was slower than the 605 MB/s one-worker result. The table's
+corresponding medians are 641, 5,016, and 6,173 MB/s. Peak RSS was 18,908 KiB
+at budget 16 and 38,348 KiB at budget 32. A SHA-256 comparison against GNU
+gzip produced the same decoded digest.

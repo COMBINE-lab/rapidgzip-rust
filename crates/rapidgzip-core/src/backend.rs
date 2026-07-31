@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::crc32::Crc32;
-use crate::gzip::{SourceCursor, parse_member_header};
+use crate::gzip::{MemberHeader, SourceCursor, parse_member_header};
 use crate::parallel::Window;
 use crate::parallel::adaptive::AdaptiveConcurrency;
 use crate::parallel::deflate::{
@@ -154,6 +154,9 @@ where
             && index.tasks.len() > 1
         {
             return decode_stored_parallel(source, config, cancelled, output, &index);
+        }
+        if let Some(index) = index_independent_members(source, config)? {
+            return decode_independent_members(source, config, cancelled, output, &index);
         }
         let grid_size = adjusted_compressed_chunk_size(source, config)?;
         return decode_rapidgzip_estimated(source, config, cancelled, output, grid_size);
@@ -488,9 +491,30 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
+    decode_members_sequential(source, config, cancelled, output, 0, 0, 0)
+}
+
+/// Decodes complete members beginning at a known member boundary.
+///
+/// The independent-member path uses this as a correctness fallback if a byte
+/// sequence inside DEFLATE happened to look like a gzip header. Previously
+/// emitted members remain valid, so resuming from the first uncommitted task
+/// avoids both duplicate output and trusting the speculative candidate index.
+fn decode_members_sequential<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    start_offset: u64,
+    mut total_output: u64,
+    mut member_count: u64,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
     let mut cursor = SourceCursor::new(source, config.input_page_size)?;
-    let mut total_output = 0_u64;
-    let mut member_count = 0_u64;
+    cursor.seek(start_offset)?;
 
     while !cursor.at_end() {
         if cancelled.load(Ordering::Relaxed) {
@@ -653,6 +677,675 @@ where
 
     Ok(DecodeReport {
         compressed_bytes: cursor.position(),
+        decompressed_bytes: total_output,
+        member_count,
+        decoder_threads: config.decoder_threads,
+    })
+}
+
+const INDEPENDENT_MEMBER_SCAN_BYTES: usize = 4 * 1024 * 1024;
+const INDEPENDENT_MEMBER_PROBE_BYTES: u64 = 8 * 1024 * 1024;
+const INDEPENDENT_MEMBER_MIN_CANDIDATES: usize = 4;
+
+fn find_gzip_magic(bytes: &[u8], candidate_limit: usize, candidates: &mut Vec<usize>) {
+    candidates.clear();
+    let candidate_limit = candidate_limit.min(bytes.len());
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: runtime detection proves AVX2 is available. The helper
+        // bounds every unaligned load against `candidate_limit`, which the
+        // caller has already bounded by `bytes.len()`.
+        unsafe { find_gzip_magic_avx2(bytes, candidate_limit, candidates) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: runtime detection proves NEON is available. The helper
+        // bounds every 16-byte load against the input slice and stores only
+        // into a live local lane array.
+        unsafe { find_gzip_magic_neon(bytes, candidate_limit, candidates) };
+        return;
+    }
+    find_gzip_magic_scalar(bytes, candidate_limit, candidates);
+}
+
+fn find_gzip_magic_scalar(bytes: &[u8], candidate_limit: usize, candidates: &mut Vec<usize>) {
+    for (relative, &byte) in bytes.iter().take(candidate_limit).enumerate() {
+        if byte == 0x1F {
+            candidates.push(relative);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn find_gzip_magic_avx2(bytes: &[u8], candidate_limit: usize, candidates: &mut Vec<usize>) {
+    use std::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
+
+    let needle = _mm256_set1_epi8(0x1F);
+    let mut offset = 0_usize;
+    while offset.saturating_add(32) <= candidate_limit {
+        // SAFETY: `offset + 32 <= candidate_limit <= bytes.len()`, and the
+        // unaligned intrinsic imposes no alignment requirement.
+        let input = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(offset).cast::<__m256i>()) };
+        let mut mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(input, needle)) as u32;
+        while mask != 0 {
+            let lane = mask.trailing_zeros() as usize;
+            candidates.push(offset + lane);
+            mask &= mask - 1;
+        }
+        offset += 32;
+    }
+    for (relative, &byte) in bytes.iter().enumerate().take(candidate_limit).skip(offset) {
+        if byte == 0x1F {
+            candidates.push(relative);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn find_gzip_magic_neon(bytes: &[u8], candidate_limit: usize, candidates: &mut Vec<usize>) {
+    use std::arch::aarch64::{vceqq_u8, vdupq_n_u8, vld1q_u8, vst1q_u8};
+
+    let needle = vdupq_n_u8(0x1F);
+    let mut offset = 0_usize;
+    let mut lanes = [0_u8; 16];
+    while offset.saturating_add(16) <= candidate_limit {
+        // SAFETY: `offset + 16 <= candidate_limit <= bytes.len()`.
+        let input = unsafe { vld1q_u8(bytes.as_ptr().add(offset)) };
+        let matches = vceqq_u8(input, needle);
+        // SAFETY: `lanes` is a live, writable 16-byte array.
+        unsafe { vst1q_u8(lanes.as_mut_ptr(), matches) };
+        for (lane, &matched) in lanes.iter().enumerate() {
+            if matched != 0 {
+                candidates.push(offset + lane);
+            }
+        }
+        offset += 16;
+    }
+    for (relative, &byte) in bytes.iter().enumerate().take(candidate_limit).skip(offset) {
+        if byte == 0x1F {
+            candidates.push(relative);
+        }
+    }
+}
+
+struct IndependentMemberIndex {
+    headers: Vec<MemberHeader>,
+    scan_start: u64,
+    compressed_size: u64,
+}
+
+fn scan_independent_headers<R, F>(
+    source: &R,
+    page_size: usize,
+    mut scan_start: u64,
+    scan_end: u64,
+    stopped: Option<&AtomicBool>,
+    mut found: F,
+) -> Result<(), DecodeError>
+where
+    R: ReadAt + ?Sized,
+    F: FnMut(MemberHeader),
+{
+    let mut header_cursor = SourceCursor::new(source, page_size.min(256))?;
+    let compressed_size = header_cursor.length();
+    let mut scan = Vec::new();
+    let mut candidates = Vec::new();
+
+    while scan_start < scan_end {
+        if stopped.is_some_and(|stopped| stopped.load(Ordering::Relaxed)) {
+            return Ok(());
+        }
+        // Nine bytes of forward overlap let the common ten-byte header be
+        // parsed directly even when it straddles scan pages, without copying
+        // a carry buffer.
+        let unique_remaining = usize::try_from(scan_end - scan_start).unwrap_or(usize::MAX);
+        let unique_length = unique_remaining.min(INDEPENDENT_MEMBER_SCAN_BYTES);
+        let source_remaining =
+            usize::try_from(compressed_size.saturating_sub(scan_start)).unwrap_or(usize::MAX);
+        let read_length = source_remaining.min(unique_length.saturating_add(9));
+        read_range_reuse(source, scan_start, read_length, &mut scan)?;
+
+        let candidate_limit = unique_length.min(scan.len().saturating_sub(9));
+        find_gzip_magic(&scan, candidate_limit, &mut candidates);
+        for &relative in &candidates {
+            if scan[relative + 1] != 0x8B
+                || scan[relative + 2] != 8
+                || scan[relative + 3] & 0xE0 != 0
+            {
+                continue;
+            }
+            let candidate = scan_start.saturating_add(relative as u64);
+            if candidate == 0 {
+                continue;
+            }
+            if scan[relative + 3] == 0 {
+                // Most producer-generated members have no optional fields.
+                // Their remaining six fixed header bytes are metadata and
+                // require no validation, so avoid one positional read and
+                // parser call per member.
+                found(MemberHeader {
+                    start: candidate,
+                    deflate_start: candidate.saturating_add(10),
+                    bgzf_block_size: None,
+                });
+            } else {
+                header_cursor.seek(candidate)?;
+                match parse_member_header(&mut header_cursor, false) {
+                    Ok(header) => found(header),
+                    Err(error @ DecodeError::Io { .. }) => return Err(error),
+                    Err(_) => {}
+                }
+            }
+        }
+        scan_start = scan_start.saturating_add(unique_length as u64);
+    }
+    Ok(())
+}
+
+/// Finds plausible gzip headers without treating them as authoritative.
+///
+/// A candidate becomes trusted only when a worker starting there reaches
+/// `Z_STREAM_END`, verifies the following trailer, and the coordinator was
+/// already expecting that exact start from the preceding verified member.
+/// Failed or skipped candidates cannot alter output; decoding resumes
+/// sequentially at the first uncommitted real member boundary when necessary.
+/// This is required because gzip magic bytes are legal inside DEFLATE data.
+fn index_independent_members<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+) -> Result<Option<IndependentMemberIndex>, DecodeError> {
+    let mut header_cursor = SourceCursor::new(source, config.input_page_size.min(256))?;
+    if header_cursor.at_end() {
+        return Ok(None);
+    }
+    let first_header = parse_member_header(&mut header_cursor, true)?;
+    let compressed_size = header_cursor.length();
+    let mut headers = vec![first_header];
+    let probe_end = compressed_size.min(INDEPENDENT_MEMBER_PROBE_BYTES);
+    scan_independent_headers(
+        source,
+        config.input_page_size,
+        0,
+        probe_end,
+        None,
+        |header| headers.push(header),
+    )?;
+
+    // Avoid a full-file scan on ordinary large members. A dense prefix is
+    // sufficient evidence that exact gzip members expose finer parallel work
+    // than the regular compressed grid. Remaining candidates are discovered
+    // concurrently with decoding so a large reader can begin producing data.
+    let average_probe_spacing = probe_end / headers.len() as u64;
+    if headers.len() < INDEPENDENT_MEMBER_MIN_CANDIDATES
+        || average_probe_spacing > config.compressed_chunk_size.saturating_mul(4) as u64
+    {
+        return Ok(None);
+    }
+
+    headers.sort_unstable_by_key(|header| header.start);
+    headers.dedup_by_key(|header| header.start);
+    if headers.len() < INDEPENDENT_MEMBER_MIN_CANDIDATES {
+        return Ok(None);
+    }
+
+    Ok(Some(IndependentMemberIndex {
+        headers,
+        scan_start: probe_end,
+        compressed_size,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inflate_independent_member_into<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    member_number: u64,
+    header: MemberHeader,
+    compressed_size: u64,
+    inflater: &mut RawInflater,
+    compressed: &mut Vec<u8>,
+    decoded: &mut Vec<u8>,
+) -> Result<u64, DecodeError> {
+    let mut input_offset = header.deflate_start;
+    let member_output_start = decoded.len();
+    let maximum_member_output = config.decoded_chunk_size.max(16 * 1024 * 1024);
+    let output_step = config.decoded_chunk_size.clamp(32 * 1024, 256 * 1024);
+    let input_step = config.input_page_size.clamp(32 * 1024, 64 * 1024);
+    inflater.reset(header.deflate_start.saturating_mul(8))?;
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(DecodeError::Cancelled);
+        }
+        if input_offset >= compressed_size {
+            return Err(DecodeError::InvalidDeflate {
+                bit_offset: input_offset.saturating_mul(8),
+                reason: DeflateErrorKind::Truncated,
+            });
+        }
+        let input_length = usize::try_from(compressed_size - input_offset)
+            .unwrap_or(usize::MAX)
+            .min(input_step);
+        read_range_reuse(source, input_offset, input_length, compressed)?;
+
+        let mut relative_input = 0_usize;
+        while relative_input < compressed.len() {
+            let member_output = decoded.len() - member_output_start;
+            if member_output >= maximum_member_output {
+                return Err(DecodeError::OutputLimitExceeded {
+                    limit: maximum_member_output as u64,
+                });
+            }
+            let wanted_output = output_step.min(maximum_member_output - member_output);
+            decoded.reserve(wanted_output);
+            let output_start = decoded.len();
+            let spare_output = decoded.capacity() - output_start;
+            let input = &compressed[relative_input..];
+            let input_length = input.len().min(u32::MAX as usize);
+            let output_length = spare_output
+                .min(maximum_member_output - member_output)
+                .min(u32::MAX as usize);
+            inflater.stream.next_in = input.as_ptr();
+            inflater.stream.avail_in = input_length as u32;
+            inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+            inflater.stream.avail_out = output_length as u32;
+            let input_before = inflater.stream.avail_in;
+            let output_before = inflater.stream.avail_out;
+
+            // SAFETY:
+            // - the reset inflater is uniquely borrowed for this call;
+            // - `next_in` covers an immutable slice that remains live and
+            //   unmoved until `inflate` returns;
+            // - `next_out` covers only uniquely owned spare `Vec` capacity;
+            // - the initialized byte count is derived from zlib's reduction
+            //   of `avail_out` before extending the vector length below.
+            let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
+            let consumed = usize::try_from(input_before - inflater.stream.avail_in)
+                .expect("zlib uInt fits usize");
+            let produced = usize::try_from(output_before - inflater.stream.avail_out)
+                .expect("zlib uInt fits usize");
+            relative_input += consumed;
+            input_offset = input_offset.saturating_add(consumed as u64);
+            // SAFETY: zlib initialized exactly `produced` bytes in the spare
+            // capacity supplied above, and cannot report more than that
+            // capacity through `avail_out`.
+            unsafe { decoded.set_len(output_start + produced) };
+
+            match status {
+                z::Z_STREAM_END => {
+                    let member_output = &decoded[member_output_start..];
+                    let actual_crc = {
+                        let mut crc = Crc32::new();
+                        crc.update(member_output);
+                        crc.finish()
+                    };
+                    let footer_offset = input_offset;
+                    read_range_reuse(source, footer_offset, 8, compressed)?;
+                    let expected_crc =
+                        u32::from_le_bytes(compressed[0..4].try_into().expect("four bytes"));
+                    let expected_size =
+                        u32::from_le_bytes(compressed[4..8].try_into().expect("four bytes"));
+                    if actual_crc != expected_crc {
+                        return Err(DecodeError::ChecksumMismatch {
+                            member: member_number,
+                            expected: expected_crc,
+                            actual: actual_crc,
+                        });
+                    }
+                    let actual_size = member_output.len() as u32;
+                    if actual_size != expected_size {
+                        return Err(DecodeError::SizeMismatch {
+                            member: member_number,
+                            expected: expected_size,
+                            actual_mod32: actual_size,
+                        });
+                    }
+                    return Ok(footer_offset.saturating_add(8));
+                }
+                z::Z_OK => {
+                    if consumed == 0 && produced == 0 {
+                        return Err(DecodeError::InvalidDeflate {
+                            bit_offset: input_offset.saturating_mul(8),
+                            reason: DeflateErrorKind::Stalled,
+                        });
+                    }
+                }
+                z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {}
+                z::Z_BUF_ERROR => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: input_offset.saturating_mul(8),
+                        reason: DeflateErrorKind::Truncated,
+                    });
+                }
+                z::Z_NEED_DICT => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: header.deflate_start.saturating_mul(8),
+                        reason: DeflateErrorKind::UnexpectedDictionary,
+                    });
+                }
+                z::Z_DATA_ERROR => {
+                    let _diagnostic = inflater.message();
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: input_offset.saturating_mul(8),
+                        reason: DeflateErrorKind::InvalidData,
+                    });
+                }
+                other => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: input_offset.saturating_mul(8),
+                        reason: DeflateErrorKind::BackendStatus(other),
+                    });
+                }
+            }
+        }
+    }
+}
+
+struct DecodedIndependentMember {
+    end: u64,
+    bytes: Vec<u8>,
+}
+
+struct IndependentResult {
+    start: u64,
+    result: Result<DecodedIndependentMember, DecodeError>,
+}
+
+fn send_independent_result(
+    sender: &mpsc::SyncSender<IndependentResult>,
+    stopped: &AtomicBool,
+    mut result: IndependentResult,
+) {
+    loop {
+        if stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        match sender.try_send(result) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(returned)) => {
+                result = returned;
+                thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+enum IndependentOutcome {
+    Complete,
+    SequentialFallback { offset: u64 },
+}
+
+fn decode_independent_members<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    index: &IndependentMemberIndex,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    let queue = Arc::new(Injector::<MemberHeader>::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let available_tasks = Arc::new(AtomicUsize::new(index.headers.len()));
+    let unresolved_tasks = Arc::new(AtomicUsize::new(index.headers.len()));
+    let pending_results = Arc::new(AtomicUsize::new(index.headers.len()));
+    let scanner_done = Arc::new(AtomicBool::new(index.scan_start >= index.compressed_size));
+    let scanner_error = Arc::new(Mutex::new(None::<DecodeError>));
+    let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
+    let scan_signal = Arc::new((Mutex::new(()), Condvar::new()));
+    let worker_count = config.decoder_threads;
+    let pending_limit = config.in_flight_chunks.max(worker_count).max(1);
+    let scan_ahead_limit = pending_limit.saturating_mul(16);
+    for &header in &index.headers {
+        queue.push(header);
+    }
+    let (sender, receiver) = mpsc::sync_channel::<IndependentResult>(pending_limit);
+    let mut reordered = BTreeMap::new();
+    let mut total_output = 0_u64;
+    let mut member_count = 0_u64;
+    let mut expected_start = 0_u64;
+
+    let outcome = thread::scope(|scope| -> Result<IndependentOutcome, DecodeError> {
+        let _stop_on_exit = StopGuard(&stopped);
+        if index.scan_start < index.compressed_size {
+            let queue = Arc::clone(&queue);
+            let scanner_stopped = Arc::clone(&stopped);
+            let available_tasks = Arc::clone(&available_tasks);
+            let unresolved_tasks = Arc::clone(&unresolved_tasks);
+            let pending_results = Arc::clone(&pending_results);
+            let scanner_done = Arc::clone(&scanner_done);
+            let scanner_error = Arc::clone(&scanner_error);
+            let work_signal = Arc::clone(&work_signal);
+            let scan_signal = Arc::clone(&scan_signal);
+            scope.spawn(move || {
+                let result = scan_independent_headers(
+                    source,
+                    config.input_page_size,
+                    index.scan_start,
+                    index.compressed_size,
+                    Some(&scanner_stopped),
+                    |header| {
+                        while unresolved_tasks.load(Ordering::Acquire) >= scan_ahead_limit
+                            && !scanner_stopped.load(Ordering::Relaxed)
+                        {
+                            let (lock, signal) = &*scan_signal;
+                            let guard = lock.lock().expect("member scan mutex poisoned");
+                            let _ = signal
+                                .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                                    unresolved_tasks.load(Ordering::Acquire) >= scan_ahead_limit
+                                        && !scanner_stopped.load(Ordering::Relaxed)
+                                })
+                                .expect("member scan mutex poisoned");
+                        }
+                        if scanner_stopped.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        unresolved_tasks.fetch_add(1, Ordering::Release);
+                        pending_results.fetch_add(1, Ordering::Release);
+                        queue.push(header);
+                        available_tasks.fetch_add(1, Ordering::Release);
+                        work_signal.1.notify_one();
+                    },
+                );
+                if let Err(error) = result {
+                    *scanner_error.lock().expect("member scanner mutex poisoned") = Some(error);
+                }
+                scanner_done.store(true, Ordering::Release);
+                work_signal.1.notify_all();
+            });
+        }
+
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&queue);
+            let worker_stopped = Arc::clone(&stopped);
+            let available_tasks = Arc::clone(&available_tasks);
+            let work_signal = Arc::clone(&work_signal);
+            let sender = sender.clone();
+            scope.spawn(move || {
+                let mut inflater = None;
+                let mut compressed = Vec::new();
+                while !worker_stopped.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed)
+                {
+                    let header = loop {
+                        match queue.steal() {
+                            Steal::Success(header) => {
+                                available_tasks.fetch_sub(1, Ordering::AcqRel);
+                                break header;
+                            }
+                            Steal::Retry => std::hint::spin_loop(),
+                            Steal::Empty => {
+                                if worker_stopped.load(Ordering::Relaxed)
+                                    || cancelled.load(Ordering::Relaxed)
+                                {
+                                    return;
+                                }
+                                let (lock, signal) = &*work_signal;
+                                let guard = lock.lock().expect("member work mutex poisoned");
+                                let _ = signal
+                                    .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                                        available_tasks.load(Ordering::Acquire) == 0
+                                            && !worker_stopped.load(Ordering::Relaxed)
+                                            && !cancelled.load(Ordering::Relaxed)
+                                    })
+                                    .expect("member work mutex poisoned");
+                            }
+                        }
+                    };
+                    let result = (|| {
+                        if inflater.is_none() {
+                            inflater = Some(RawInflater::new()?);
+                        }
+                        let inflater = inflater
+                            .as_mut()
+                            .expect("the inflater was initialized immediately above");
+                        let mut decoded = Vec::new();
+                        let end = inflate_independent_member_into(
+                            source,
+                            config,
+                            cancelled,
+                            0,
+                            header,
+                            index.compressed_size,
+                            inflater,
+                            &mut compressed,
+                            &mut decoded,
+                        )?;
+                        Ok(DecodedIndependentMember {
+                            end,
+                            bytes: decoded,
+                        })
+                    })();
+                    send_independent_result(
+                        &sender,
+                        &worker_stopped,
+                        IndependentResult {
+                            start: header.start,
+                            result,
+                        },
+                    );
+                }
+            });
+        }
+        drop(sender);
+
+        while expected_start < index.compressed_size {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(DecodeError::Cancelled);
+            }
+            let result = match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => {
+                    pending_results.fetch_sub(1, Ordering::AcqRel);
+                    result
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if scanner_done.load(Ordering::Acquire) {
+                        if let Some(error) = scanner_error
+                            .lock()
+                            .expect("member scanner mutex poisoned")
+                            .take()
+                        {
+                            return Err(error);
+                        }
+                        if pending_results.load(Ordering::Acquire) == 0 {
+                            stopped.store(true, Ordering::Relaxed);
+                            return Ok(IndependentOutcome::SequentialFallback {
+                                offset: expected_start,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => return Err(DecodeError::WorkerPanicked),
+            };
+            if result.start < expected_start {
+                unresolved_tasks.fetch_sub(1, Ordering::AcqRel);
+                scan_signal.1.notify_one();
+                continue;
+            }
+            reordered.insert(result.start, result.result);
+
+            while let Some(result) = reordered.remove(&expected_start) {
+                let decoded = match result {
+                    Ok(decoded) => decoded,
+                    Err(_) => {
+                        stopped.store(true, Ordering::Relaxed);
+                        return Ok(IndependentOutcome::SequentialFallback {
+                            offset: expected_start,
+                        });
+                    }
+                };
+                if decoded.end <= expected_start || decoded.end > index.compressed_size {
+                    stopped.store(true, Ordering::Relaxed);
+                    return Ok(IndependentOutcome::SequentialFallback {
+                        offset: expected_start,
+                    });
+                }
+                let next_total = total_output.checked_add(decoded.bytes.len() as u64).ok_or(
+                    DecodeError::OutputLimitExceeded {
+                        limit: config.output_limit.unwrap_or(u64::MAX),
+                    },
+                )?;
+                if config.output_limit.is_some_and(|limit| next_total > limit) {
+                    return Err(DecodeError::OutputLimitExceeded {
+                        limit: config.output_limit.expect("checked as some"),
+                    });
+                }
+                total_output = next_total;
+                member_count += 1;
+                unresolved_tasks.fetch_sub(1, Ordering::AcqRel);
+                expected_start = decoded.end;
+                if !decoded.bytes.is_empty() {
+                    output.emit(decoded.bytes)?;
+                }
+                let before_retain = reordered.len();
+                reordered.retain(|start, _| *start >= expected_start);
+                let removed = before_retain - reordered.len();
+                if removed != 0 {
+                    unresolved_tasks.fetch_sub(removed, Ordering::AcqRel);
+                }
+                scan_signal.1.notify_one();
+            }
+        }
+        stopped.store(true, Ordering::Relaxed);
+        Ok(IndependentOutcome::Complete)
+    })?;
+    stopped.store(true, Ordering::Relaxed);
+
+    if let IndependentOutcome::SequentialFallback { offset } = outcome {
+        return decode_members_sequential(
+            source,
+            config,
+            cancelled,
+            output,
+            offset,
+            total_output,
+            member_count,
+        );
+    }
+
+    let final_length = source
+        .len()
+        .map_err(|error| DecodeError::input_io(index.compressed_size, error))?;
+    if final_length != index.compressed_size {
+        return Err(DecodeError::input_io(
+            index.compressed_size,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed source length changed during decoding",
+            ),
+        ));
+    }
+
+    Ok(DecodeReport {
+        compressed_bytes: index.compressed_size,
         decompressed_bytes: total_output,
         member_count,
         decoder_threads: config.decoder_threads,
@@ -2355,7 +3048,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MemberAccounting, SourceCursor, Window, inflate_tail, validate_footer};
+    use super::{
+        MemberAccounting, SourceCursor, Window, find_gzip_magic, find_gzip_magic_scalar,
+        inflate_tail, validate_footer,
+    };
+
+    #[test]
+    fn dispatched_gzip_magic_scan_matches_scalar_across_vector_edges() {
+        let mut bytes = vec![0_u8; 128];
+        for offset in [0, 1, 15, 31, 32, 63, 64, 95, 96, 127] {
+            bytes[offset] = 0x1F;
+        }
+        let mut scalar = Vec::new();
+        let mut dispatched = Vec::new();
+        find_gzip_magic_scalar(&bytes, 97, &mut scalar);
+        find_gzip_magic(&bytes, 97, &mut dispatched);
+        assert_eq!(dispatched, scalar);
+    }
 
     #[test]
     fn zlib_rs_tail_stops_at_exact_stored_block_boundary() {

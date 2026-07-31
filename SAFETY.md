@@ -25,8 +25,8 @@ There is no unsafe public API and no manual `Send` or `Sync` implementation.
   byte before the first inflate call.
 - `inflateSetDictionary` receives an immutable slice no larger than 32 KiB.
 - `inflateReset` receives the same uniquely owned initialized stream between
-  completed BGZF blocks. It preserves the raw-window mode and is never called
-  concurrently with `inflate`.
+  completed BGZF blocks or independent ordinary gzip members. It preserves the
+  raw-window mode and is never called concurrently with `inflate`.
 - `inflateEnd` runs exactly once for each successfully initialized stream.
 - `crc32_z` receives a live immutable byte slice and uses its exact length.
 
@@ -35,6 +35,22 @@ passes only that spare capacity to zlib-rs, checks `Z_STREAM_END`, exact input
 consumption, and exact output size, then calls `Vec::set_len` with the backend's
 reported initialized byte count. The extra byte distinguishes an exact-size
 decode from an output-buffer exhaustion condition, including empty EOF blocks.
+
+The dense ordinary-member path supplies live immutable input chunks and only
+the spare capacity remaining beneath its per-member output bound. It exposes
+exactly the initialized byte count reported by zlib-rs, verifies that the
+stream reached `Z_STREAM_END`, and authenticates CRC32 and ISIZE before the
+coordinator can emit the buffer.
+
+## SIMD gzip-header scan
+
+The x86-64 header prefilter calls its AVX2 implementation only after runtime
+feature detection. Each unaligned 32-byte load is guarded by
+`offset + 32 <= candidate_limit <= input.len()`. The resulting bit mask only
+selects byte offsets for safe Rust to validate; it never establishes a gzip
+boundary or bypasses full member inflation and trailer verification.
+The AArch64 NEON implementation similarly guards each 16-byte input load and
+stores its comparison lanes only into a live local 16-byte array.
 
 ## Native DEFLATE bit loads
 
