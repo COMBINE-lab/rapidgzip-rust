@@ -1,6 +1,7 @@
 use crate::backend::{Output, decode_source};
 use crate::config::Config;
-use crate::{DecodeError, DecodeReport, ReadAt};
+use crate::runtime::{AuxiliaryKind, RuntimeState};
+use crate::{DecodeError, DecodeReport, DecoderHandle, DecoderStats, ReadAt, WorkerLimitError};
 use std::io::{self, IoSliceMut, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,18 +18,27 @@ enum Message {
 struct ChannelOutput {
     sender: SyncSender<Message>,
     cancelled: Arc<AtomicBool>,
+    runtime: Arc<RuntimeState>,
 }
 
 impl ChannelOutput {
     fn send(&self, mut message: Message) -> Result<(), DecodeError> {
+        let mut observed_full = false;
         loop {
             if self.cancelled.load(Ordering::Relaxed) {
                 return Err(DecodeError::Cancelled);
             }
             match self.sender.try_send(message) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if !observed_full {
+                        self.runtime.set_consumer_blocked(false);
+                    }
+                    return Ok(());
+                }
                 Err(TrySendError::Disconnected(_)) => return Err(DecodeError::Cancelled),
                 Err(TrySendError::Full(returned)) => {
+                    observed_full = true;
+                    self.runtime.set_consumer_blocked(true);
                     message = returned;
                     thread::park_timeout(Duration::from_millis(1));
                 }
@@ -39,7 +49,10 @@ impl ChannelOutput {
 
 impl Output for ChannelOutput {
     fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError> {
-        self.send(Message::Data(chunk))
+        let byte_count = chunk.len();
+        self.send(Message::Data(chunk))?;
+        self.runtime.add_decompressed_bytes(byte_count);
+        Ok(())
     }
 }
 
@@ -63,6 +76,7 @@ pub struct DecoderReader {
     receiver: Option<Receiver<Message>>,
     worker: Option<JoinHandle<()>>,
     cancelled: Arc<AtomicBool>,
+    handle: DecoderHandle,
     current: Vec<u8>,
     current_offset: usize,
     terminal: Terminal,
@@ -74,16 +88,30 @@ where
 {
     let (sender, receiver) = mpsc::sync_channel(config.in_flight_chunks);
     let cancelled = Arc::new(AtomicBool::new(false));
+    let runtime = RuntimeState::new(config.decoder_threads);
+    let handle = DecoderHandle::new(Arc::clone(&runtime));
     let worker_cancelled = Arc::clone(&cancelled);
+    let worker_runtime = Arc::clone(&runtime);
     let worker = thread::Builder::new()
         .name("rapidgzip-coordinator".to_owned())
         .spawn(move || {
+            let _registration = worker_runtime.register_auxiliary(AuxiliaryKind::Coordinator);
             let mut output = ChannelOutput {
                 sender,
                 cancelled: Arc::clone(&worker_cancelled),
+                runtime: Arc::clone(&worker_runtime),
             };
-            let terminal = match decode_source(&source, &config, &worker_cancelled, &mut output) {
-                Ok(report) => Message::Finished(report),
+            let terminal = match decode_source(
+                &source,
+                &config,
+                &worker_cancelled,
+                &mut output,
+                &worker_runtime,
+            ) {
+                Ok(report) => {
+                    worker_runtime.set_member_count(report.member_count);
+                    Message::Finished(report)
+                }
                 Err(DecodeError::Cancelled) if worker_cancelled.load(Ordering::Relaxed) => return,
                 Err(error) => Message::Failed(error),
             };
@@ -95,6 +123,7 @@ where
         receiver: Some(receiver),
         worker: Some(worker),
         cancelled,
+        handle,
         current: Vec::new(),
         current_offset: 0,
         terminal: Terminal::Open,
@@ -102,6 +131,33 @@ where
 }
 
 impl DecoderReader {
+    /// Returns a cloneable telemetry and runtime-control handle.
+    ///
+    /// The handle can be retained after moving this reader into a parser or a
+    /// `Box<dyn Read + Send>`.
+    pub fn handle(&self) -> DecoderHandle {
+        self.handle.clone()
+    }
+
+    /// Returns an approximate lock-free snapshot of decoder activity.
+    pub fn stats(&self) -> DecoderStats {
+        self.handle.stats()
+    }
+
+    /// Changes the maximum number of workers that may accept decoder tasks.
+    ///
+    /// This is a convenience forwarding method for
+    /// [`DecoderHandle::set_worker_limit`]. Retain a handle when the reader
+    /// will be moved into another component.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLimitError`] for zero or a value above the configured
+    /// worker budget.
+    pub fn set_worker_limit(&self, workers: usize) -> Result<(), WorkerLimitError> {
+        self.handle.set_worker_limit(workers)
+    }
+
     /// Returns the report after verified EOF has been observed.
     ///
     /// This is `None` while decoding is open and after a terminal failure.
@@ -133,6 +189,7 @@ impl DecoderReader {
                 self.current_offset = 0;
             }
             Ok(Message::Finished(report)) => {
+                self.handle.state.mark_terminal();
                 let terminal = match self.join_worker() {
                     Ok(()) => Terminal::Finished(report),
                     Err(error) => Terminal::Failed(error),
@@ -140,6 +197,7 @@ impl DecoderReader {
                 self.terminal = terminal;
             }
             Ok(Message::Failed(error)) => {
+                self.handle.state.mark_terminal();
                 let terminal = match self.join_worker() {
                     Ok(()) => Terminal::Failed(error),
                     Err(join_error) => Terminal::Failed(join_error),
@@ -147,6 +205,7 @@ impl DecoderReader {
                 self.terminal = terminal;
             }
             Err(_) => {
+                self.handle.state.mark_terminal();
                 let error = self
                     .join_worker()
                     .err()
@@ -194,6 +253,7 @@ impl Read for DecoderReader {
                     self.current.clear();
                     self.current_offset = 0;
                 }
+                self.handle.state.add_consumed_bytes(count);
                 return Ok(count);
             }
 
@@ -230,6 +290,7 @@ impl Read for DecoderReader {
 impl Drop for DecoderReader {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Relaxed);
+        self.handle.state.mark_terminal();
         self.receiver.take();
         let _ = self.join_worker();
     }

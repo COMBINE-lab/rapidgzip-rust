@@ -1,6 +1,7 @@
 use crate::backend::{DirectOutput, decode_source};
 use crate::gzip::validate_initial_header;
 use crate::reader;
+use crate::runtime::RuntimeState;
 use crate::{DecodeError, DecodeReport, DecoderReader, ReadAt};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -185,7 +186,8 @@ impl Decoder {
     {
         let cancelled = AtomicBool::new(false);
         let mut sink = DirectOutput::new(output);
-        decode_source(source, &self.config, &cancelled, &mut sink)
+        let runtime = RuntimeState::new(self.config.decoder_threads);
+        decode_source(source, &self.config, &cancelled, &mut sink, &runtime)
     }
 
     /// Starts decoding an owned positional source and returns `Read + Send`

@@ -23,6 +23,8 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let decoder = Decoder::builder().decoder_threads(8).build()?;
 //! let mut reader = decoder.open("reads.fastq.gz")?;
+//! let control = reader.handle();
+//! control.set_worker_limit(4)?;
 //! io::copy(&mut reader, &mut io::sink())?;
 //! let report = reader.finish()?;
 //! assert!(report.member_count >= 1);
@@ -49,9 +51,13 @@
 //! files on Unix and Windows, in-memory byte storage, [`std::sync::Arc`], and
 //! [`Box`]. The source length and contents must remain stable during decoding.
 //!
-//! [`DecoderBuilder::decoder_threads`] sets a maximum worker budget. A format
-//! path or the empirical controller may activate fewer workers when the input
-//! exposes less parallelism or additional concurrency is counterproductive.
+//! [`DecoderBuilder::decoder_threads`] sets a maximum worker budget rather than
+//! eagerly creating that many threads. Parallel paths grow an elastic worker
+//! population from an affinity- and budget-aware bootstrap. A cloned
+//! [`DecoderHandle`] provides lock-free telemetry and can change the runtime
+//! ceiling after a [`DecoderReader`] moves into another component. Excess
+//! workers finish their current task and retire; sustained reader backpressure
+//! also reduces admission automatically.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
@@ -62,6 +68,7 @@ mod error;
 mod gzip;
 mod read_at;
 mod reader;
+mod runtime;
 
 pub mod parallel;
 
@@ -69,3 +76,4 @@ pub use config::{ConfigError, Decoder, DecoderBuilder};
 pub use error::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind};
 pub use read_at::ReadAt;
 pub use reader::DecoderReader;
+pub use runtime::{DecoderHandle, DecoderPath, DecoderPressure, DecoderStats, WorkerLimitError};

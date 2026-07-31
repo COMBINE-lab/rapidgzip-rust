@@ -57,6 +57,50 @@ unread decoded bytes, verifies the remainder, and returns the final report.
 Dropping the reader early cancels its background work and does not claim that
 the unread remainder was verified.
 
+### Runtime telemetry and worker control
+
+[`DecoderReader::handle`] returns a cloneable [`DecoderHandle`]. Retain it
+before moving the reader into paraseq or a `Box<dyn Read + Send>`:
+
+```rust,no_run
+use rapidgzip_core::{Decoder, DecoderPressure};
+use std::io::Read;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let decoder = Decoder::builder().decoder_threads(32).build()?;
+    let reader = decoder.open("reads.fastq.gz")?;
+    let control = reader.handle();
+
+    // The parser may now take ownership of the reader.
+    let mut parser_input: Box<dyn Read + Send> = Box::new(reader);
+
+    // A process-wide scheduler can reduce or restore the decoder's ceiling.
+    control.set_worker_limit(8)?;
+    let stats = control.stats();
+    if matches!(stats.pressure, DecoderPressure::ConsumerBound { .. }) {
+        control.set_worker_limit(2)?;
+    }
+
+    std::io::copy(&mut parser_input, &mut std::io::sink())?;
+    Ok(())
+}
+```
+
+The configured worker count is an immutable maximum, not an eager allocation.
+Workers are created lazily as the empirical controller finds useful parallel
+work. Lowering the runtime ceiling is nonblocking: in-flight tasks finish,
+excess workers stop accepting tasks, and persistently excess OS threads retire.
+They can be recreated if the ceiling and measured demand later increase.
+Sustained backpressure at the final reader handoff automatically reduces task
+admission to one worker and retires the rest.
+
+`DecoderStats` distinguishes the configured maximum, current application
+ceiling, adaptive active target, workers executing decode tasks, and live OS
+threads. It also reports the selected decode path, verified members, produced
+and consumed bytes, average rates, and a high-level pressure classification.
+Snapshots use relaxed atomic loads, are deliberately approximate, and describe
+rapidgzip task activity rather than operating-system CPU utilization.
+
 ### Push decoding
 
 [`Decoder::decode`] avoids the final reader copy and calls a `Write` value only
@@ -103,9 +147,11 @@ rapidgzip-rust -P 16 --test reads.fastq.gz
 rapidgzip-rust -P 16 --output reads.fastq reads.fastq.gz
 ```
 
-`-P`/`--threads` is a maximum decoder-worker budget. Some formats or the
-empirical controller may use fewer active workers when the input exposes less
-parallel work or when additional concurrency reduces throughput.
+`-P`/`--threads` is a maximum decoder-worker budget. Parallel paths bootstrap
+from the smaller of the affinity-visible processors and this requested budget,
+then create more workers only while measurements justify them. They may retain
+fewer active workers when the input exposes less parallel work, the consumer is
+backpressured, or additional concurrency reduces throughput.
 
 ## Correctness and resource behavior
 
@@ -194,6 +240,8 @@ MIT. See [LICENSE-BSD-3-CLAUSE] and [LICENSE-MIT].
 
 [`Decoder::decode`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode
 [`Decoder::open`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.open
+[`DecoderHandle`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderHandle.html
+[`DecoderReader::handle`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderReader.html#method.handle
 [`DecoderBuilder::output_limit`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.output_limit
 [`DecoderReader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderReader.html
 [`ReadAt`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/trait.ReadAt.html

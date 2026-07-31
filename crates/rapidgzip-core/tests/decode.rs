@@ -1,8 +1,10 @@
 //! End-to-end decoder and paraseq integration tests.
 
 use paraseq::{Record, fastq};
-use rapidgzip_core::{DecodeError, Decoder};
+use rapidgzip_core::{DecodeError, Decoder, DecoderHandle, DecoderPath, DecoderPressure, ReadAt};
 use std::io::{self, Read};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 fn crc32(bytes: &[u8]) -> u32 {
     let mut value = u32::MAX;
@@ -128,6 +130,65 @@ fn padded_empty_member(total_size: usize) -> Vec<u8> {
     encoded.extend_from_slice(&0_u32.to_le_bytes());
     assert_eq!(encoded.len(), total_size);
     encoded
+}
+
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    condition()
+}
+
+#[derive(Clone)]
+struct GatedReadAt {
+    bytes: Arc<Vec<u8>>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl GatedReadAt {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+            gate: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    fn open(&self) {
+        let (lock, signal) = &*self.gate;
+        *lock.lock().unwrap() = true;
+        signal.notify_all();
+    }
+}
+
+impl ReadAt for GatedReadAt {
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.bytes.as_slice().len() as u64)
+    }
+
+    fn read_at(&self, offset: u64, output: &mut [u8]) -> io::Result<usize> {
+        // Integration-test threads and the named coordinator may classify the
+        // input. Unnamed scoped decoder workers wait so the test can observe
+        // their elastic population deterministically.
+        if std::thread::current().name().is_none() {
+            let (lock, signal) = &*self.gate;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = signal.wait(open).unwrap();
+            }
+        }
+        self.bytes.as_slice().read_at(offset, output)
+    }
+}
+
+fn assert_handle_traits<T: Clone + Send + Sync + Unpin>() {}
+
+#[test]
+fn decoder_handle_is_clone_send_sync_and_unpin() {
+    assert_handle_traits::<DecoderHandle>();
 }
 
 #[test]
@@ -318,6 +379,121 @@ fn reader_streams_dense_small_members_in_order() {
     reader.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, expected_member.repeat(64));
     assert_eq!(reader.report().unwrap().member_count, 64);
+}
+
+#[test]
+fn reader_telemetry_survives_moving_and_finishing_the_reader() {
+    let (member, expected_member) = dynamic_multiblock_fixture();
+    let compressed = member.repeat(64);
+    let expected_bytes = expected_member.len() * 64;
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let mut reader = decoder.reader(compressed).unwrap();
+    let handle = reader.handle();
+    let mut decoded = Vec::new();
+    reader.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded.len(), expected_bytes);
+
+    let stats = handle.stats();
+    assert_eq!(stats.path, DecoderPath::DenseMembers);
+    assert_eq!(stats.configured_workers, 8);
+    assert_eq!(stats.decompressed_bytes, expected_bytes as u64);
+    assert_eq!(stats.consumed_bytes, expected_bytes as u64);
+    assert_eq!(stats.member_count, 64);
+    assert_eq!(stats.active_workers, 0);
+    assert_eq!(stats.spawned_workers, 0);
+    assert_eq!(stats.auxiliary_threads, 0);
+    assert!(matches!(stats.pressure, DecoderPressure::Finished));
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(
+        handle.stats().decode_throughput_bps,
+        stats.decode_throughput_bps
+    );
+}
+
+#[test]
+fn telemetry_reports_specialized_and_sequential_paths() {
+    let stored = member(&vec![1; 10 * 1024 * 1024]);
+    let mut bgzf = Vec::new();
+    for _ in 0..32 {
+        bgzf.extend(bgzf_member(b"ACGT\n"));
+    }
+    bgzf.extend(bgzf_eof());
+    let (marker, _) = dynamic_multiblock_fixture();
+
+    for (compressed, workers, expected_path, expected_members) in [
+        (stored, 4, DecoderPath::Stored, 1),
+        (bgzf, 4, DecoderPath::Bgzf, 33),
+        (marker.clone(), 4, DecoderPath::MarkerWindow, 1),
+        (marker, 1, DecoderPath::Sequential, 1),
+    ] {
+        let decoder = Decoder::builder().decoder_threads(workers).build().unwrap();
+        let mut reader = decoder.reader(compressed).unwrap();
+        let handle = reader.handle();
+        io::copy(&mut reader, &mut io::sink()).unwrap();
+        assert_eq!(handle.stats().path, expected_path);
+        assert_eq!(handle.stats().member_count, expected_members);
+    }
+}
+
+#[test]
+fn runtime_limit_lazily_grows_and_retires_dense_workers() {
+    let visible = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    if visible < 2 {
+        return;
+    }
+
+    let (member, _) = dynamic_multiblock_fixture();
+    let source = GatedReadAt::new(member.repeat(512));
+    let decoder = Decoder::builder()
+        .decoder_threads(8)
+        .in_flight_chunks(1)
+        .build()
+        .unwrap();
+    let reader = decoder.reader(source.clone()).unwrap();
+    let handle = reader.handle();
+    handle.set_worker_limit(1).unwrap();
+
+    assert!(wait_until(Duration::from_secs(5), || {
+        let stats = handle.stats();
+        stats.path == DecoderPath::DenseMembers
+            && stats.spawned_workers == 1
+            && stats.busy_workers == 1
+    }));
+
+    let raised_limit = visible.min(4);
+    handle.set_worker_limit(raised_limit).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        handle.stats().spawned_workers == raised_limit
+    }));
+
+    handle.set_worker_limit(1).unwrap();
+    source.open();
+    assert!(wait_until(Duration::from_secs(5), || {
+        handle.stats().spawned_workers <= 1
+    }));
+    drop(reader);
+}
+
+#[test]
+fn final_reader_handoff_reports_consumer_backpressure() {
+    let (member, _) = dynamic_multiblock_fixture();
+    let decoder = Decoder::builder()
+        .decoder_threads(8)
+        .in_flight_chunks(1)
+        .build()
+        .unwrap();
+    let reader = decoder.reader(member.repeat(512)).unwrap();
+    let handle = reader.handle();
+    assert!(wait_until(Duration::from_secs(5), || {
+        matches!(
+            handle.stats().pressure,
+            DecoderPressure::ConsumerBound { .. }
+        )
+    }));
+    assert!(wait_until(Duration::from_secs(5), || {
+        handle.stats().spawned_workers <= 1
+    }));
+    drop(reader);
 }
 
 #[test]

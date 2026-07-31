@@ -118,42 +118,63 @@ reuse their initialized zlib-rs stream with `inflateReset`.
 ## Scheduling and memory
 
 The BGZF, stored, dense-member, and native paths use a
-`crossbeam-deque::Injector`, scoped workers, and bounded result channels. The
+`crossbeam_deque::Injector`, scoped workers, and bounded result channels. The
 dense-member scanner is held to sixteen result windows of candidate work so
 its header queue cannot grow with archive size. A collated dense-member result
 contains at most four independently verified members and is also bounded by
-the configured decoded/compressed work sizes. For generic native
-decoding, the configured thread count is a maximum budget rather than a fixed
-active count. The controller reads `available_parallelism`, which respects the
-process affinity mask on supported platforms and bounds active ranks by that
-value. A budget below the machine seed starts fully enabled. Larger budgets
-share a starting point at the ceiling of twice the square root of visible
-parallelism, so increasing the requested maximum never causes an abrupt jump
-or drop in bootstrap concurrency.
-This grows with the machine without multiplying speculative memory linearly by
-every processor. Streams with fewer than sixteen initial worker-waves retain
-that machine-derived bootstrap: calibrating a short decode costs more than an
-optimum found near EOF can recover.
+the configured decoded/compressed work sizes.
 
-Longer streams measure native worker completions before ordered output handoff,
-so `DecoderReader` backpressure or parser speed cannot bias the decoder limit.
-Each candidate uses the median of three intervals. Work carries a controller
-generation, and completions begun under an earlier limit do not inflate the new
-candidate's byte count. The search probes downward first, preferring a lower
-setting within a 3% noise margin, or climbs in quarter-bootstrap steps while
-throughput materially improves. Its empirical search extent is at most twice
-the bootstrap and never exceeds the configured budget. This bounds calibration
-and speculative-memory exposure without a compiled-in worker cap.
+All parallel paths treat the configured thread count as an immutable maximum,
+not an eager allocation. The bootstrap budget is the minimum of that maximum
+and affinity-visible parallelism, and its initial target is the ceiling of twice
+the square root of that budget. The mutable application ceiling further caps
+the effective target. This preserves a larger configured request as headroom
+without immediately multiplying worker stacks, inflaters, buffers, and
+speculative output by every processor.
+
+Streams with enough work empirically probe upward from that conservative
+bootstrap in bootstrap-sized steps while throughput materially improves, then
+probe downward around the best setting and prefer a lower count within a 3%
+noise margin. Each candidate uses the median of five intervals. Work carries a
+controller generation, and completions begun under an earlier limit do not
+inflate a new candidate's byte count. The search may reach the configured
+budget when every increase remains useful; streams with fewer than eight
+initial worker-waves retain the bootstrap because an optimum found near EOF
+cannot repay calibration overhead. Modest budgets of at most twice their
+bootstrap grow to their requested ceiling after the initial sample; on these
+small pools, noisy interior calibration costs more than the few threads it
+could release.
+
+The adaptive target is combined with the application ceiling exposed by
+`DecoderHandle::set_worker_limit`. Workers have stable ranks and are created
+lazily only when the effective target grows. A worker above a reduced target
+finishes its current task, stops taking queue work, and exits after a 250 ms
+hysteresis interval if the reduction persists. The coordinator observes that
+exit and can recreate the missing rank if demand later returns. Thread creation
+and retirement therefore remain bounded by the same scoped lifetime as the
+source borrowed by a decode.
+
+`DecoderReader` supplies an additional feedback signal at the only queue that
+unambiguously represents its consumer: the final synchronous output handoff.
+When that queue fills, task admission falls to one. A successful send that had
+to wait does not immediately clear the condition; a later send must complete
+without encountering a full queue. This small hysteresis prevents a slow parser
+from repeatedly restoring the full adaptive target for one available slot.
+Sustained backpressure consequently retires excess workers, while transient
+handoff jitter normally ends before their retirement timeout.
 
 The active limit also controls the decode/resolve scheduling horizon because
-each speculative result commonly owns several MiB of `u16` symbols. Workers
-have stable ranks and are created lazily as upward probes require them. Ranks
-disabled by a later downward decision sleep on a separate condition variable
-and do not wake for ordinary queue activity. All enabled workers dynamically
-take marker-resolution work first and boundary-decode work second. Result
-channels retain two slots of scheduling slack so every worker cannot block
-publishing native results while an exact member bridge awaits resolution. BGZF
-and stored paths retain their format-specific worker counts.
+each speculative result commonly owns several MiB of `u16` symbols. Enabled
+generic workers dynamically take marker-resolution work first and
+boundary-decode work second. Result channels retain two slots of scheduling
+slack so every worker cannot block publishing native results while an exact
+member bridge awaits resolution.
+
+`DecoderHandle::stats` reads relaxed atomics only. It distinguishes configured,
+application-limited, active, busy, and live-worker counts; live auxiliary
+coordinator/scanner threads are reported separately. Produced and consumed
+bytes distinguish decoder progress from parser progress. These snapshots are
+approximate task telemetry, not OS scheduler or per-thread CPU accounting.
 
 Native workers and their estimated grid persist across all members in a file.
 At each ordinary gzip member transition, the coordinator resets

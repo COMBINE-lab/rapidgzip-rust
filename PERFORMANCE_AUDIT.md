@@ -45,14 +45,15 @@ The accepted changes are:
 - Huffman leaves are packed into `u16`, halving the large direct tables. The bit
   reader has a proven eight-byte fast path and retains checked safe-Rust tail
   handling.
-- Native decode/resolve concurrency is empirically controlled rather than
-  capped at a compiled-in value. A process-affinity-aware square-root bootstrap
-  is capped monotonically by the requested worker budget and avoids linear
-  speculative-memory growth. Long inputs search both downward and upward using
-  generation-tagged native worker throughput; short inputs do not pay a
-  calibration cost they cannot amortize. The scheduling horizon follows the
-  selected limit, and worker ranks are created lazily. BGZF and stored paths
-  keep their format-specific parallelism.
+- Parallel concurrency is empirically controlled rather than capped at a
+  compiled-in value. The square-root bootstrap is derived from the smaller of
+  the requested budget and affinity-visible processors, avoiding eager linear
+  thread and speculative-memory growth. Long inputs search upward and then
+  downward using generation-tagged worker throughput; short inputs do not pay
+  calibration they cannot amortize. Generic, dense-member, BGZF, and stored
+  workers are created lazily and persistently excess ranks retire. The reader's
+  final handoff separately detects consumer backpressure and temporarily caps
+  admission at one worker.
 
 Correct overlapping-copy behavior is covered across predecessor references,
 short-distance overlap, and 32 KiB wraparound. Suffix-only window derivation is

@@ -11,6 +11,23 @@ The Criterion benchmark drains the public `DecoderReader`, so channel
 handoff, ordered assembly, verification, and the unavoidable `Read` copy are
 included.
 
+The unpublished telemetry sampler drains the same reader while recording its
+elastic worker state:
+
+```bash
+cargo run --release -p rapidgzip-bench --bin telemetry -- \
+  corpus.fastq.gz 32 16
+
+# Add a delay after each 1 MiB Read call to exercise consumer backpressure.
+cargo run --release -p rapidgzip-bench --bin telemetry -- \
+  corpus.fastq.gz 32 32 1000
+```
+
+Arguments after the path are the configured worker maximum, optional runtime
+worker ceiling, and optional consumer delay in microseconds. Output includes
+maximum active, busy, spawned, and auxiliary threads; pressure sample counts;
+and time from sustained consumer backpressure to retirement of excess workers.
+
 For corpus and competitor runs, build the Rust release binary and use the
 matrix driver:
 
@@ -235,6 +252,52 @@ parallel decode was slower than the 605 MB/s one-worker result. The table's
 corresponding medians are 641, 5,016, and 6,173 MB/s. Peak RSS was 18,908 KiB
 at budget 16 and 38,348 KiB at budget 32. A SHA-256 comparison against GNU
 gzip produced the same decoded digest.
+
+### Elastic-worker and telemetry diagnostic
+
+The initial elastic-worker implementation was measured on the 1,024-member,
+380,928,000-byte decoded fixture above using the public `DecoderReader`. The
+process was pinned to physical CPUs 0--43. Each cell below is the median of five
+runs with a configured maximum of 32 workers and a fast discard consumer:
+
+| runtime worker ceiling | peak spawned workers | median MiB/s |
+|---:|---:|---:|
+| 4 | 4 | 1,531 |
+| 8 | 8 | 2,985 |
+| 16 | 16 | 4,809 |
+| 32 | 32 | 4,462 |
+
+This verifies that the runtime ceiling controls actual OS-worker creation, not
+only task admission. It also reproduces the workload's useful-concurrency knee:
+16 workers exceeded the unconstrained 32-worker median on this short fixture.
+The 32-worker run begins at a 12-worker budget-derived bootstrap and may probe
+upward; the input is too short to guarantee a completed empirical search.
+
+For the backpressure run, the same decoder used a 1,000-microsecond delay after
+each 1 MiB `Read` request. Across five runs, maximum active and spawned workers
+were 12 before backpressure. While consumer-bound, the active target was always
+one; excess worker threads retired after a median 252.0 ms, close to the
+configured 250 ms hysteresis, and the live worker count reached zero once
+decoding got ahead of the throttled consumer. Median end-to-end throughput was
+300.8 MiB/s. This controlled delay is a scheduling diagnostic, not a decoder
+throughput result.
+
+The same sampler was run five times on the public single-member FASTQ under the
+same 44-CPU affinity mask. These are pull-API measurements and therefore do not
+replace the competitor matrix above:
+
+| configured budget | peak worker OS threads | median MiB/s |
+|---:|---:|---:|
+| 1 | 0 (coordinator decodes) | 650.0 |
+| 4 | 4 | 793.0 |
+| 16 | 16 | 1,583.2 |
+| 44 | 14 | 1,845.3 |
+
+The 44-budget stream was too short to amortize calibration, so it retained the
+14-worker bootstrap instead of allocating all 44 workers. Against the published
+zlib-ng C++ control values, the corresponding throughput ratios remain above
+the 95% per-cell gate. A final nine-run follow-up at budget 16 selected 16
+workers every time and produced a 1,583.2 MiB/s median.
 
 ### Adjacent-member result collation
 

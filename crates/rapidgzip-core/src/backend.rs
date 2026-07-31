@@ -7,6 +7,7 @@ use crate::parallel::deflate::{
     ChunkOutput, Error as NativeError, InitialHistory, ResolvedParts, decode_to_estimated_boundary,
     find_next_structural_candidate,
 };
+use crate::runtime::{DecoderPath, RuntimeState};
 use crate::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ReadAt};
 use crossbeam_deque::{Injector, Steal};
 use libz_rs_sys as z;
@@ -135,6 +136,7 @@ pub(crate) fn decode_source<R, O>(
     config: &Config,
     cancelled: &AtomicBool,
     output: &mut O,
+    runtime: &Arc<RuntimeState>,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
@@ -146,22 +148,28 @@ where
     let bgzf_index = index_bgzf(source, config.input_page_size.min(256))?;
     if let Some(index) = bgzf_index {
         if index.len() > 1 {
-            return decode_bgzf_parallel(source, config, cancelled, output, &index);
+            runtime.set_path(DecoderPath::Bgzf);
+            return decode_bgzf_parallel(source, config, cancelled, output, &index, runtime);
         }
     }
     if config.decoder_threads > 1 {
         if let Some(index) = index_stored_stream(source, config.input_page_size.min(256))? {
             if index.tasks.len() > 1 {
-                return decode_stored_parallel(source, config, cancelled, output, &index);
+                runtime.set_path(DecoderPath::Stored);
+                return decode_stored_parallel(source, config, cancelled, output, &index, runtime);
             }
         }
         if let Some(index) = index_independent_members(source, config)? {
-            return decode_independent_members(source, config, cancelled, output, &index);
+            runtime.set_path(DecoderPath::DenseMembers);
+            return decode_independent_members(source, config, cancelled, output, &index, runtime);
         }
         let grid_size = adjusted_compressed_chunk_size(source, config)?;
-        return decode_rapidgzip_estimated(source, config, cancelled, output, grid_size);
+        runtime.set_path(DecoderPath::MarkerWindow);
+        return decode_rapidgzip_estimated(source, config, cancelled, output, grid_size, runtime);
     }
-    decode_source_sequential(source, config, cancelled, output)
+    runtime.set_path(DecoderPath::Sequential);
+    runtime.set_adaptive_target(1);
+    decode_source_sequential(source, config, cancelled, output, runtime)
 }
 
 fn adjusted_compressed_chunk_size<R: ReadAt + ?Sized>(
@@ -305,14 +313,14 @@ impl Drop for StopGuard<'_> {
 struct SignalledStopGuard<'a> {
     stopped: &'a AtomicBool,
     work_signal: &'a Condvar,
-    limit_signal: &'a Condvar,
+    runtime: &'a RuntimeState,
 }
 
 impl Drop for SignalledStopGuard<'_> {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Relaxed);
         self.work_signal.notify_all();
-        self.limit_signal.notify_all();
+        self.runtime.notify_limit_waiters();
     }
 }
 
@@ -335,19 +343,113 @@ fn send_stored_result(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_stored_worker<'scope, 'env: 'scope, R>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    worker_index: usize,
+    source: &'env R,
+    cancelled: &'env AtomicBool,
+    index: &'env StoredIndex,
+    queue: Arc<Injector<usize>>,
+    stopped: Arc<AtomicBool>,
+    available_tasks: Arc<AtomicUsize>,
+    sender: mpsc::SyncSender<StoredResult>,
+    adaptive_workers: Arc<AdaptiveWorkers>,
+    exited_sender: mpsc::Sender<usize>,
+) where
+    R: ReadAt + ?Sized + 'env,
+{
+    scope.spawn(move || {
+        let _registration = adaptive_workers.runtime.register_worker();
+        loop {
+            if stopped.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            if !adaptive_workers.worker_enabled(worker_index) {
+                if adaptive_workers.wait_until_enabled_or_retire(worker_index, &stopped) {
+                    continue;
+                }
+                break;
+            }
+            let task_index = 'take_task: loop {
+                match queue.steal() {
+                    Steal::Success(task_index) => {
+                        let remaining = available_tasks
+                            .fetch_sub(1, Ordering::AcqRel)
+                            .saturating_sub(1);
+                        adaptive_workers.runtime.set_queued_tasks(remaining);
+                        break 'take_task Some(task_index);
+                    }
+                    Steal::Retry => std::hint::spin_loop(),
+                    Steal::Empty => {
+                        if stopped.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+                            let _ = exited_sender.send(worker_index);
+                            return;
+                        }
+                        thread::park_timeout(Duration::from_millis(1));
+                        if !adaptive_workers.worker_enabled(worker_index) {
+                            break 'take_task None;
+                        }
+                    }
+                }
+            };
+            let Some(task_index) = task_index else {
+                continue;
+            };
+            let generation = adaptive_workers.start_work();
+            let task = &index.tasks[task_index];
+            let result = {
+                let _busy = adaptive_workers.runtime.begin_task();
+                (|| {
+                    let mut decoded = Vec::with_capacity(task.decoded_size);
+                    for range in &task.ranges {
+                        let length = usize::try_from(range.end - range.start)
+                            .expect("stored block length fits usize");
+                        decoded.extend_from_slice(&read_range(source, range.start, length)?);
+                    }
+                    Ok(decoded)
+                })()
+            };
+            let decoded_bytes = result.as_ref().map_or(0, Vec::len);
+            adaptive_workers.observe_work(generation, decoded_bytes);
+            send_stored_result(
+                &sender,
+                &stopped,
+                StoredResult {
+                    index: task_index,
+                    result,
+                },
+            );
+        }
+        let _ = exited_sender.send(worker_index);
+    });
+}
+
 fn decode_stored_parallel<R, O>(
     source: &R,
     config: &Config,
     cancelled: &AtomicBool,
     output: &mut O,
     index: &StoredIndex,
+    runtime: &Arc<RuntimeState>,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
     O: Output,
 {
+    let worker_count = config.decoder_threads.min(index.tasks.len());
+    let machine_parallelism = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let adaptive_workers = Arc::new(AdaptiveWorkers::new(
+        worker_count,
+        machine_parallelism,
+        config.decoded_chunk_size.saturating_mul(4),
+        index.tasks.len(),
+        Arc::clone(runtime),
+    ));
+    let worker_pool_count = adaptive_workers.worker_pool_limit().min(worker_count);
     let task_queue = Arc::new(Injector::new());
     let stopped = Arc::new(AtomicBool::new(false));
+    let available_tasks = Arc::new(AtomicUsize::new(0));
     let task_window = config
         .in_flight_chunks
         .max(config.decoder_threads)
@@ -355,6 +457,8 @@ where
     for task_index in 0..task_window {
         task_queue.push(task_index);
     }
+    available_tasks.store(task_window, Ordering::Relaxed);
+    runtime.set_queued_tasks(task_window);
     let (sender, receiver) = mpsc::sync_channel::<StoredResult>(task_window);
     let mut next_to_schedule = task_window;
     let mut next_to_emit = 0;
@@ -364,51 +468,34 @@ where
 
     let scoped_result = thread::scope(|scope| -> Result<(), DecodeError> {
         let _stop_on_exit = StopGuard(&stopped);
-        for _ in 0..config.decoder_threads.min(index.tasks.len()) {
-            let queue = Arc::clone(&task_queue);
-            let worker_stopped = Arc::clone(&stopped);
-            let sender = sender.clone();
-            scope.spawn(move || {
-                while !worker_stopped.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed)
-                {
-                    let task_index = loop {
-                        match queue.steal() {
-                            Steal::Success(task_index) => break task_index,
-                            Steal::Retry => std::hint::spin_loop(),
-                            Steal::Empty => {
-                                if worker_stopped.load(Ordering::Relaxed)
-                                    || cancelled.load(Ordering::Relaxed)
-                                {
-                                    return;
-                                }
-                                thread::park_timeout(Duration::from_millis(1));
-                            }
-                        }
-                    };
-                    let task = &index.tasks[task_index];
-                    let result = (|| {
-                        let mut decoded = Vec::with_capacity(task.decoded_size);
-                        for range in &task.ranges {
-                            let length = usize::try_from(range.end - range.start)
-                                .expect("stored block length fits usize");
-                            decoded.extend_from_slice(&read_range(source, range.start, length)?);
-                        }
-                        Ok(decoded)
-                    })();
-                    send_stored_result(
-                        &sender,
-                        &worker_stopped,
-                        StoredResult {
-                            index: task_index,
-                            result,
-                        },
-                    );
-                }
-            });
-        }
-        drop(sender);
+        let sender_template = sender;
+        let (exited_sender, exited_receiver) = mpsc::channel();
+        let mut live_workers = vec![false; worker_pool_count];
 
         while next_to_emit < index.tasks.len() {
+            while let Ok(worker_index) = exited_receiver.try_recv() {
+                live_workers[worker_index] = false;
+            }
+            let spawn_target = adaptive_workers.current_limit().min(worker_pool_count);
+            for (worker_index, is_live) in live_workers.iter_mut().enumerate().take(spawn_target) {
+                if *is_live {
+                    continue;
+                }
+                spawn_stored_worker(
+                    scope,
+                    worker_index,
+                    source,
+                    cancelled,
+                    index,
+                    Arc::clone(&task_queue),
+                    Arc::clone(&stopped),
+                    Arc::clone(&available_tasks),
+                    sender_template.clone(),
+                    Arc::clone(&adaptive_workers),
+                    exited_sender.clone(),
+                );
+                *is_live = true;
+            }
             if cancelled.load(Ordering::Relaxed) {
                 stopped.store(true, Ordering::Relaxed);
                 return Err(DecodeError::Cancelled);
@@ -446,10 +533,12 @@ where
                         });
                     }
                     accounting = MemberAccounting::new();
+                    runtime.set_member_count(task.member as u64 + 1);
                 }
                 next_to_emit += 1;
                 if next_to_schedule < index.tasks.len() {
                     task_queue.push(next_to_schedule);
+                    available_tasks.fetch_add(1, Ordering::Release);
                     next_to_schedule += 1;
                 }
             }
@@ -486,12 +575,13 @@ fn decode_source_sequential<R, O>(
     config: &Config,
     cancelled: &AtomicBool,
     output: &mut O,
+    runtime: &Arc<RuntimeState>,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    decode_members_sequential(source, config, cancelled, output, 0, 0, 0)
+    decode_members_sequential(source, config, cancelled, output, 0, 0, 0, runtime)
 }
 
 /// Decodes complete members beginning at a known member boundary.
@@ -500,6 +590,7 @@ where
 /// sequence inside DEFLATE happened to look like a gzip header. Previously
 /// emitted members remain valid, so resuming from the first uncommitted task
 /// avoids both duplicate output and trusting the speculative candidate index.
+#[allow(clippy::too_many_arguments)]
 fn decode_members_sequential<R, O>(
     source: &R,
     config: &Config,
@@ -508,6 +599,7 @@ fn decode_members_sequential<R, O>(
     start_offset: u64,
     mut total_output: u64,
     mut member_count: u64,
+    runtime: &Arc<RuntimeState>,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
@@ -653,6 +745,7 @@ where
         }
 
         member_count += 1;
+        runtime.set_member_count(member_count);
     }
 
     if member_count == 0 {
@@ -1257,16 +1350,18 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
     inflater: &mut RawInflater,
     compressed: &mut Vec<u8>,
     sender: &mpsc::SyncSender<IndependentResult>,
-) -> bool {
+    runtime: &RuntimeState,
+) -> Option<usize> {
     let target_result_size = config
         .decoded_chunk_size
         .min(config.compressed_chunk_size / 2);
     let maximum_collatable_member_size = (target_result_size / 4).max(32 * 1024);
     let mut active = None::<PendingIndependentRun>;
+    let mut decoded_bytes = 0_usize;
 
     for &header in task.headers() {
         if stopped.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
-            return false;
+            return None;
         }
 
         if active
@@ -1274,7 +1369,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
             .is_some_and(|run| run.decoded.end != header.start)
             && !send_finished_independent_run(&mut active, sender, stopped)
         {
-            return false;
+            return None;
         }
 
         let run = active.get_or_insert_with(|| PendingIndependentRun {
@@ -1287,26 +1382,31 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
             },
         });
         let member_output_start = run.decoded.bytes.len();
-        match inflate_independent_member_into(
-            source,
-            config,
-            cancelled,
-            0,
-            header,
-            compressed_size,
-            inflater,
-            compressed,
-            &mut run.decoded.bytes,
-        ) {
+        let result = {
+            let _busy = runtime.begin_task();
+            inflate_independent_member_into(
+                source,
+                config,
+                cancelled,
+                0,
+                header,
+                compressed_size,
+                inflater,
+                compressed,
+                &mut run.decoded.bytes,
+            )
+        };
+        match result {
             Ok(end) => {
                 let member_size = run.decoded.bytes.len() - member_output_start;
+                decoded_bytes = decoded_bytes.saturating_add(member_size);
                 run.decoded.end = end;
                 run.decoded.push_member_size(member_size);
                 if (member_size > maximum_collatable_member_size
                     || run.decoded.bytes.len() >= target_result_size)
                     && !send_finished_independent_run(&mut active, sender, stopped)
                 {
-                    return false;
+                    return None;
                 }
             }
             Err(error) => {
@@ -1314,7 +1414,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
                 if run.decoded.member_count() == 0 {
                     active = None;
                 } else if !send_finished_independent_run(&mut active, sender, stopped) {
-                    return false;
+                    return None;
                 }
                 if !send_independent_result(
                     sender,
@@ -1325,13 +1425,131 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
                         result: Err(error),
                     },
                 ) {
-                    return false;
+                    return None;
                 }
             }
         }
     }
 
-    send_finished_independent_run(&mut active, sender, stopped)
+    send_finished_independent_run(&mut active, sender, stopped).then_some(decoded_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_independent_worker<'scope, 'env: 'scope, R>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    worker_index: usize,
+    source: &'env R,
+    config: &'env Config,
+    cancelled: &'env AtomicBool,
+    compressed_size: u64,
+    queue: Arc<Injector<IndependentMemberTask>>,
+    stopped: Arc<AtomicBool>,
+    available_tasks: Arc<AtomicUsize>,
+    work_signal: Arc<(Mutex<()>, Condvar)>,
+    sender: mpsc::SyncSender<IndependentResult>,
+    adaptive_workers: Arc<AdaptiveWorkers>,
+    exited_sender: mpsc::Sender<usize>,
+) where
+    R: ReadAt + ?Sized + 'env,
+{
+    scope.spawn(move || {
+        let _registration = adaptive_workers.runtime.register_worker();
+        let mut inflater = None;
+        let mut compressed = Vec::new();
+        loop {
+            if stopped.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            if !adaptive_workers.worker_enabled(worker_index) {
+                if adaptive_workers.wait_until_enabled_or_retire(worker_index, &stopped) {
+                    continue;
+                }
+                break;
+            }
+            let task = 'take_task: loop {
+                match queue.steal() {
+                    Steal::Success(task) => {
+                        let remaining = available_tasks
+                            .fetch_sub(1, Ordering::AcqRel)
+                            .saturating_sub(1);
+                        adaptive_workers.runtime.set_queued_tasks(remaining);
+                        break 'take_task Some(task);
+                    }
+                    Steal::Retry => std::hint::spin_loop(),
+                    Steal::Empty => {
+                        if stopped.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+                            let _ = exited_sender.send(worker_index);
+                            return;
+                        }
+                        if !adaptive_workers.worker_enabled(worker_index) {
+                            break 'take_task None;
+                        }
+                        let (lock, signal) = &*work_signal;
+                        let guard = lock.lock().expect("member work mutex poisoned");
+                        let _ = signal
+                            .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                                available_tasks.load(Ordering::Acquire) == 0
+                                    && adaptive_workers.worker_enabled(worker_index)
+                                    && !stopped.load(Ordering::Relaxed)
+                                    && !cancelled.load(Ordering::Relaxed)
+                            })
+                            .expect("member work mutex poisoned");
+                    }
+                }
+            };
+            let Some(task) = task else {
+                continue;
+            };
+            let generation = adaptive_workers.start_work();
+            if inflater.is_none() {
+                match RawInflater::new() {
+                    Ok(new_inflater) => inflater = Some(new_inflater),
+                    Err(error) => {
+                        let candidate_count = task.headers().len();
+                        let start = task
+                            .headers()
+                            .first()
+                            .expect("independent tasks are never empty")
+                            .start;
+                        if !send_independent_result(
+                            &sender,
+                            &stopped,
+                            IndependentResult {
+                                start,
+                                candidate_count,
+                                result: Err(error),
+                            },
+                        ) {
+                            let _ = exited_sender.send(worker_index);
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
+            let Some(decoded_bytes) = decode_independent_task(
+                source,
+                config,
+                cancelled,
+                &stopped,
+                compressed_size,
+                task,
+                inflater
+                    .as_mut()
+                    .expect("the inflater was initialized immediately above"),
+                &mut compressed,
+                &sender,
+                &adaptive_workers.runtime,
+            ) else {
+                let _ = exited_sender.send(worker_index);
+                return;
+            };
+            if adaptive_workers.observe_work(generation, decoded_bytes) {
+                work_signal.1.notify_all();
+            }
+        }
+        let _ = exited_sender.send(worker_index);
+    });
 }
 
 enum IndependentOutcome {
@@ -1345,6 +1563,7 @@ fn decode_independent_members<R, O>(
     cancelled: &AtomicBool,
     output: &mut O,
     index: &IndependentMemberIndex,
+    runtime: &Arc<RuntimeState>,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
@@ -1359,6 +1578,23 @@ where
     );
     let initial_tasks =
         batch_independent_headers(&index.headers, task_compressed_span, task_candidate_limit);
+    let estimated_candidates = usize::try_from(
+        index
+            .compressed_size
+            .div_ceil(index.average_probe_spacing.max(1)),
+    )
+    .unwrap_or(usize::MAX)
+    .max(index.headers.len());
+    let estimated_work_items = estimated_candidates.div_ceil(task_candidate_limit.max(1));
+    let machine_parallelism = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let adaptive_workers = Arc::new(AdaptiveWorkers::new(
+        worker_count,
+        machine_parallelism,
+        config.decoded_chunk_size.saturating_mul(4),
+        estimated_work_items,
+        Arc::clone(runtime),
+    ));
+    let worker_pool_count = adaptive_workers.worker_pool_limit().min(worker_count);
     let queue = Arc::new(Injector::<IndependentMemberTask>::new());
     let stopped = Arc::new(AtomicBool::new(false));
     let available_tasks = Arc::new(AtomicUsize::new(initial_tasks.len()));
@@ -1373,6 +1609,7 @@ where
     for task in initial_tasks {
         queue.push(task);
     }
+    runtime.set_queued_tasks(available_tasks.load(Ordering::Relaxed));
     let (sender, receiver) = mpsc::sync_channel::<IndependentResult>(pending_limit);
     let mut reordered = BTreeMap::new();
     let mut total_output = 0_u64;
@@ -1380,7 +1617,14 @@ where
     let mut expected_start = 0_u64;
 
     let outcome = thread::scope(|scope| -> Result<IndependentOutcome, DecodeError> {
-        let _stop_on_exit = StopGuard(&stopped);
+        let _stop_on_exit = SignalledStopGuard {
+            stopped: &stopped,
+            work_signal: &work_signal.1,
+            runtime,
+        };
+        let sender_template = sender;
+        let (exited_sender, exited_receiver) = mpsc::channel();
+        let mut live_workers = vec![false; worker_pool_count];
         if index.scan_start < index.compressed_size {
             let queue = Arc::clone(&queue);
             let scanner_stopped = Arc::clone(&stopped);
@@ -1391,7 +1635,10 @@ where
             let scanner_error = Arc::clone(&scanner_error);
             let work_signal = Arc::clone(&work_signal);
             let scan_signal = Arc::clone(&scan_signal);
+            let scanner_runtime = Arc::clone(runtime);
             scope.spawn(move || {
+                let _registration =
+                    scanner_runtime.register_auxiliary(crate::runtime::AuxiliaryKind::Scanner);
                 let enqueue = |task: IndependentMemberTask| {
                     let candidate_count = task.headers().len();
                     while unresolved_candidates.load(Ordering::Acquire) != 0
@@ -1418,7 +1665,8 @@ where
                     unresolved_candidates.fetch_add(candidate_count, Ordering::AcqRel);
                     pending_candidates.fetch_add(candidate_count, Ordering::AcqRel);
                     queue.push(task);
-                    available_tasks.fetch_add(1, Ordering::Release);
+                    let queued = available_tasks.fetch_add(1, Ordering::Release) + 1;
+                    scanner_runtime.set_queued_tasks(queued);
                     work_signal.1.notify_one();
                 };
                 let mut builder =
@@ -1450,88 +1698,33 @@ where
             });
         }
 
-        for _ in 0..worker_count {
-            let queue = Arc::clone(&queue);
-            let worker_stopped = Arc::clone(&stopped);
-            let available_tasks = Arc::clone(&available_tasks);
-            let work_signal = Arc::clone(&work_signal);
-            let sender = sender.clone();
-            scope.spawn(move || {
-                let mut inflater = None;
-                let mut compressed = Vec::new();
-                while !worker_stopped.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed)
-                {
-                    let task = loop {
-                        match queue.steal() {
-                            Steal::Success(task) => {
-                                available_tasks.fetch_sub(1, Ordering::AcqRel);
-                                break task;
-                            }
-                            Steal::Retry => std::hint::spin_loop(),
-                            Steal::Empty => {
-                                if worker_stopped.load(Ordering::Relaxed)
-                                    || cancelled.load(Ordering::Relaxed)
-                                {
-                                    return;
-                                }
-                                let (lock, signal) = &*work_signal;
-                                let guard = lock.lock().expect("member work mutex poisoned");
-                                let _ = signal
-                                    .wait_timeout_while(guard, Duration::from_millis(1), |_| {
-                                        available_tasks.load(Ordering::Acquire) == 0
-                                            && !worker_stopped.load(Ordering::Relaxed)
-                                            && !cancelled.load(Ordering::Relaxed)
-                                    })
-                                    .expect("member work mutex poisoned");
-                            }
-                        }
-                    };
-                    if inflater.is_none() {
-                        match RawInflater::new() {
-                            Ok(new_inflater) => inflater = Some(new_inflater),
-                            Err(error) => {
-                                let candidate_count = task.headers().len();
-                                let start = task
-                                    .headers()
-                                    .first()
-                                    .expect("independent tasks are never empty")
-                                    .start;
-                                if !send_independent_result(
-                                    &sender,
-                                    &worker_stopped,
-                                    IndependentResult {
-                                        start,
-                                        candidate_count,
-                                        result: Err(error),
-                                    },
-                                ) {
-                                    return;
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    if !decode_independent_task(
-                        source,
-                        config,
-                        cancelled,
-                        &worker_stopped,
-                        index.compressed_size,
-                        task,
-                        inflater
-                            .as_mut()
-                            .expect("the inflater was initialized immediately above"),
-                        &mut compressed,
-                        &sender,
-                    ) {
-                        return;
-                    }
-                }
-            });
-        }
-        drop(sender);
-
         while expected_start < index.compressed_size {
+            while let Ok(worker_index) = exited_receiver.try_recv() {
+                live_workers[worker_index] = false;
+            }
+            let spawn_target = adaptive_workers.current_limit().min(worker_pool_count);
+            for (worker_index, is_live) in live_workers.iter_mut().enumerate().take(spawn_target) {
+                if *is_live {
+                    continue;
+                }
+                spawn_independent_worker(
+                    scope,
+                    worker_index,
+                    source,
+                    config,
+                    cancelled,
+                    index.compressed_size,
+                    Arc::clone(&queue),
+                    Arc::clone(&stopped),
+                    Arc::clone(&available_tasks),
+                    Arc::clone(&work_signal),
+                    sender_template.clone(),
+                    Arc::clone(&adaptive_workers),
+                    exited_sender.clone(),
+                );
+                *is_live = true;
+            }
+            runtime.set_queued_tasks(available_tasks.load(Ordering::Relaxed));
             if cancelled.load(Ordering::Relaxed) {
                 return Err(DecodeError::Cancelled);
             }
@@ -1615,6 +1808,7 @@ where
                     total_output =
                         next_total.expect("the overflow case returned immediately above");
                     member_count += 1;
+                    runtime.set_member_count(member_count);
                     accepted_bytes += member_size;
                 }
                 unresolved_candidates.fetch_sub(result_candidate_count, Ordering::AcqRel);
@@ -1651,6 +1845,7 @@ where
             offset,
             total_output,
             member_count,
+            runtime,
         );
     }
 
@@ -1912,21 +2107,19 @@ struct ResolveResult {
     result: Result<ResolvedParts, crate::parallel::MarkerError>,
 }
 
-/// Admission control shared by the generic decode and marker-resolution work.
+/// Admission control shared by parallel decode paths.
 ///
-/// Worker ranks are created lazily as upward probes request them. Stable ranks
-/// keep per-worker compressed buffers local instead of rotating parked threads
-/// through the active set. Candidate measurements count native completions
-/// before ordered output handoff, and stable operation costs one atomic rank
-/// check per task without touching the controller mutex.
+/// Worker ranks are created lazily as upward probes request them and retire
+/// after a persistent downward decision. Candidate measurements count native
+/// completions before ordered output handoff. Stable operation costs one atomic
+/// rank check per task without touching the controller mutex.
 struct AdaptiveWorkers {
     controller: Mutex<AdaptiveConcurrency>,
-    current_limit: AtomicUsize,
     generation: AtomicUsize,
     calibrating: AtomicBool,
     worker_pool_limit: usize,
-    limit_mutex: Mutex<()>,
-    limit_signal: Condvar,
+    observed_limit_epoch: AtomicUsize,
+    runtime: Arc<RuntimeState>,
 }
 
 impl AdaptiveWorkers {
@@ -1935,6 +2128,7 @@ impl AdaptiveWorkers {
         machine_parallelism: usize,
         sample_bytes: usize,
         work_items: usize,
+        runtime: Arc<RuntimeState>,
     ) -> Self {
         let controller =
             AdaptiveConcurrency::new(maximum, machine_parallelism, sample_bytes, work_items);
@@ -1942,19 +2136,20 @@ impl AdaptiveWorkers {
         let generation = controller.generation();
         let calibrating = !controller.is_stable();
         let worker_pool_limit = controller.worker_pool_limit();
+        runtime.set_adaptive_target(current_limit);
+        runtime.set_best_workers(controller.best_limit());
         Self {
             controller: Mutex::new(controller),
-            current_limit: AtomicUsize::new(current_limit),
             generation: AtomicUsize::new(generation),
             calibrating: AtomicBool::new(calibrating),
             worker_pool_limit,
-            limit_mutex: Mutex::new(()),
-            limit_signal: Condvar::new(),
+            observed_limit_epoch: AtomicUsize::new(runtime.limit_epoch()),
+            runtime,
         }
     }
 
     fn current_limit(&self) -> usize {
-        self.current_limit.load(Ordering::Acquire)
+        self.runtime.effective_worker_limit()
     }
 
     fn worker_enabled(&self, worker_index: usize) -> bool {
@@ -1965,21 +2160,10 @@ impl AdaptiveWorkers {
         self.worker_pool_limit
     }
 
-    fn is_calibrating(&self) -> bool {
-        self.calibrating.load(Ordering::Acquire)
-    }
-
-    fn wait_until_enabled(&self, worker_index: usize, stopped: &AtomicBool) {
-        let guard = self
-            .limit_mutex
-            .lock()
-            .expect("adaptive limit mutex poisoned");
-        let _guard = self
-            .limit_signal
-            .wait_while(guard, |_| {
-                !self.worker_enabled(worker_index) && !stopped.load(Ordering::Relaxed)
-            })
-            .expect("adaptive limit mutex poisoned");
+    fn wait_until_enabled_or_retire(&self, worker_index: usize, stopped: &AtomicBool) -> bool {
+        const RETIRE_AFTER: Duration = Duration::from_millis(250);
+        self.runtime.wait_for_limit_change(RETIRE_AFTER);
+        !stopped.load(Ordering::Relaxed) && self.worker_enabled(worker_index)
     }
 
     fn start_work(&self) -> Option<usize> {
@@ -1987,10 +2171,21 @@ impl AdaptiveWorkers {
             return None;
         }
         let generation = self.generation.load(Ordering::Acquire);
-        self.controller
+        let limit_epoch = self.runtime.limit_epoch();
+        let mut controller = self
+            .controller
             .lock()
-            .expect("adaptive worker mutex poisoned")
-            .start_work(generation, Instant::now());
+            .expect("adaptive worker mutex poisoned");
+        if self
+            .observed_limit_epoch
+            .swap(limit_epoch, Ordering::AcqRel)
+            != limit_epoch
+            || self.current_limit() != controller.current_limit()
+        {
+            controller.pause_observation();
+            return None;
+        }
+        controller.start_work(generation, Instant::now());
         Some(generation)
     }
 
@@ -2004,13 +2199,12 @@ impl AdaptiveWorkers {
             .expect("adaptive worker mutex poisoned");
         let changed = controller.observe_work(generation, decoded_bytes, Instant::now());
         if changed {
-            self.current_limit
-                .store(controller.current_limit(), Ordering::Release);
             self.generation
                 .store(controller.generation(), Ordering::Release);
             self.calibrating
                 .store(!controller.is_stable(), Ordering::Release);
-            self.limit_signal.notify_all();
+            self.runtime.set_adaptive_target(controller.current_limit());
+            self.runtime.set_best_workers(controller.best_limit());
         }
         changed
     }
@@ -2070,23 +2264,30 @@ fn spawn_estimated_worker<'scope, 'env: 'scope, R>(
     available_resolve_tasks: Arc<AtomicUsize>,
     work_signal: Arc<(Mutex<()>, Condvar)>,
     adaptive_workers: Arc<AdaptiveWorkers>,
+    exited_sender: mpsc::Sender<usize>,
 ) where
     R: ReadAt + ?Sized + 'env,
 {
     scope.spawn(move || {
+        let _registration = adaptive_workers.runtime.register_worker();
         let mut compressed = Vec::new();
         loop {
             if stopped.load(Ordering::Relaxed) {
                 break;
             }
             if !adaptive_workers.worker_enabled(worker_index) {
-                adaptive_workers.wait_until_enabled(worker_index, &stopped);
-                continue;
+                if adaptive_workers.wait_until_enabled_or_retire(worker_index, &stopped) {
+                    continue;
+                }
+                break;
             }
             match resolve_queue.steal() {
                 Steal::Success(task) => {
                     available_resolve_tasks.fetch_sub(1, Ordering::AcqRel);
-                    let result = task.output.resolve_parts(&task.predecessor);
+                    let result = {
+                        let _busy = adaptive_workers.runtime.begin_task();
+                        task.output.resolve_parts(&task.predecessor)
+                    };
                     send_resolve_result(
                         &resolve_sender,
                         &stopped,
@@ -2107,8 +2308,10 @@ fn spawn_estimated_worker<'scope, 'env: 'scope, R>(
                 Steal::Success(index) => {
                     available_decode_tasks.fetch_sub(1, Ordering::AcqRel);
                     let generation = adaptive_workers.start_work();
-                    let result =
-                        run_estimated_task(source, &tasks[index], maximum_output, &mut compressed);
+                    let result = {
+                        let _busy = adaptive_workers.runtime.begin_task();
+                        run_estimated_task(source, &tasks[index], maximum_output, &mut compressed)
+                    };
                     let decoded_bytes = result.as_ref().map_or(0, |chunk| chunk.output.len());
                     if adaptive_workers.observe_work(generation, decoded_bytes) {
                         work_signal.1.notify_all();
@@ -2133,6 +2336,7 @@ fn spawn_estimated_worker<'scope, 'env: 'scope, R>(
                 })
                 .expect("estimated work mutex poisoned");
         }
+        let _ = exited_sender.send(worker_index);
     });
 }
 
@@ -2554,6 +2758,7 @@ fn decode_rapidgzip_estimated<R, O>(
     cancelled: &AtomicBool,
     output: &mut O,
     compressed_chunk_size: usize,
+    runtime: &Arc<RuntimeState>,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
@@ -2621,8 +2826,9 @@ where
     let adaptive_workers = Arc::new(AdaptiveWorkers::new(
         worker_count,
         machine_parallelism,
-        compressed_chunk_size.saturating_mul(16),
+        config.decoded_chunk_size,
         tasks.len(),
+        Arc::clone(runtime),
     ));
     let worker_pool_count = adaptive_workers.worker_pool_limit().min(worker_count);
     // Result channels need spare slots beyond the active ranks because the
@@ -2659,11 +2865,12 @@ where
         let _stop_on_exit = SignalledStopGuard {
             stopped: &stopped,
             work_signal: &work_signal.1,
-            limit_signal: &adaptive_workers.limit_signal,
+            runtime,
         };
-        let mut sender_template = Some(sender);
-        let mut resolve_sender_template = Some(resolve_sender);
-        let mut spawned_workers = 0_usize;
+        let sender_template = sender;
+        let resolve_sender_template = resolve_sender;
+        let (exited_sender, exited_receiver) = mpsc::channel();
+        let mut live_workers = vec![false; worker_pool_count];
 
         let mut window = Window::empty();
         let mut accounting = MemberAccounting::new();
@@ -2671,35 +2878,37 @@ where
         let mut bridge_compressed = Vec::new();
 
         'decode: loop {
+            while let Ok(worker_index) = exited_receiver.try_recv() {
+                live_workers[worker_index] = false;
+            }
+            runtime.set_queued_tasks(
+                available_decode_tasks
+                    .load(Ordering::Relaxed)
+                    .saturating_add(available_resolve_tasks.load(Ordering::Relaxed)),
+            );
             let spawn_target = adaptive_workers.current_limit().min(worker_pool_count);
-            while spawned_workers < spawn_target {
+            for (worker_index, is_live) in live_workers.iter_mut().enumerate().take(spawn_target) {
+                if *is_live {
+                    continue;
+                }
                 spawn_estimated_worker(
                     scope,
-                    spawned_workers,
+                    worker_index,
                     source,
                     &tasks,
                     maximum_output,
                     Arc::clone(&task_queue),
                     Arc::clone(&resolve_queue),
-                    sender_template
-                        .as_ref()
-                        .expect("worker sender remains while calibration can grow")
-                        .clone(),
-                    resolve_sender_template
-                        .as_ref()
-                        .expect("resolve sender remains while calibration can grow")
-                        .clone(),
+                    sender_template.clone(),
+                    resolve_sender_template.clone(),
                     Arc::clone(&stopped),
                     Arc::clone(&available_decode_tasks),
                     Arc::clone(&available_resolve_tasks),
                     Arc::clone(&work_signal),
                     Arc::clone(&adaptive_workers),
+                    exited_sender.clone(),
                 );
-                spawned_workers += 1;
-            }
-            if !adaptive_workers.is_calibrating() {
-                drop(sender_template.take());
-                drop(resolve_sender_template.take());
+                *is_live = true;
             }
 
             if let Some(offset) = footer_offset.take() {
@@ -2718,6 +2927,7 @@ where
                 let actual_footer =
                     validate_footer(&mut frame_cursor, offset, member_count, &accounting)?;
                 member_count += 1;
+                runtime.set_member_count(member_count);
                 if actual_footer.saturating_add(8) == frame_cursor.length() {
                     break 'decode;
                 }
@@ -3176,30 +3386,157 @@ fn send_bgzf_result(
     }
 }
 
+const BGZF_BLOCKS_PER_TASK: usize = 8;
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_bgzf_worker<'scope, 'env: 'scope, R>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    worker_index: usize,
+    source: &'env R,
+    cancelled: &'env AtomicBool,
+    ranges: &'env [BgzfRange],
+    queue: Arc<Injector<usize>>,
+    stopped: Arc<AtomicBool>,
+    available_tasks: Arc<AtomicUsize>,
+    work_signal: Arc<(Mutex<()>, Condvar)>,
+    sender: mpsc::SyncSender<BgzfResult>,
+    adaptive_workers: Arc<AdaptiveWorkers>,
+    exited_sender: mpsc::Sender<usize>,
+) where
+    R: ReadAt + ?Sized + 'env,
+{
+    scope.spawn(move || {
+        let _registration = adaptive_workers.runtime.register_worker();
+        let mut compressed = Vec::new();
+        let mut inflater = None;
+        loop {
+            if stopped.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            if !adaptive_workers.worker_enabled(worker_index) {
+                if adaptive_workers.wait_until_enabled_or_retire(worker_index, &stopped) {
+                    continue;
+                }
+                break;
+            }
+            let task_index = 'take_task: loop {
+                match queue.steal() {
+                    Steal::Success(index) => {
+                        let remaining = available_tasks
+                            .fetch_sub(1, Ordering::AcqRel)
+                            .saturating_sub(1);
+                        adaptive_workers.runtime.set_queued_tasks(remaining);
+                        break 'take_task Some(index);
+                    }
+                    Steal::Retry => std::hint::spin_loop(),
+                    Steal::Empty => {
+                        if stopped.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+                            let _ = exited_sender.send(worker_index);
+                            return;
+                        }
+                        if !adaptive_workers.worker_enabled(worker_index) {
+                            break 'take_task None;
+                        }
+                        let (lock, signal) = &*work_signal;
+                        let guard = lock.lock().expect("BGZF work mutex poisoned");
+                        let _ = signal
+                            .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                                available_tasks.load(Ordering::Acquire) == 0
+                                    && adaptive_workers.worker_enabled(worker_index)
+                                    && !stopped.load(Ordering::Relaxed)
+                                    && !cancelled.load(Ordering::Relaxed)
+                            })
+                            .expect("BGZF work mutex poisoned");
+                    }
+                }
+            };
+            let Some(task_index) = task_index else {
+                continue;
+            };
+            let generation = adaptive_workers.start_work();
+            let first_block = task_index * BGZF_BLOCKS_PER_TASK;
+            let past_last_block = (first_block + BGZF_BLOCKS_PER_TASK).min(ranges.len());
+            let mut decoded =
+                Vec::with_capacity((past_last_block - first_block).saturating_mul(64 * 1024));
+            let result = {
+                let _busy = adaptive_workers.runtime.begin_task();
+                (|| {
+                    if inflater.is_none() {
+                        inflater = Some(RawInflater::new()?);
+                    }
+                    let inflater = inflater
+                        .as_mut()
+                        .expect("the inflater was initialized immediately above");
+                    for (range_index, &range) in ranges
+                        .iter()
+                        .enumerate()
+                        .take(past_last_block)
+                        .skip(first_block)
+                    {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return Err(DecodeError::Cancelled);
+                        }
+                        decode_bgzf_block_into(
+                            source,
+                            range,
+                            range_index as u64,
+                            &mut compressed,
+                            &mut decoded,
+                            inflater,
+                        )?;
+                    }
+                    Ok(decoded)
+                })()
+            };
+            let decoded_bytes = result.as_ref().map_or(0, Vec::len);
+            adaptive_workers.observe_work(generation, decoded_bytes);
+            send_bgzf_result(
+                &sender,
+                &stopped,
+                BgzfResult {
+                    index: task_index,
+                    result,
+                },
+            );
+        }
+        let _ = exited_sender.send(worker_index);
+    });
+}
+
 fn decode_bgzf_parallel<R, O>(
     source: &R,
     config: &Config,
     cancelled: &AtomicBool,
     output: &mut O,
     ranges: &[BgzfRange],
+    runtime: &Arc<RuntimeState>,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    const BLOCKS_PER_TASK: usize = 8;
-    let task_count = ranges.len().div_ceil(BLOCKS_PER_TASK);
+    let task_count = ranges.len().div_ceil(BGZF_BLOCKS_PER_TASK);
     let worker_count = config.decoder_threads.min(task_count);
+    let machine_parallelism = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let adaptive_workers = Arc::new(AdaptiveWorkers::new(
+        worker_count,
+        machine_parallelism,
+        8 * 64 * 1024 * 16,
+        task_count,
+        Arc::clone(runtime),
+    ));
+    let worker_pool_count = adaptive_workers.worker_pool_limit().min(worker_count);
     let task_queue = Arc::new(Injector::new());
     let stopped = Arc::new(AtomicBool::new(false));
     let available_tasks = Arc::new(AtomicUsize::new(0));
     let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
-    let task_window = worker_count;
-    let pending_limit = config.in_flight_chunks.max(worker_count);
+    let task_window = adaptive_workers.current_limit().min(task_count);
+    let pending_limit = config.in_flight_chunks.max(worker_pool_count);
     for index in 0..task_window {
         task_queue.push(index);
     }
     available_tasks.store(task_window, Ordering::Release);
+    runtime.set_queued_tasks(task_window);
     let (sender, receiver) = mpsc::sync_channel::<BgzfResult>(pending_limit);
     let mut next_to_schedule = task_window;
     let mut next_to_emit = 0;
@@ -3208,83 +3545,40 @@ where
     let mut total_output = 0_u64;
 
     let scoped_result = thread::scope(|scope| -> Result<(), DecodeError> {
-        let _stop_on_exit = StopGuard(&stopped);
-        for _ in 0..worker_count {
-            let queue = Arc::clone(&task_queue);
-            let worker_stopped = Arc::clone(&stopped);
-            let available_tasks = Arc::clone(&available_tasks);
-            let work_signal = Arc::clone(&work_signal);
-            let sender = sender.clone();
-            scope.spawn(move || {
-                let mut compressed = Vec::new();
-                let mut inflater = None;
-
-                while !worker_stopped.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed)
-                {
-                    let index = loop {
-                        match queue.steal() {
-                            Steal::Success(index) => {
-                                available_tasks.fetch_sub(1, Ordering::AcqRel);
-                                break index;
-                            }
-                            Steal::Retry => std::hint::spin_loop(),
-                            Steal::Empty => {
-                                if worker_stopped.load(Ordering::Relaxed)
-                                    || cancelled.load(Ordering::Relaxed)
-                                {
-                                    return;
-                                }
-                                let (lock, signal) = &*work_signal;
-                                let guard = lock.lock().expect("BGZF work mutex poisoned");
-                                let _ = signal
-                                    .wait_timeout_while(guard, Duration::from_millis(1), |_| {
-                                        available_tasks.load(Ordering::Acquire) == 0
-                                            && !worker_stopped.load(Ordering::Relaxed)
-                                            && !cancelled.load(Ordering::Relaxed)
-                                    })
-                                    .expect("BGZF work mutex poisoned");
-                            }
-                        }
-                    };
-                    let first_block = index * BLOCKS_PER_TASK;
-                    let past_last_block = (first_block + BLOCKS_PER_TASK).min(ranges.len());
-                    let mut decoded = Vec::with_capacity(
-                        (past_last_block - first_block).saturating_mul(64 * 1024),
-                    );
-                    let result = (|| {
-                        if inflater.is_none() {
-                            inflater = Some(RawInflater::new()?);
-                        }
-                        let inflater = inflater
-                            .as_mut()
-                            .expect("the inflater was initialized immediately above");
-                        for (range_index, &range) in ranges
-                            .iter()
-                            .enumerate()
-                            .take(past_last_block)
-                            .skip(first_block)
-                        {
-                            if cancelled.load(Ordering::Relaxed) {
-                                return Err(DecodeError::Cancelled);
-                            }
-                            decode_bgzf_block_into(
-                                source,
-                                range,
-                                range_index as u64,
-                                &mut compressed,
-                                &mut decoded,
-                                inflater,
-                            )?;
-                        }
-                        Ok(decoded)
-                    })();
-                    send_bgzf_result(&sender, &worker_stopped, BgzfResult { index, result });
-                }
-            });
-        }
-        drop(sender);
+        let _stop_on_exit = SignalledStopGuard {
+            stopped: &stopped,
+            work_signal: &work_signal.1,
+            runtime,
+        };
+        let sender_template = sender;
+        let (exited_sender, exited_receiver) = mpsc::channel();
+        let mut live_workers = vec![false; worker_pool_count];
 
         while next_to_emit < task_count {
+            while let Ok(worker_index) = exited_receiver.try_recv() {
+                live_workers[worker_index] = false;
+            }
+            let spawn_target = adaptive_workers.current_limit().min(worker_pool_count);
+            for (worker_index, is_live) in live_workers.iter_mut().enumerate().take(spawn_target) {
+                if *is_live {
+                    continue;
+                }
+                spawn_bgzf_worker(
+                    scope,
+                    worker_index,
+                    source,
+                    cancelled,
+                    ranges,
+                    Arc::clone(&task_queue),
+                    Arc::clone(&stopped),
+                    Arc::clone(&available_tasks),
+                    Arc::clone(&work_signal),
+                    sender_template.clone(),
+                    Arc::clone(&adaptive_workers),
+                    exited_sender.clone(),
+                );
+                *is_live = true;
+            }
             if cancelled.load(Ordering::Relaxed) {
                 stopped.store(true, Ordering::Relaxed);
                 return Err(DecodeError::Cancelled);
@@ -3326,16 +3620,21 @@ where
                     output.emit(decoded)?;
                 }
                 next_to_emit += 1;
+                runtime.set_member_count(
+                    (next_to_emit * BGZF_BLOCKS_PER_TASK).min(ranges.len()) as u64
+                );
             }
 
-            while running < worker_count
+            let active_limit = adaptive_workers.current_limit();
+            while running < active_limit
                 && next_to_schedule < task_count
                 && reordered.len() < pending_limit
             {
                 let (lock, signal) = &*work_signal;
                 let _guard = lock.lock().expect("BGZF work mutex poisoned");
                 task_queue.push(next_to_schedule);
-                available_tasks.fetch_add(1, Ordering::Release);
+                let queued = available_tasks.fetch_add(1, Ordering::Release) + 1;
+                runtime.set_queued_tasks(queued);
                 next_to_schedule += 1;
                 running += 1;
                 signal.notify_one();
