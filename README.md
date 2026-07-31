@@ -1,7 +1,7 @@
-# rapidgzip-rs
+# rapidgzip-rust
 
-`rapidgzip-rs` is a Rust 2024, decoder-only implementation of the
-[rapidgzip](https://github.com/mxmlnkn/rapid-gzip) approach to parallel gzip
+`rapidgzip-rust` is a Rust 2024, decoder-only implementation of the
+[rapidgzip](https://github.com/mxmlnkn/rapidgzip) approach to parallel gzip
 decompression.
 
 The library exposes both a push API writing decompressed bytes to

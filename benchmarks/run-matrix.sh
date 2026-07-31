@@ -10,7 +10,7 @@ input=$1
 runs=${RUNS:-9}
 warmups=${WARMUPS:-2}
 thread_cells=${THREAD_CELLS:-"1 4 16 44"}
-rust_binary=${RAPIDGZIP_RS:-target/release/rapidgzip-rs}
+rust_binary=${RAPIDGZIP_RUST:-target/release/rapidgzip-rust}
 cpp_binary=${RAPIDGZIP_CPP:-rapidgzip}
 gzippy_binary=${GZIPPY:-gzippy}
 decoded_bytes=${DECODED_BYTES:-}
@@ -62,7 +62,7 @@ for threads in $thread_cells; do
         fi
     done
     for run in $(seq 1 "$runs"); do
-        benchmark_one rapidgzip-rs "$threads" "$run" \
+        benchmark_one rapidgzip-rust "$threads" "$run" \
             "$rust_binary" -P "$threads" -t "$input"
         if command -v "$cpp_binary" > /dev/null 2>&1 || [[ -x "$cpp_binary" ]]; then
             benchmark_one rapidgzip-cpp "$threads" "$run" \

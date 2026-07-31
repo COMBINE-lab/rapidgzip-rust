@@ -75,7 +75,7 @@ Every decoder verified CRCs and wrote to a discard sink.
 
 | decoder | 1 | 4 | 16 | 44 |
 |---|---:|---:|---:|---:|
-| rapidgzip-rs, zlib-rs | 0.969 | 0.407 | 0.141 | 0.130 |
+| rapidgzip-rust, zlib-rs | 0.969 | 0.407 | 0.141 | 0.130 |
 | C++ rapidgzip, zlib-ng | 1.834 | 0.623 | 0.214 | 0.136 |
 | gzippy | 0.764 | 0.289 | 0.118 | 0.096 |
 
@@ -86,7 +86,7 @@ geometric mean.
 
 | decoder | 1 | 4 | 16 | 44 |
 |---|---:|---:|---:|---:|
-| rapidgzip-rs, zlib-rs | 0.936 | 0.434 | 0.152 | 0.157 |
+| rapidgzip-rust, zlib-rs | 0.936 | 0.434 | 0.152 | 0.157 |
 | C++ rapidgzip, zlib-ng | 1.839 | 0.625 | 0.214 | 0.149 |
 | gzippy | 0.789 | 0.786 | 0.192 | 0.198 |
 
@@ -99,7 +99,7 @@ grid point, while workers and useful later tasks remain live.
 
 | decoder | 1 | 4 | 16 | 44 |
 |---|---:|---:|---:|---:|
-| rapidgzip-rs, zlib-rs | 0.812 | 0.243 | 0.086 | 0.072 |
+| rapidgzip-rust, zlib-rs | 0.812 | 0.243 | 0.086 | 0.072 |
 | C++ rapidgzip, zlib-ng | 1.048 | 0.339 | 0.139 | 0.080 |
 | gzippy | 0.813 | 0.378 | 0.213 | 0.353 |
 

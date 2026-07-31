@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "rapidgzip-rs",
+    name = "rapidgzip-rust",
     version,
     about = "Parallel, verified gzip decompression"
 )]
@@ -81,7 +81,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("rapidgzip-rs: {error}");
+            eprintln!("rapidgzip-rust: {error}");
             ExitCode::FAILURE
         }
     }

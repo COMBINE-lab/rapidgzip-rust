@@ -1,6 +1,6 @@
 [package]
 name = "rapidgzip-bench"
-description = "Unpublished benchmark harness for rapidgzip-rs"
+description = "Unpublished benchmark harness for rapidgzip-rust"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

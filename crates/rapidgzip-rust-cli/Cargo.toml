@@ -1,5 +1,5 @@
 [package]
-name = "rapidgzip-rs"
+name = "rapidgzip-rust-cli"
 description = "Decode-only command-line interface for rapidgzip-core"
 version.workspace = true
 edition.workspace = true
@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "rapidgzip-rs"
+name = "rapidgzip-rust"
 path = "src/main.rs"
 
 [dependencies]
