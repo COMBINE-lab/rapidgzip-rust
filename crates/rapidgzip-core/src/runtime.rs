@@ -249,6 +249,9 @@ pub(crate) struct RuntimeState {
     limit_signal: Condvar,
     index_enabled: AtomicBool,
     index: Mutex<Option<IndexBuilder>>,
+    line_counting: AtomicBool,
+    line_count: AtomicU64,
+    emitted_bytes: AtomicU64,
 }
 
 impl RuntimeState {
@@ -275,6 +278,9 @@ impl RuntimeState {
             limit_signal: Condvar::new(),
             index_enabled: AtomicBool::new(false),
             index: Mutex::new(None),
+            line_counting: AtomicBool::new(false),
+            line_count: AtomicU64::new(0),
+            emitted_bytes: AtomicU64::new(0),
         })
     }
 
@@ -283,8 +289,11 @@ impl RuntimeState {
     /// Decode paths offer checkpoints through [`Self::offer_checkpoint`], which
     /// is a cheap atomic load away from a no-op when indexing is off.
     pub(crate) fn enable_index(&self, spacing: u64, compress_windows: bool) {
-        *self.index.lock().expect("index mutex") =
-            Some(IndexBuilder::new(spacing, compress_windows));
+        let mut builder = IndexBuilder::new(spacing, compress_windows);
+        if self.line_counting() {
+            builder.enable_line_annotation();
+        }
+        *self.index.lock().expect("index mutex") = Some(builder);
         self.index_enabled.store(true, Ordering::Release);
     }
 
@@ -306,11 +315,57 @@ impl RuntimeState {
         }
     }
 
-    /// Attaches the collected index, if any, to a finished report.
+    /// Starts counting newlines in the decompressed output of this decode.
+    pub(crate) fn enable_line_counting(&self) {
+        self.line_counting.store(true, Ordering::Release);
+    }
+
+    /// Returns whether this decode counts newlines.
+    pub(crate) fn line_counting(&self) -> bool {
+        self.line_counting.load(Ordering::Acquire)
+    }
+
+    /// Records one ordered run of decompressed output.
+    ///
+    /// Every path funnels its output through [`crate::backend::Output`], and
+    /// the implementations call this before handing bytes on. The bytes are
+    /// therefore final: markers are already resolved, which is why counting
+    /// happens here rather than in the workers.
+    ///
+    /// When an index is also being collected, checkpoints whose decompressed
+    /// offset falls within this run receive their line offset here. The offer
+    /// always precedes the emit of the bytes at that offset, so a checkpoint
+    /// is never passed before it is known.
+    pub(crate) fn note_emitted(&self, bytes: &[u8]) {
+        if !self.line_counting() {
+            return;
+        }
+        let start = self
+            .emitted_bytes
+            .fetch_add(bytes.len() as u64, Ordering::AcqRel);
+        let lines_before = self.line_count.load(Ordering::Acquire);
+        if self.index_enabled() {
+            if let Some(builder) = self.index.lock().expect("index mutex").as_mut() {
+                builder.note_output(start, lines_before, bytes);
+            }
+        }
+        let newlines = bytes.iter().filter(|&&byte| byte == b'\n').count() as u64;
+        self.line_count
+            .store(lines_before + newlines, Ordering::Release);
+    }
+
+    /// Returns the newline count so far, or `None` when counting is off.
+    pub(crate) fn line_count(&self) -> Option<u64> {
+        self.line_counting()
+            .then(|| self.line_count.load(Ordering::Acquire))
+    }
+
+    /// Attaches the collected index and line count to a finished report.
     pub(crate) fn attach_index(
         &self,
         mut report: crate::DecodeReport,
     ) -> Result<crate::DecodeReport, crate::DecodeError> {
+        report.line_count = self.line_count();
         if let Some(index) = self.take_index(report.compressed_bytes, report.decompressed_bytes) {
             let index = index
                 .map_err(|error| crate::DecodeError::input_io(0, std::io::Error::other(error)))?;
@@ -328,7 +383,7 @@ impl RuntimeState {
         uncompressed_bytes: u64,
     ) -> Option<Result<GzipIndex, IndexError>> {
         let mut builder = self.index.lock().expect("index mutex").take()?;
-        builder.finish(compressed_bytes, uncompressed_bytes);
+        builder.finish(compressed_bytes, uncompressed_bytes, self.line_count());
         Some(builder.into_index())
     }
 

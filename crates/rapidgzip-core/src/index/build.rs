@@ -7,6 +7,7 @@
 //! caller to serialize.
 
 use super::{Checkpoint, GzipIndex, IndexError, StoredWindow};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Collects checkpoints into a [`GzipIndex`].
 pub(crate) struct IndexBuilder {
@@ -15,7 +16,14 @@ pub(crate) struct IndexBuilder {
     compress_windows: bool,
     compressed_size: u64,
     uncompressed_size: u64,
+    total_line_count: Option<u64>,
     error: Option<IndexError>,
+    /// Whether line offsets are being resolved for this index.
+    annotate_lines: bool,
+    /// Checkpoint offsets whose line offset the output has not reached yet.
+    pending_lines: BTreeSet<u64>,
+    /// Resolved line offset per checkpoint decompressed offset.
+    resolved_lines: BTreeMap<u64, u64>,
 }
 
 impl IndexBuilder {
@@ -28,7 +36,41 @@ impl IndexBuilder {
             compress_windows,
             compressed_size: 0,
             uncompressed_size: u64::MAX,
+            total_line_count: None,
             error: None,
+            annotate_lines: false,
+            pending_lines: BTreeSet::new(),
+            resolved_lines: BTreeMap::new(),
+        }
+    }
+
+    /// Resolves a line offset for every checkpoint as the output passes it.
+    pub(crate) const fn enable_line_annotation(&mut self) {
+        self.annotate_lines = true;
+    }
+
+    /// Resolves the line offset of every checkpoint inside one output run.
+    ///
+    /// `start` is the decompressed offset of `bytes` and `lines_before` is the
+    /// newline count preceding it. Offsets are visited in order, so the scan
+    /// over `bytes` advances once rather than restarting per checkpoint.
+    pub(crate) fn note_output(&mut self, start: u64, lines_before: u64, bytes: &[u8]) {
+        if !self.annotate_lines || self.pending_lines.is_empty() {
+            return;
+        }
+        let end = start.saturating_add(bytes.len() as u64);
+        let reached: Vec<u64> = self.pending_lines.range(start..end).copied().collect();
+        let mut scanned = 0_usize;
+        let mut lines = lines_before;
+        for offset in reached {
+            let target = (offset - start) as usize;
+            lines += bytes[scanned..target]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count() as u64;
+            scanned = target;
+            self.pending_lines.remove(&offset);
+            self.resolved_lines.insert(offset, lines);
         }
     }
 
@@ -52,13 +94,31 @@ impl IndexBuilder {
                 }
             }
         };
+        if self.annotate_lines {
+            self.pending_lines
+                .insert(checkpoint.uncompressed_offset_in_bytes);
+        }
         self.points.push((checkpoint, stored));
     }
 
-    /// Records the verified sizes of the decode.
-    pub(crate) const fn finish(&mut self, compressed_bytes: u64, uncompressed_bytes: u64) {
+    /// Records the verified sizes and the final newline count of the decode.
+    ///
+    /// A checkpoint sitting exactly at the end of the output is resolved here,
+    /// since no further run of bytes passes it.
+    pub(crate) fn finish(
+        &mut self,
+        compressed_bytes: u64,
+        uncompressed_bytes: u64,
+        line_count: Option<u64>,
+    ) {
         self.compressed_size = compressed_bytes;
         self.uncompressed_size = uncompressed_bytes;
+        self.total_line_count = line_count;
+        if let Some(lines) = line_count {
+            if self.pending_lines.remove(&uncompressed_bytes) {
+                self.resolved_lines.insert(uncompressed_bytes, lines);
+            }
+        }
     }
 
     /// Orders and thins the collected points into a validated index.
@@ -79,8 +139,21 @@ impl IndexBuilder {
         index.uncompressed_size_in_bytes = self.uncompressed_size;
         index.checkpoint_spacing_in_bytes = self.spacing;
 
+        // An index claims line counters only when every kept checkpoint got
+        // one. Writing zeros for the rest is what gztool would silently
+        // believe, so a partial annotation drops the claim entirely.
+        let mut fully_annotated = self.annotate_lines;
         let mut last: Option<Checkpoint> = None;
-        for (checkpoint, window) in self.points {
+        for (mut checkpoint, window) in self.points {
+            if self.annotate_lines {
+                match self
+                    .resolved_lines
+                    .get(&checkpoint.uncompressed_offset_in_bytes)
+                {
+                    Some(&lines) => checkpoint.line_offset = lines,
+                    None => fully_annotated = false,
+                }
+            }
             if let Some(last) = last {
                 if checkpoint.uncompressed_offset_in_bytes <= last.uncompressed_offset_in_bytes
                     || checkpoint.compressed_offset_in_bits <= last.compressed_offset_in_bits
@@ -95,6 +168,10 @@ impl IndexBuilder {
             }
             last = Some(checkpoint);
             index.push(checkpoint, window);
+        }
+
+        if fully_annotated {
+            index.total_line_count = self.total_line_count;
         }
 
         index.validate()?;
@@ -122,7 +199,7 @@ mod tests {
         builder.offer(checkpoint(8 * 2000, 4096), &window);
         builder.offer(checkpoint(0, 0), &[]);
         builder.offer(checkpoint(8 * 1000, 2048), &window);
-        builder.finish(4096, 8192);
+        builder.finish(4096, 8192, None);
 
         let index = builder.into_index().expect("index");
         assert_eq!(
@@ -143,7 +220,7 @@ mod tests {
         builder.offer(checkpoint(80, 100), &window);
         builder.offer(checkpoint(160, 200), &window);
         builder.offer(checkpoint(240, 8192), &window);
-        builder.finish(4096, 16384);
+        builder.finish(4096, 16384, None);
 
         let index = builder.into_index().expect("index");
         assert_eq!(
@@ -162,7 +239,7 @@ mod tests {
         builder.offer(checkpoint(0, 0), &[]);
         builder.offer(checkpoint(800, 100), &[]);
         builder.offer(checkpoint(1600, 200), &[]);
-        builder.finish(4096, 300);
+        builder.finish(4096, 300, None);
 
         let index = builder.into_index().expect("index");
         assert_eq!(index.checkpoint_count(), 3);
@@ -173,7 +250,7 @@ mod tests {
         let mut builder = IndexBuilder::new(1024, false);
         builder.offer(checkpoint(0, 0), &[]);
         builder.offer(checkpoint(0, 0), &[]);
-        builder.finish(4096, 100);
+        builder.finish(4096, 100, None);
 
         let index = builder.into_index().expect("index");
         assert_eq!(index.checkpoint_count(), 1);
@@ -184,7 +261,7 @@ mod tests {
         let mut builder = IndexBuilder::new(0, true);
         builder.offer(checkpoint(0, 0), &[]);
         builder.offer(checkpoint(800, 100), &vec![0x2bu8; WINDOW_SIZE]);
-        builder.finish(4096, 200);
+        builder.finish(4096, 200, None);
 
         let index = builder.into_index().expect("index");
         assert!(index.windows().get(800).expect("window").is_compressed());

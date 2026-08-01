@@ -38,6 +38,7 @@ pub(crate) struct Config {
     pub(crate) compress_index_windows: bool,
     pub(crate) format: Format,
     pub(crate) expected_uncompressed_size: Option<u64>,
+    pub(crate) count_lines: bool,
 }
 
 /// Builder for an immutable, reusable [`Decoder`].
@@ -70,6 +71,7 @@ impl Default for DecoderBuilder {
                 compress_index_windows: true,
                 format: Format::Auto,
                 expected_uncompressed_size: None,
+                count_lines: false,
             },
         }
     }
@@ -193,6 +195,21 @@ impl DecoderBuilder {
         self
     }
 
+    /// Enables counting newlines in the decompressed output.
+    ///
+    /// The count arrives in [`DecodeReport::line_count`]. When an index is
+    /// also collected, each checkpoint records the line offset at its
+    /// decompressed offset and the index records the total, which is what
+    /// gztool's line-aware format stores.
+    ///
+    /// Counting happens once over output the decoder already holds, on the
+    /// thread that emits it. It is off by default, so existing callers pay
+    /// nothing.
+    pub const fn count_lines(mut self, enabled: bool) -> Self {
+        self.config.count_lines = enabled;
+        self
+    }
+
     /// Validates the configuration and creates a reusable decoder.
     ///
     /// # Errors
@@ -263,8 +280,8 @@ impl Decoder {
         W: Write,
     {
         let cancelled = AtomicBool::new(false);
-        let mut sink = DirectOutput::new(output);
         let runtime = RuntimeState::new(self.config.decoder_threads);
+        let mut sink = DirectOutput::new(output, &runtime);
         decode_source(source, &self.config, &cancelled, &mut sink, &runtime)
     }
 
@@ -338,8 +355,8 @@ impl Decoder {
         W: Write,
     {
         let cancelled = AtomicBool::new(false);
-        let mut sink = DirectOutput::new(output);
         let runtime = RuntimeState::new(1);
+        let mut sink = DirectOutput::new(output, &runtime);
         let mut cursor = StreamCursor::new(source, self.config.input_page_size);
         if self.config.format != Format::Zlib
             && self.config.format != Format::RawDeflate

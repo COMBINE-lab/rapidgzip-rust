@@ -34,22 +34,25 @@ pub(crate) trait Output {
 
 pub(crate) struct DirectOutput<'a, W> {
     writer: &'a mut W,
+    runtime: &'a Arc<RuntimeState>,
 }
 
 impl<'a, W> DirectOutput<'a, W> {
-    pub(crate) const fn new(writer: &'a mut W) -> Self {
-        Self { writer }
+    pub(crate) const fn new(writer: &'a mut W, runtime: &'a Arc<RuntimeState>) -> Self {
+        Self { writer, runtime }
     }
 }
 
 impl<W: Write> Output for DirectOutput<'_, W> {
     fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError> {
+        self.runtime.note_emitted(&chunk);
         self.writer
             .write_all(&chunk)
             .map_err(DecodeError::output_io)
     }
 
     fn emit_reusable(&mut self, mut chunk: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
+        self.runtime.note_emitted(&chunk);
         self.writer
             .write_all(&chunk)
             .map_err(DecodeError::output_io)?;
@@ -70,6 +73,9 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
+    if config.count_lines {
+        runtime.enable_line_counting();
+    }
     if config.build_index {
         runtime.enable_index(config.index_spacing, config.compress_index_windows);
     }
@@ -597,6 +603,7 @@ where
         member_count: index.members.len() as u64,
         decoder_threads: config.decoder_threads,
         index: None,
+        line_count: None,
         format: Format::Gzip,
     })
 }
@@ -649,6 +656,9 @@ where
     R: Read,
     O: Output,
 {
+    if config.count_lines {
+        runtime.enable_line_counting();
+    }
     if config.build_index {
         runtime.enable_index(config.index_spacing, config.compress_index_windows);
     }
@@ -822,6 +832,7 @@ where
         member_count,
         decoder_threads,
         index: None,
+        line_count: None,
         format: Format::Gzip,
     })
 }
@@ -1920,6 +1931,7 @@ where
         member_count,
         decoder_threads: config.decoder_threads,
         index: None,
+        line_count: None,
         format: Format::Gzip,
     })
 }
@@ -2926,6 +2938,7 @@ where
             member_count: 0,
             decoder_threads: config.decoder_threads,
             index: None,
+            line_count: None,
             format,
         });
     }
@@ -3401,6 +3414,7 @@ where
         member_count,
         decoder_threads: config.decoder_threads,
         index: None,
+        line_count: None,
         format,
     })
 }
@@ -3857,6 +3871,7 @@ where
         member_count: ranges.len() as u64,
         decoder_threads: config.decoder_threads,
         index: None,
+        line_count: None,
         format: Format::Gzip,
     })
 }

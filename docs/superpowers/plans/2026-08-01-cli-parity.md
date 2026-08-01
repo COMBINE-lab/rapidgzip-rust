@@ -28,7 +28,7 @@ silent-zero bug into a refusal.
 
 ## Steps
 
-- [ ] **1. Line counting in the core library**
+- [x] **1. Line counting in the core library**
   `Config::count_lines`, `DecoderBuilder::count_lines`,
   `DecodeReport::line_count`. `RuntimeState` gains a line counter and the
   merge described above; `Output::emit` call sites route through it.

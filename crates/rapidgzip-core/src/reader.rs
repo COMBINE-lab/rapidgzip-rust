@@ -50,6 +50,7 @@ impl ChannelOutput {
 
 impl Output for ChannelOutput {
     fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError> {
+        self.runtime.note_emitted(&chunk);
         let byte_count = chunk.len();
         self.send(Message::Data(chunk))?;
         self.runtime.add_decompressed_bytes(byte_count);

@@ -166,6 +166,7 @@ where
         member_count: 1,
         decoder_threads,
         index: None,
+        line_count: None,
         format,
     })
 }

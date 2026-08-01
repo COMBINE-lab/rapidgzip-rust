@@ -335,6 +335,10 @@ pub struct DecodeReport {
     pub decoder_threads: usize,
     /// Container that was decoded, always a concrete variant.
     pub format: Format,
+    /// Newlines in the decompressed output, present when
+    /// [`DecoderBuilder::count_lines`](crate::DecoderBuilder::count_lines) was
+    /// enabled.
+    pub line_count: Option<u64>,
     /// Random-access index, present when
     /// [`DecoderBuilder::build_index`](crate::DecoderBuilder::build_index) was
     /// enabled.
