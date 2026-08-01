@@ -218,6 +218,12 @@ impl<R: Read> StreamCursor<R> {
             self.filled -= self.consumed;
             self.consumed = 0;
         }
+        // Reading into an empty tail would return `Ok(0)` and be mistaken for
+        // end of input. Callers only refill a drained window, so this cannot
+        // happen, but the consequence of being wrong is silent truncation.
+        if self.filled == self.buffer.len() {
+            return Ok(());
+        }
         loop {
             match self.source.read(&mut self.buffer[self.filled..]) {
                 Ok(0) => {
