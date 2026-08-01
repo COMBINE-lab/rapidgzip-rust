@@ -4,6 +4,7 @@
 //! validates it, and reads and writes the supported on-disk formats. Using an
 //! index for random access lives in [`crate::indexed`].
 
+mod gzi;
 mod gzidx;
 mod native;
 mod window_codec;
@@ -259,6 +260,25 @@ impl GzipIndex {
         archive_size: Option<u64>,
     ) -> Result<Self, IndexError> {
         gzidx::read_gzidx(reader, archive_size)
+    }
+
+    /// Writes this index in htslib BGZF `.gzi` format.
+    ///
+    /// Only indexes whose checkpoints all sit on independent member or block
+    /// boundaries can be represented; a checkpoint carrying a predecessor
+    /// window or a non-byte-aligned offset is refused, because reimporting it
+    /// would install an empty window and seek to the wrong place.
+    pub fn write_gzi(&self, writer: &mut impl Write) -> Result<(), IndexError> {
+        gzi::write_gzi(self, writer)
+    }
+
+    /// Reads an htslib BGZF `.gzi` index.
+    ///
+    /// The format does not record the uncompressed size, so the result reports
+    /// [`u64::MAX`] for it. `archive_size`, when supplied, is recorded as the
+    /// compressed size.
+    pub fn read_gzi(reader: &mut impl Read, archive_size: Option<u64>) -> Result<Self, IndexError> {
+        gzi::read_gzi(reader, archive_size)
     }
 
     /// Checks the index invariants.

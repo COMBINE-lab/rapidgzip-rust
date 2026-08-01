@@ -279,3 +279,114 @@ fn gzidx_rejects_truncation_at_every_prefix() {
         );
     }
 }
+
+/// Three independent BGZF-style block starts, none needing a window.
+fn bgzf_style_index() -> GzipIndex {
+    let mut index = GzipIndex::new();
+    index.compressed_size_in_bytes = 300;
+    index.uncompressed_size_in_bytes = 3000;
+    for block in 0..3u64 {
+        index.push(
+            Checkpoint {
+                compressed_offset_in_bits: block * 8 * 100,
+                uncompressed_offset_in_bytes: block * 1000,
+                line_offset: 0,
+            },
+            StoredWindow::empty(),
+        );
+    }
+    index
+}
+
+#[test]
+fn gzi_round_trips_block_starts_and_skips_the_origin() {
+    let index = bgzf_style_index();
+    let mut bytes = Vec::new();
+    index.write_gzi(&mut bytes).expect("write");
+
+    assert_eq!(bytes.len(), 8 + 2 * 16);
+    assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 2);
+
+    let restored = GzipIndex::read_gzi(&mut bytes.as_slice(), Some(300)).expect("read");
+    assert_eq!(restored.checkpoints(), index.checkpoints());
+    assert_eq!(restored.uncompressed_size_in_bytes, u64::MAX);
+}
+
+#[test]
+fn gzi_round_trips_an_empty_index() {
+    let index = GzipIndex::new();
+    let mut bytes = Vec::new();
+    index.write_gzi(&mut bytes).expect("write");
+    assert_eq!(bytes.len(), 8);
+
+    let restored = GzipIndex::read_gzi(&mut bytes.as_slice(), None).expect("read");
+    assert_eq!(restored.checkpoint_count(), 1);
+}
+
+#[test]
+fn gzi_refuses_checkpoints_that_need_a_window() {
+    let mut index = bgzf_style_index();
+    index.push(
+        Checkpoint {
+            compressed_offset_in_bits: 8 * 250,
+            uncompressed_offset_in_bytes: 4000,
+            line_offset: 0,
+        },
+        StoredWindow::from_raw(vec![3u8; WINDOW_SIZE]),
+    );
+    let mut bytes = Vec::new();
+    assert_eq!(
+        index.write_gzi(&mut bytes).unwrap_err(),
+        IndexError::InvalidCheckpoint("BGZF index cannot store a predecessor window")
+    );
+}
+
+#[test]
+fn gzi_refuses_unaligned_offsets() {
+    let mut index = GzipIndex::new();
+    index.compressed_size_in_bytes = 300;
+    index.push(
+        Checkpoint {
+            compressed_offset_in_bits: 0,
+            uncompressed_offset_in_bytes: 0,
+            line_offset: 0,
+        },
+        StoredWindow::empty(),
+    );
+    index.push(
+        Checkpoint {
+            compressed_offset_in_bits: 8 * 100 + 1,
+            uncompressed_offset_in_bytes: 1000,
+            line_offset: 0,
+        },
+        StoredWindow::empty(),
+    );
+    let mut bytes = Vec::new();
+    assert_eq!(
+        index.write_gzi(&mut bytes).unwrap_err(),
+        IndexError::InvalidCheckpoint("BGZF index requires byte-aligned compressed offsets")
+    );
+}
+
+#[test]
+fn gzi_rejects_a_hostile_pair_count() {
+    let mut bytes = u64::MAX.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&[0u8; 16]);
+    assert!(matches!(
+        GzipIndex::read_gzi(&mut bytes.as_slice(), None),
+        Err(IndexError::ExcessiveLength { .. })
+    ));
+}
+
+#[test]
+fn gzi_rejects_truncation_at_every_prefix() {
+    let index = bgzf_style_index();
+    let mut bytes = Vec::new();
+    index.write_gzi(&mut bytes).expect("write");
+    for length in 1..bytes.len() {
+        assert!(
+            GzipIndex::read_gzi(&mut &bytes[..length], None).is_err(),
+            "prefix of {length} bytes was accepted"
+        );
+    }
+}
