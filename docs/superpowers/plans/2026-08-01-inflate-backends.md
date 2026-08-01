@@ -25,7 +25,7 @@
   Verify: `cargo test -p rapidgzip-core --features isal` locally against
   Homebrew's isa-l 2.32.1.
 
-- [ ] **4. CI job**
+- [x] **4. CI job**
   A job installing `libisal-dev` and running the suite with `--features isal`.
 
 - [ ] **5. Benchmark and documentation**

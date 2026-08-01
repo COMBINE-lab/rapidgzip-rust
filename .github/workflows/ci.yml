@@ -64,6 +64,26 @@ jobs:
       - run: bgzip --version && gztool -h | head -1 && python3 -c "import indexed_gzip"
       - run: cargo test -p rapidgzip-core --test index_interop --locked -- --ignored --nocapture
 
+  isal:
+    # The optional ISA-L inflate backend. It links a system libisal, so the
+    # default jobs cannot cover it.
+    runs-on: ubuntu-latest
+    env:
+      # isal-sys looks for the library under this prefix. The linker finds it
+      # under the multiarch directory either way, but the variable is what
+      # stops the crate from building ISA-L from source.
+      ISAL_INSTALL_PREFIX: /usr
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libisal
+        run: sudo apt-get update && sudo apt-get install -y libisal-dev
+      - run: cargo clippy -p rapidgzip-core --all-targets --features isal --locked -- -D warnings
+      - run: cargo test -p rapidgzip-core --all-targets --features isal --locked
+
   msrv:
     runs-on: ubuntu-latest
     steps:
