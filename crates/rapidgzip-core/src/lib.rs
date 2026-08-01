@@ -125,6 +125,18 @@
 //! `ISAL_INSTALL_PREFIX`. Whether it is worth enabling is a measurement, not a
 //! given; see `README.md`.
 //!
+//! # Structural analysis
+//!
+//! [`Decoder::analyze`] walks every DEFLATE block and returns an [`Analysis`]:
+//! per stream the container, its header fields, offsets and footer; per block
+//! the encoding, offsets to the bit, sizes, the declared Huffman alphabets,
+//! how much output came from literals against copies, and how far its
+//! back-references reach into the preceding window.
+//!
+//! It decodes sequentially with the crate's native DEFLATE decoder, since zlib
+//! exposes none of this, and holds the decompressed output in memory. It is a
+//! diagnostic, not a decode path.
+//!
 //! # Verification and errors
 //!
 //! Every member is accepted only after an actual final DEFLATE block and a

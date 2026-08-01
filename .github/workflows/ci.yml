@@ -55,14 +55,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install bgzip
         run: sudo apt-get update && sudo apt-get install -y tabix zlib1g-dev
-      - name: Install indexed_gzip
-        run: python3 -m pip install --user indexed_gzip
+      - name: Install indexed_gzip and rapidgzip
+        run: python3 -m pip install --user indexed_gzip 'rapidgzip==0.16.0'
       - name: Build gztool
         run: |
           git clone --depth 1 --branch v1.8.2 https://github.com/circulosmeos/gztool.git /tmp/gztool
           cc -O2 -std=gnu11 -o /usr/local/bin/gztool /tmp/gztool/gztool.c -lz -lm
-      - run: bgzip --version && gztool -h | head -1 && python3 -c "import indexed_gzip"
+      - run: bgzip --version && gztool -h | head -1 && python3 -c "import indexed_gzip" && rapidgzip --version
       - run: cargo test -p rapidgzip-core --test index_interop --locked -- --ignored --nocapture
+      # The analyze report is meant to be drop-in for rapidgzip's, so the
+      # reference tool is what checks it.
+      - run: cargo test -p rapidgzip-rust-cli --test analyze_interop --locked -- --ignored --nocapture
 
   isal:
     # The optional ISA-L inflate backend. It links a system libisal, so the

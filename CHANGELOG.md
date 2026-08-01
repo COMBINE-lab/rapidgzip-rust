@@ -21,6 +21,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Structural analysis. `Decoder::analyze` walks every DEFLATE block and
+  returns an `Analysis`: per stream the container, header fields, offsets and
+  footer; per block the encoding, offsets to the bit, sizes, declared Huffman
+  alphabets, symbol-kind counts, and how far its back-references reach into
+  the preceding window. The CLI prints it through `--analyze` in rapidgzip
+  0.16.0's exact layout, checked by diffing against the real tool in CI.
 - Newline counting, through `DecoderBuilder::count_lines`. It fills
   `DecodeReport::line_count` and, when an index is also collected, a line
   offset for every checkpoint plus the index total.

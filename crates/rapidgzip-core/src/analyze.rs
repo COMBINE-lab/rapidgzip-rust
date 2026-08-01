@@ -741,23 +741,31 @@ fn finalize(
 }
 
 /// Counts references after merging overlapping and adjacent ones.
+///
+/// This is a plain interval union. rapidgzip computes the same idea with a
+/// pairwise merge that can shorten the current run when a contained reference
+/// follows it, which makes its result depend on how its unstable sort ordered
+/// equal distances. Ours does not depend on that order.
 fn merged_count(references: &[WindowReference]) -> u64 {
     if references.is_empty() {
         return 0;
     }
     let mut sorted: Vec<WindowReference> = references.to_vec();
     sorted.sort_by_key(|entry| (entry.distance, entry.length));
-    let mut current = 0_usize;
-    for index in 1..sorted.len() {
-        if sorted[current].distance + sorted[current].length >= sorted[index].distance {
-            sorted[current].length =
-                sorted[index].distance + sorted[index].length - sorted[current].distance;
+    let mut groups = 1_u64;
+    let mut end = sorted[0].distance + sorted[0].length;
+    for entry in &sorted[1..] {
+        if entry.distance <= end {
+            // Overlapping or adjacent, so the run continues. Taking the
+            // farther end keeps this a true interval union: a reference
+            // contained in the current run must not shorten it.
+            end = end.max(entry.distance + entry.length);
         } else {
-            current += 1;
-            sorted[current] = sorted[index];
+            groups += 1;
+            end = entry.distance + entry.length;
         }
     }
-    (current + 1).min(references.len()) as u64
+    groups
 }
 
 fn native(error: crate::parallel::deflate::Error) -> DecodeError {

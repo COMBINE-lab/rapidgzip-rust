@@ -294,6 +294,30 @@ rapidgzip-rust --format raw-deflate --expected-size 4000000 -c payload.deflate
 addressing and `gztool-with-lines` need `--count-lines`, which is what fills
 the per-checkpoint line offsets those features read.
 
+### Inspecting a file's structure
+
+`--analyze` walks every DEFLATE block and prints rapidgzip's report: stream
+headers, one section per block with its offsets to the bit, Huffman alphabet
+shapes and symbol ratios, then the file-wide distributions.
+
+```console
+rapidgzip-rust --analyze reads.fastq.gz | head -40
+```
+
+The output reproduces rapidgzip 0.16.0's, and `tests/analyze_interop.rs` diffs
+against the real tool in CI to keep it that way. Two things are excluded from
+that comparison:
+
+- the benchmark profile, which prints wall-clock durations, so ours carries its
+  own measurements;
+- `Number of merged back-references`. The reference merges pairwise after an
+  unstable sort, in a way that can shorten the current run, so its value
+  depends on how equal distances happened to be ordered. Ours is a plain
+  interval union, which is deterministic and, where they disagree, correct.
+
+The library exposes the same data as `Decoder::analyze`, which returns a
+structured `Analysis` rather than text.
+
 ### Deliberate differences from rapidgzip
 
 Three options are accepted and do nothing, because they name behaviour this

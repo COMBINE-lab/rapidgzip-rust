@@ -71,6 +71,26 @@ The builder tracks whether every checkpoint was resolved and claims a total
 line count only when they all were, so a future path that offers late degrades
 to an index without counters rather than one full of zeros.
 
+## Structural analysis
+
+`Decoder::analyze` reuses `parallel/deflate.rs`, which already parses dynamic
+headers and decodes symbols. It needed the code lengths that parsing discards,
+so `dynamic_trees_with_lengths` hands them back. The decode loop is the
+analyzer's own: it counts symbol kinds and back-reference distances rather
+than producing markers, and it keeps plain output because it has no unknown
+history to represent.
+
+Header fields are parsed by the analyzer rather than by `parse_member_header`,
+which deliberately keeps only the offsets the decoder needs.
+
+The command-line report is a faithful reproduction of rapidgzip 0.16.0's, down
+to C++ number formatting and histogram bucketing, and a differential test
+diffs against the real tool. One derived field is deliberately not reproduced:
+rapidgzip's merged back-reference count comes from a pairwise merge after an
+unstable sort, which can shorten the current run and therefore depends on how
+equal distances were ordered. The analyzer computes a plain interval union
+instead.
+
 ## Inflate backends
 
 Raw inflate sits behind one crate-internal trait, `InflateBackend`, with three
