@@ -21,8 +21,7 @@ Non-seekable input is decoded sequentially by the same zlib-rs path the parallel
 decoders fall back to, so it is verified exactly as strictly as a regular file
 but is not decoded in parallel. See [Non-seekable input](#non-seekable-input).
 
-The project intentionally does not yet provide compression, random-access
-indexes, or seeking in decoded output.
+The project intentionally does not provide compression.
 
 ## Library installation
 
@@ -270,6 +269,45 @@ cat reads.fastq.gz | rapidgzip-rust - > reads.fastq
 # A FIFO or process substitution given as a path is routed the same way.
 rapidgzip-rust <(some_producer) > reads.fastq
 ```
+
+Every option rapidgzip 0.16.0 accepts is accepted here under the same names:
+
+```console
+# Build a random-access index while decoding, then extract from it.
+rapidgzip-rust --export-index reads.gzi --index-format indexed_gzip -t reads.fastq.gz
+rapidgzip-rust --import-index reads.gzi --ranges 1KiB@4GiB -c reads.fastq.gz
+
+# Byte and line addressing, mixed, in the order given.
+rapidgzip-rust --ranges 10@0,1KiB@15KiB,5L@20L,inf@40L -c reads.fastq.gz
+
+# Sizes and line counts without keeping the output.
+rapidgzip-rust --count reads.fastq.gz
+rapidgzip-rust --count-lines reads.fastq.gz
+
+# zlib and raw DEFLATE, the latter with the only check it allows.
+rapidgzip-rust --format zlib -c payload.zlib
+rapidgzip-rust --format raw-deflate --expected-size 4000000 -c payload.deflate
+```
+
+`--index-format` accepts `indexed_gzip` (the default), `gztool`,
+`gztool-with-lines`, this crate's own `native`, and htslib's `gzi`. Line
+addressing and `gztool-with-lines` need `--count-lines`, which is what fills
+the per-checkpoint line offsets those features read.
+
+### Deliberate differences from rapidgzip
+
+Three options are accepted and do nothing, because they name behaviour this
+crate does not have: `--io-read-method`, which has a single strategy here, and
+`--sparse-windows` with its negation, since index windows are always dense. A
+dense index is valid and interoperable, just larger.
+
+`--no-verify` is refused rather than ignored. Verification is structural here:
+a member is accepted only after its CRC32 and size check out, so there is
+nothing to switch off and no speed to gain by pretending otherwise.
+
+rapidgzip skips the decode entirely when output is piped to `/dev/null` without
+`-l` or `--force`. This tool always decodes, so `rapidgzip-rust file.gz >
+/dev/null` costs a full decode and verifies the file.
 
 `-P`/`--threads` is a maximum decoder-worker budget. Parallel paths bootstrap
 from the smaller of the affinity-visible processors and this requested budget,

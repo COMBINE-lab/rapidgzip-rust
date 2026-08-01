@@ -77,7 +77,7 @@ silent-zero bug into a refusal.
   input; `tests/cli.rs` for byte, line, mixed, overlapping, and the two
   failure cases.
 
-- [ ] **8. Counting, reporting, and documentation**
+- [x] **8. Counting, reporting, and documentation**
   `report.rs` for `--count`, `--count-lines`, `--test`, and verbose output.
   `README.md`, crate docs, `ARCHITECTURE.md`, and `CHANGELOG.md`.
 

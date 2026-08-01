@@ -5,8 +5,35 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Two gzip index interoperability bugs, found by a test in which real gztool
+  extracts by line from an index this crate wrote. gztool numbers lines from
+  one while the index counts newlines before a point, so export and import now
+  convert. More seriously, a member checkpoint recorded the member start, so
+  gztool resumed by inflating raw DEFLATE at the gzip header and reported a
+  compressed data error. Member checkpoints now record the DEFLATE start,
+  matching indexed_gzip and gztool. BGZF block checkpoints still record the
+  block start, which is what `.gzi` means by an offset.
+- Writing gztool's line-aware format from an index that never counted lines
+  wrote zero for every counter, producing a file gztool accepts and then
+  trusts. It is now refused.
+
 ### Added
 
+- Newline counting, through `DecoderBuilder::count_lines`. It fills
+  `DecodeReport::line_count` and, when an index is also collected, a line
+  offset for every checkpoint plus the index total.
+  `IndexedReader::seek_to_line` seeks by zero-based line number, refusing an
+  index that carries no counters rather than scanning from the start.
+- Command-line parity with rapidgzip 0.16.0. `rapidgzip-rust` now accepts
+  every option that tool accepts, under the same names: `--ranges` with byte
+  and line addressing, `--import-index` and `--export-index` with
+  `--index-format`, `--count`, `--count-lines`, `--format`, `-f`, `-k`, `-d`,
+  `--chunk-size`, `-q`, `-v`, and `--oss-attributions`. Output goes where
+  rapidgzip sends it, including the derived name with the compressed suffix
+  stripped. `--io-read-method` and `--sparse-windows` are accepted no-ops;
+  `--no-verify` is refused, since verification here is structural.
 - An optional ISA-L raw-inflate backend, behind the off-by-default `isal`
   feature of `rapidgzip-core`. It replaces zlib-rs on the paths that decode a
   whole stream from its start: sequential gzip members, single-stream zlib and

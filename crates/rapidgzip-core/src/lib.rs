@@ -82,6 +82,13 @@
 //! # }
 //! ```
 //!
+//! [`DecoderBuilder::count_lines`] counts newlines while decoding, filling
+//! [`DecodeReport::line_count`] and, when an index is also collected, a line
+//! offset for every checkpoint plus the index total. That is what
+//! [`IndexedReader::seek_to_line`] and gztool's line-aware format both read.
+//! Counting is off by default and costs one pass over output the decoder
+//! already holds.
+//!
 //! Indexes persist in the crate's own versioned format
 //! ([`GzipIndex::write_native`]), in indexed_gzip `GZIDX`
 //! ([`GzipIndex::write_gzidx`]), in htslib BGZF `.gzi`
@@ -89,12 +96,17 @@
 //! ([`GzipIndex::write_gztool`]). All four import as well, so indexes written
 //! by those tools work here and the reverse holds.
 //!
+//! A checkpoint records where DEFLATE begins, not where a container header
+//! does, which is the convention indexed_gzip and gztool both use and what any
+//! reader resuming with raw inflate needs. BGZF block checkpoints are the
+//! exception: `.gzi` defines its offsets as block starts.
+//!
 //! Which checkpoints an index holds depends on the path that decoded the
 //! input. The parallel path records interior points at its chunk boundaries,
 //! spaced by [`DecoderBuilder::index_spacing`]. BGZF records every block. The
-//! sequential and streaming paths record member starts only, because the zlib
-//! backend does not expose DEFLATE block boundaries; an index built from
-//! standard input is therefore coarse but valid.
+//! sequential and streaming paths record one point per member only, because
+//! the zlib backend does not expose DEFLATE block boundaries; an index built
+//! from standard input is therefore coarse but valid.
 //!
 //! # Inflate backends
 //!

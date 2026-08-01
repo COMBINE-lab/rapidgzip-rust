@@ -55,6 +55,22 @@ validated against the initial window, without consuming it, before any
 coordinator is spawned. The runtime is then configured with a single worker so
 `DecoderStats` and `DecodeReport` report the concurrency actually in use.
 
+## Line counting
+
+`DecoderBuilder::count_lines` counts newlines in the `Output` implementations,
+on the thread that emits. That is the only place the bytes are final: the
+marker path's chunks hold 16-bit symbols until the coordinator resolves them,
+and a marker can resolve to a newline. Counting in the workers would therefore
+be wrong on the path that matters most.
+
+Checkpoint line offsets come from merging two ordered streams. The index
+builder keeps the offsets it has been offered but not yet passed, and each run
+of output resolves the ones it covers in a single scan. Offers always precede
+the emit of the bytes at their offset, so nothing is passed before it is known.
+The builder tracks whether every checkpoint was resolved and claims a total
+line count only when they all were, so a future path that offers late degrades
+to an index without counters rather than one full of zeros.
+
 ## Inflate backends
 
 Raw inflate sits behind one crate-internal trait, `InflateBackend`, with three
