@@ -285,6 +285,24 @@ impl Decoder {
         decode_source(source, &self.config, &cancelled, &mut sink, &runtime)
     }
 
+    /// Walks every DEFLATE block, reporting the input's structure.
+    ///
+    /// Analysis decodes the whole input sequentially with the crate's native
+    /// DEFLATE decoder, since zlib exposes none of the per-block detail. It is
+    /// therefore slower than decoding and holds the decompressed output in
+    /// memory. It is a diagnostic, not a decode path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] for the same malformed input a decode would
+    /// reject.
+    pub fn analyze<R>(&self, source: &R) -> Result<crate::Analysis, DecodeError>
+    where
+        R: ReadAt + ?Sized,
+    {
+        crate::analyze::analyze_source(source, self.config.format)
+    }
+
     /// Starts decoding an owned positional source and returns `Read + Send`
     /// decompressed output.
     ///

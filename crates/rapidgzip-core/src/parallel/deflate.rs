@@ -10,24 +10,24 @@ use std::array;
 use std::sync::OnceLock;
 
 const MAX_BITS: usize = 15;
-const END_OF_BLOCK: usize = 256;
+pub(crate) const END_OF_BLOCK: usize = 256;
 
-const LENGTH_BASE: [usize; 29] = [
+pub(crate) const LENGTH_BASE: [usize; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
 ];
-const LENGTH_EXTRA: [u8; 29] = [
+pub(crate) const LENGTH_EXTRA: [u8; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
-const DISTANCE_BASE: [usize; 30] = [
+pub(crate) const DISTANCE_BASE: [usize; 30] = [
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
     2049, 3073, 4097, 6145, 8193, 12_289, 16_385, 24_577,
 ];
-const DISTANCE_EXTRA: [u8; 30] = [
+pub(crate) const DISTANCE_EXTRA: [u8; 30] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
     13,
 ];
-const PRECODE_ORDER: [usize; 19] = [
+pub(crate) const PRECODE_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
@@ -45,21 +45,21 @@ pub(crate) enum Error {
 }
 
 #[derive(Clone)]
-struct BitReader<'a> {
+pub(crate) struct BitReader<'a> {
     bytes: &'a [u8],
     bit_offset: usize,
 }
 
 impl<'a> BitReader<'a> {
     #[inline]
-    fn at(bytes: &'a [u8], bit_offset: usize) -> Result<Self, Error> {
+    pub(crate) fn at(bytes: &'a [u8], bit_offset: usize) -> Result<Self, Error> {
         if bit_offset > bytes.len().saturating_mul(8) {
             return Err(Error::UnexpectedEof);
         }
         Ok(Self { bytes, bit_offset })
     }
 
-    const fn position(&self) -> usize {
+    pub(crate) const fn position(&self) -> usize {
         self.bit_offset
     }
 
@@ -69,7 +69,7 @@ impl<'a> BitReader<'a> {
     }
 
     #[inline(always)]
-    fn read_bits(&mut self, count: u8) -> Result<u32, Error> {
+    pub(crate) fn read_bits(&mut self, count: u8) -> Result<u32, Error> {
         debug_assert!(count <= 24);
         let byte_offset = self.bit_offset / 8;
         let shift = self.bit_offset % 8;
@@ -125,7 +125,7 @@ impl<'a> BitReader<'a> {
     }
 
     #[inline(always)]
-    fn align_to_byte(&mut self) {
+    pub(crate) fn align_to_byte(&mut self) {
         self.bit_offset = self.bit_offset.saturating_add(7) & !7;
     }
 }
@@ -148,7 +148,7 @@ fn word_at(bytes: &[u8], byte_offset: usize) -> u64 {
 }
 
 #[derive(Clone)]
-struct Huffman {
+pub(crate) struct Huffman {
     // Packed as `(bit_length << 9) | symbol`, indexed by the next
     // `maximum_length` stream bits.
     table: Vec<u16>,
@@ -223,7 +223,7 @@ impl Huffman {
     }
 
     #[inline(always)]
-    fn decode(&self, reader: &mut BitReader<'_>) -> Result<usize, Error> {
+    pub(crate) fn decode(&self, reader: &mut BitReader<'_>) -> Result<usize, Error> {
         let (bits, available) = reader.peek_bits_padded(self.maximum_length);
         let packed = self.table[bits as usize];
         if packed == u16::MAX {
@@ -335,7 +335,7 @@ impl History {
     }
 }
 
-fn fixed_trees() -> &'static (Huffman, Huffman) {
+pub(crate) fn fixed_trees() -> &'static (Huffman, Huffman) {
     static TREES: OnceLock<(Huffman, Huffman)> = OnceLock::new();
     TREES.get_or_init(|| {
         let mut literal_lengths = [0_u8; 288];
@@ -352,7 +352,41 @@ fn fixed_trees() -> &'static (Huffman, Huffman) {
     })
 }
 
+/// Code lengths a dynamic header declared, kept for analysis.
+///
+/// The decoder discards these once its trees are built. Analysis reports their
+/// shape, so this variant hands them back.
+pub(crate) struct DeclaredCodeLengths {
+    /// All nineteen precode lengths, with the ones not read left at zero.
+    pub(crate) precode: [u8; 19],
+    /// How many precode lengths the header actually carried.
+    pub(crate) precode_read: usize,
+    /// Literal and length code lengths, exactly as many as declared.
+    pub(crate) literal: Vec<u8>,
+    /// Distance code lengths, exactly as many as declared.
+    pub(crate) distance: Vec<u8>,
+}
+
+/// Parses a dynamic header, returning the trees and the declared lengths.
+pub(crate) fn dynamic_trees_with_lengths(
+    reader: &mut BitReader<'_>,
+) -> Result<(Huffman, Huffman, DeclaredCodeLengths), Error> {
+    dynamic_trees_inner(reader).map(|(literal, distance, declared)| {
+        (
+            literal,
+            distance,
+            declared.expect("requested by this caller"),
+        )
+    })
+}
+
 fn dynamic_trees(reader: &mut BitReader<'_>) -> Result<(Huffman, Huffman), Error> {
+    dynamic_trees_inner(reader).map(|(literal, distance, _)| (literal, distance))
+}
+
+fn dynamic_trees_inner(
+    reader: &mut BitReader<'_>,
+) -> Result<(Huffman, Huffman, Option<DeclaredCodeLengths>), Error> {
     let literal_count = 257 + reader.read_bits(5)? as usize;
     let distance_count = 1 + reader.read_bits(5)? as usize;
     let precode_count = 4 + reader.read_bits(4)? as usize;
@@ -409,7 +443,13 @@ fn dynamic_trees(reader: &mut BitReader<'_>) -> Result<(Huffman, Huffman), Error
 
     let literal = Huffman::from_lengths(&lengths[..literal_count])?;
     let distance = Huffman::from_lengths(&lengths[literal_count..])?;
-    Ok((literal, distance))
+    let declared = DeclaredCodeLengths {
+        precode: precode_lengths,
+        precode_read: precode_count,
+        literal: lengths[..literal_count].to_vec(),
+        distance: lengths[literal_count..].to_vec(),
+    };
+    Ok((literal, distance, Some(declared)))
 }
 
 struct DecodedBuffer {

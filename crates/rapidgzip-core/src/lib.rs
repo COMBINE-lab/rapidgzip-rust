@@ -171,6 +171,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
+mod analyze;
 mod backend;
 mod config;
 mod crc32;
@@ -191,6 +192,10 @@ mod zlib;
 pub mod index;
 pub mod parallel;
 
+pub use analyze::{
+    AlphabetShape, Analysis, BlockAnalysis, BlockType, GzipHeaderFields, StreamAnalysis,
+    StreamFooter, StreamHeader, ZlibHeaderFields,
+};
 pub use config::{ConfigError, Decoder, DecoderBuilder};
 pub use error::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ZlibErrorKind};
 pub use format::Format;
