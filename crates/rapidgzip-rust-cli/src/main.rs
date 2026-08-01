@@ -8,6 +8,7 @@
 //! behaviour to attach to them.
 
 mod attributions;
+mod cxx_format;
 mod index;
 mod ranges;
 mod report;
