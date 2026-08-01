@@ -29,6 +29,17 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Parallel decoding driven by an index, through `DecoderBuilder::index` and
+  the CLI's `--import-index`. Every checkpoint records a resume point and its
+  window, so each worker runs plain zlib over its own span with no speculation
+  and no marker resolution. Measured on a 46 MB text corpus: 1311 MiB/s at two
+  workers against 686 without an index, and 3185 at six against 2477. Member
+  CRC32 and ISIZE are still verified before any bytes are emitted, combined
+  across spans with `crc32_combine64` because a member's checksum rarely falls
+  inside one span. An index that does not describe the source is ignored
+  rather than trusted.
+- `--index-spacing` on the CLI, which decides how many spans an exported index
+  offers a later parallel decode.
 - Structural analysis. `Decoder::analyze` walks every DEFLATE block and
   returns an `Analysis`: per stream the container, header fields, offsets and
   footer; per block the encoding, offsets to the bit, sizes, declared Huffman

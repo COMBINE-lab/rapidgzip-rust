@@ -27,6 +27,8 @@ pub enum DecoderPath {
     MarkerWindow,
     /// Independent inflation of indexed BGZF blocks.
     Bgzf,
+    /// Independent zlib inflation of spans delimited by an index.
+    Indexed,
 }
 
 impl DecoderPath {
@@ -38,6 +40,7 @@ impl DecoderPath {
             Self::DenseMembers => 3,
             Self::MarkerWindow => 4,
             Self::Bgzf => 5,
+            Self::Indexed => 6,
         }
     }
 
@@ -48,6 +51,7 @@ impl DecoderPath {
             3 => Self::DenseMembers,
             4 => Self::MarkerWindow,
             5 => Self::Bgzf,
+            6 => Self::Indexed,
             _ => Self::Starting,
         }
     }

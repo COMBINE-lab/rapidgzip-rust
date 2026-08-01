@@ -166,6 +166,24 @@ where
             runtime,
         );
     }
+    // An index removes the reason the grid speculates, so it is preferred
+    // over every path that has to guess. It is refused rather than trusted
+    // when it does not describe this source.
+    if crate::indexed_parallel::usable(
+        config.index.as_ref(),
+        source
+            .len()
+            .map_err(|error| DecodeError::input_io(0, error))?,
+        config.decoder_threads,
+    )
+    .is_ok()
+    {
+        let index = config.index.as_ref().expect("checked as usable");
+        return crate::indexed_parallel::decode_indexed_parallel(
+            source, config, cancelled, output, index, runtime,
+        );
+    }
+
     // BGZF block starts are normally tens of KiB apart and only their short
     // headers are needed for indexing. A small page avoids reading the
     // complete compressed payload before decoding.
@@ -2002,7 +2020,7 @@ fn read_range<R: ReadAt + ?Sized>(
     Ok(bytes)
 }
 
-fn read_range_reuse<R: ReadAt + ?Sized>(
+pub(crate) fn read_range_reuse<R: ReadAt + ?Sized>(
     source: &R,
     offset: u64,
     length: usize,

@@ -47,27 +47,27 @@ member and starts the next one after it.
   Verify: planning tests over dense, sparse, and single-member indexes,
   asserting spans tile the output exactly and no span exceeds the budget.
 
-- [ ] **3. The worker**
+- [x] **3. The worker**
   Reads its compressed range, resumes with `prime` and `set_dictionary_bytes`
   exactly as `IndexedReader::resume` does, inflates to the span's known length,
   and returns the output, its CRC32, and the offsets where members ended.
   Verify: a worker decoding one span produces bytes identical to the
   sequential decoder over the same range.
 
-- [ ] **4. Ordered coordination and verification**
+- [x] **4. Ordered coordination and verification**
   A bounded worker pool modelled on `decode_bgzf_parallel`, emitting spans in
   order. The coordinator folds span CRCs with `crc32_combine64` into per-member
   CRC32 and ISIZE and checks both against each member's footer.
   Verify: a corrupted member fails with `ChecksumMismatch` naming the right
   member, and a corrupted span fails before its bytes are emitted.
 
-- [ ] **5. Dispatch, telemetry, and the CLI**
+- [x] **5. Dispatch, telemetry, and the CLI**
   `DecoderPath::Indexed`, dispatched before the speculative grid.
   `--import-index` stops erroring without `--ranges`.
   Verify: the path-selection test gains the indexed case; a CLI test decodes
   with an imported index and compares against decoding without one.
 
-- [ ] **6. Measurement and documentation**
+- [x] **6. Measurement and documentation**
   A benchmark comparing the indexed path against the speculative one at equal
   worker counts. `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, crate docs.
   The measured numbers go in the pull request, including the case where the

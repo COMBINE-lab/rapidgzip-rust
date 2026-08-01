@@ -462,7 +462,7 @@ fn attributions_print_without_an_input() {
 }
 
 #[test]
-fn an_imported_index_without_ranges_is_refused() {
+fn an_imported_index_accelerates_a_plain_decompression() {
     let directory = workspace("import-without-ranges");
     let plain = corpus(500);
     let archive = directory.join("data.gz");
@@ -475,16 +475,14 @@ fn an_imported_index_without_ranges_is_refused() {
         archive.to_str().expect("path"),
     ]));
 
+    // The index is no longer only for seeking: it gives every worker a resume
+    // point, so an ordinary decompression uses it and must still be exact.
     let output = run(&[
         "--import-index",
         index.to_str().expect("path"),
         "-c",
         archive.to_str().expect("path"),
     ]);
-    assert_failed(&output);
-    assert!(
-        stderr_of(&output).contains("--ranges"),
-        "{}",
-        stderr_of(&output)
-    );
+    assert_ok(&output);
+    assert_eq!(output.stdout, plain);
 }

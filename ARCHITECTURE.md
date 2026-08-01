@@ -71,6 +71,33 @@ The builder tracks whether every checkpoint was resolved and claims a total
 line count only when they all were, so a future path that offers late degrades
 to an index without counters rather than one full of zeros.
 
+## Index-driven parallel decoding
+
+The speculative grid exists because a worker landing on a guessed offset knows
+neither its DEFLATE block boundary nor the history before it. An index records
+both, so when one is supplied its checkpoints partition the file into spans and
+each worker runs plain zlib, resuming exactly as `IndexedReader` does.
+
+Two things make this more than a scheduling change. Span lengths are known in
+advance, so a worker reserves once and the coordinator can check a span before
+emitting it. And member verification survives the split: a member's CRC32
+rarely falls inside one span, so each worker returns per-run checksums and the
+coordinator folds them with `crc32_combine64`, which gives the checksum of a
+concatenation. Verification is therefore exactly as strict as on every other
+path.
+
+Workers pull from a shared cursor rather than running in waves, so a large span
+does not idle the others. An admission window, not a barrier, bounds memory: a
+span is handed out only while it lies within `in_flight_chunks` of the one
+being emitted.
+
+Scaling is bounded by how many spans the index offers. Checkpoints exist only
+where the decode that built the index offered them, so an index built over a
+1 MiB compressed grid yields roughly one span per megabyte of input. Beyond
+about six workers on a 46 MB corpus, adding workers stops helping because there
+are not enough spans to divide, which is a property of the index rather than of
+this path.
+
 ## Structural analysis
 
 `Decoder::analyze` reuses `parallel/deflate.rs`, which already parses dynamic

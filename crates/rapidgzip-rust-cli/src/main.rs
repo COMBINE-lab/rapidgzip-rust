@@ -130,6 +130,13 @@ struct Arguments {
     #[arg(long = "import-index", value_name = "PATH")]
     import_index: Option<PathBuf>,
 
+    /// Decompressed bytes between index checkpoints, in KiB.
+    ///
+    /// Denser indexes split a decode into more spans, which is what lets a
+    /// parallel decode driven by --import-index keep every worker busy.
+    #[arg(long = "index-spacing", value_name = "KIB")]
+    index_spacing: Option<u64>,
+
     /// Format for --export-index.
     #[arg(long = "index-format", value_enum, default_value_t = IndexFormat::IndexedGzip)]
     index_format: IndexFormat,
@@ -382,16 +389,19 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         return run_ranges(&arguments, source, &specification, volume);
     }
 
-    if let Some(path) = &arguments.import_index {
-        // An imported index is only useful for seeking, which only --ranges
-        // does. Saying so beats silently ignoring the file.
-        return Err(format!(
-            "--import-index {} was given without --ranges, so the index would not be used; \
-             a straight decompression reads the whole stream either way",
-            path.display()
-        )
-        .into());
-    }
+    // An imported index now accelerates an ordinary decompression too: every
+    // checkpoint gives a worker a resume point and its window, so each runs
+    // plain zlib instead of decoding speculatively.
+    let imported = match (&arguments.import_index, source.path()) {
+        (Some(path), Some(input)) => {
+            let size = std::fs::metadata(input)?.len();
+            Some(index::import(path, Some(size))?)
+        }
+        (Some(_), None) => {
+            return Err("--import-index needs a seekable input".into());
+        }
+        (None, _) => None,
+    };
 
     let build_index = arguments.needs_built_index();
     if build_index && source.path().is_none() {
@@ -409,7 +419,29 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let decoder = build_decoder(&arguments, arguments.count_lines, build_index)?;
+    let mut decoder_builder_index = imported;
+    let decoder = {
+        let mut builder = Decoder::builder().format(arguments.format.into());
+        if let Some(threads) = arguments.threads.filter(|&threads| threads > 0) {
+            builder = builder.decoder_threads(threads);
+        }
+        if let Some(kibibytes) = arguments.chunk_size {
+            builder = builder.compressed_chunk_size(kibibytes.saturating_mul(1024));
+        }
+        if let Some(size) = arguments.expected_size {
+            builder = builder.expected_uncompressed_size(Some(size));
+        }
+        if arguments.count_lines {
+            builder = builder.count_lines(true);
+        }
+        if build_index {
+            builder = builder.build_index(true);
+        }
+        if let Some(kibibytes) = arguments.index_spacing {
+            builder = builder.index_spacing(kibibytes.saturating_mul(1024));
+        }
+        builder.index(decoder_builder_index.take()).build()?
+    };
     let mut destination = open_destination(
         &source,
         arguments.output.as_deref(),
