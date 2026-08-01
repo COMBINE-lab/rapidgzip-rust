@@ -239,8 +239,12 @@ if ! gh auth status >/dev/null 2>&1; then
     echo "error: GitHub CLI authentication is required; run gh auth login" >&2
     exit 1
 fi
-cargo_credentials="${CARGO_HOME:-$HOME/.cargo}/credentials.toml"
-if [[ -z "${CARGO_REGISTRY_TOKEN:-}" && ! -s "$cargo_credentials" ]]; then
+cargo_credentials_dir="${CARGO_HOME:-$HOME/.cargo}"
+cargo_credentials_toml="$cargo_credentials_dir/credentials.toml"
+cargo_credentials_legacy="$cargo_credentials_dir/credentials"
+if [[ -z "${CARGO_REGISTRY_TOKEN:-}" \
+    && ! -s "$cargo_credentials_toml" \
+    && ! -s "$cargo_credentials_legacy" ]]; then
     echo "error: crates.io authentication is required; run cargo login" >&2
     exit 1
 fi
