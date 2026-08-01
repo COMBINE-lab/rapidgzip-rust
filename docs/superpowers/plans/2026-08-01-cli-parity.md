@@ -38,39 +38,39 @@ silent-zero bug into a refusal.
   corpus with no trailing newline counts correctly, and that an index built
   with counting carries strictly increasing line offsets.
 
-- [ ] **2. Line-addressed seeking**
+- [x] **2. Line-addressed seeking**
   `IndexedReader::seek_to_line(u64) -> io::Result<u64>`, returning the
   decompressed byte offset of that zero-based line. Errors when the index
   carries no line counts.
   Verify: tests in `tests/indexed_seek.rs` seeking to first, middle, last, and
   one-past-last lines, and the error case.
 
-- [ ] **3. gztool-with-lines export refuses an unannotated index**
+- [x] **3. gztool-with-lines export refuses an unannotated index**
   Export returns an error when `total_line_count` is `None` instead of writing
   zeros.
   Verify: a test in `tests/index_formats.rs`, and the interop job gains a case
   where real gztool reads an index we exported with line counters.
 
-- [ ] **4. CLI module split, no behaviour change**
+- [x] **4. CLI module split, no behaviour change**
   `main.rs` keeps arguments and dispatch; `source.rs` takes input
   classification and output destination. Nothing else moves yet.
   Verify: existing behaviour unchanged, plus a new `tests/cli.rs` covering the
   five options that exist today, which is the regression net for steps 5 to 8.
 
-- [ ] **5. The option surface**
+- [x] **5. The option surface**
   Every option in the spec's table, with output path derivation, overwrite
   rules, the terminal check, `-q`/`-v`, the accepted no-ops, and `--no-verify`
   rejected. `attributions.rs` holds the license text.
   Verify: `tests/cli.rs` cases for derived names, overwrite refusal and
   `-f`, the terminal check, each no-op accepted, and `--no-verify` rejected.
 
-- [ ] **6. Index import and export**
+- [x] **6. Index import and export**
   `index.rs` with the format enum covering `indexed_gzip`, `gztool`,
   `gztool-with-lines`, `native`, and `gzi`.
   Verify: `tests/cli.rs` exporting in every format and reimporting, decoding
   to identical bytes.
 
-- [ ] **7. Ranges**
+- [x] **7. Ranges**
   `ranges.rs` with the `SIZE@OFFSET` parser and extraction through
   `IndexedReader`.
   Verify: unit tests for parsing, including units, `L`, `inf`, and malformed
