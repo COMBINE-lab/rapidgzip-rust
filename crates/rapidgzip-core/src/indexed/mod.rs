@@ -189,9 +189,12 @@ impl<R: ReadAt> IndexedReader<R> {
                 .map_err(io::Error::other)?;
             start += 1;
         } else if window.is_empty() {
-            // A byte-aligned checkpoint with no history is a member boundary,
-            // so a gzip header sits here and must be skipped before inflating.
-            start = self.skip_member_header(byte_offset)?;
+            // A byte-aligned checkpoint with no history is usually a member
+            // boundary, whose gzip header must be skipped before inflating.
+            // It is not always one: indexed_gzip records its first point at
+            // the DEFLATE start instead, so the header is detected rather
+            // than assumed.
+            start = self.skip_member_header_if_present(byte_offset)?;
         }
 
         if !window.is_empty() {
@@ -240,6 +243,32 @@ impl<R: ReadAt> IndexedReader<R> {
             self.windows.insert(key, expanded.clone());
         }
         Ok(expanded)
+    }
+
+    /// Returns where DEFLATE data starts at `offset`, skipping a gzip header
+    /// when one is actually there.
+    ///
+    /// A checkpoint with no predecessor window can sit either on a member
+    /// header or directly on the DEFLATE stream, depending on which tool wrote
+    /// the index, so the magic bytes decide. A header that starts with the
+    /// magic but fails to parse is treated as DEFLATE data that happens to
+    /// begin with those two bytes.
+    fn skip_member_header_if_present(&mut self, offset: u64) -> io::Result<u64> {
+        let mut magic = [0u8; 2];
+        let mut filled = 0;
+        while filled < magic.len() {
+            let read = self
+                .source
+                .read_at(offset + filled as u64, &mut magic[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled < 2 || magic != [0x1f, 0x8b] {
+            return Ok(offset);
+        }
+        Ok(self.skip_member_header(offset).unwrap_or(offset))
     }
 
     /// Parses the gzip header at `offset` and returns where its DEFLATE data
