@@ -191,6 +191,7 @@ mod error;
 mod format;
 mod gzip;
 mod indexed;
+mod indexed_parallel;
 mod inflate;
 mod inflate_backend;
 #[cfg(feature = "isal")]

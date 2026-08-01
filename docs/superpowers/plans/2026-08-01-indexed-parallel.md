@@ -30,7 +30,7 @@ member and starts the next one after it.
 
 ## Steps
 
-- [ ] **1. Supplying and validating the index**
+- [x] **1. Supplying and validating the index**
   `DecoderBuilder::index(Option<GzipIndex>)`, stored in `Config`. A helper
   decides whether the indexed path applies: an index is present, it validates,
   its recorded compressed size matches the source, it holds at least three
@@ -38,7 +38,7 @@ member and starts the next one after it.
   Verify: unit tests for each rejection, and that a rejected index leaves the
   existing dispatch untouched.
 
-- [ ] **2. Span planning**
+- [x] **2. Span planning**
   Consecutive checkpoints become spans carrying the compressed byte range to
   read, the resume bit offset, the window, and the exact decompressed length.
   A span longer than `decoded_chunk_size` is decoded in several passes inside

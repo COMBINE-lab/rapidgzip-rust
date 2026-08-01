@@ -39,6 +39,7 @@ pub(crate) struct Config {
     pub(crate) format: Format,
     pub(crate) expected_uncompressed_size: Option<u64>,
     pub(crate) count_lines: bool,
+    pub(crate) index: Option<crate::GzipIndex>,
 }
 
 /// Builder for an immutable, reusable [`Decoder`].
@@ -72,6 +73,7 @@ impl Default for DecoderBuilder {
                 format: Format::Auto,
                 expected_uncompressed_size: None,
                 count_lines: false,
+                index: None,
             },
         }
     }
@@ -207,6 +209,23 @@ impl DecoderBuilder {
     /// nothing.
     pub const fn count_lines(mut self, enabled: bool) -> Self {
         self.config.count_lines = enabled;
+        self
+    }
+
+    /// Supplies an index so decoding can be split without speculation.
+    ///
+    /// Every checkpoint carries a compressed bit offset and the window needed
+    /// to resume there, so each worker can run plain zlib over its own span
+    /// instead of decoding with unknown history and resolving markers
+    /// afterwards. The index is used only when it validates against the
+    /// source and holds enough checkpoints to be worth splitting; otherwise
+    /// decoding proceeds exactly as it would without one.
+    ///
+    /// Building an index in order to use it here is not worthwhile: that is
+    /// two decodes where the speculative path needs one. This helps when an
+    /// index already exists.
+    pub fn index(mut self, index: Option<crate::GzipIndex>) -> Self {
+        self.config.index = index;
         self
     }
 
