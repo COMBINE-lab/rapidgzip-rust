@@ -1,3 +1,4 @@
+use crate::Format;
 use crate::config::Config;
 use crate::crc32::Crc32;
 use crate::gzip::{InputCursor, MemberHeader, SourceCursor, StreamCursor, parse_member_header};
@@ -75,6 +76,53 @@ where
     runtime.attach_index(report)
 }
 
+/// Resolves the configured format against the source prefix.
+///
+/// An explicit format is taken as given: the framing checks that follow report
+/// a mismatch far better than a prefix sniff could. `Auto` reads two bytes and
+/// falls back to reporting missing gzip magic, which is what it did before
+/// zlib was supported.
+fn resolve_source_format<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+) -> Result<Format, DecodeError> {
+    if config.format.is_concrete() {
+        return Ok(config.format);
+    }
+    let mut prefix = [0_u8; 2];
+    let mut filled = 0;
+    while filled < prefix.len() {
+        let read = source
+            .read_at(filled as u64, &mut prefix[filled..])
+            .map_err(|error| DecodeError::input_io(filled as u64, error))?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(crate::format::detect(&prefix[..filled]).unwrap_or(Format::Gzip))
+}
+
+/// Returns whether the source prefix carries gzip magic.
+pub(crate) fn looks_like_gzip<R: ReadAt + ?Sized>(
+    source: &R,
+    page_size: usize,
+) -> Result<bool, DecodeError> {
+    let _ = page_size;
+    let mut prefix = [0_u8; 2];
+    let mut filled = 0;
+    while filled < prefix.len() {
+        let read = source
+            .read_at(filled as u64, &mut prefix[filled..])
+            .map_err(|error| DecodeError::input_io(filled as u64, error))?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(crate::format::detect(&prefix[..filled]) != Some(Format::Zlib))
+}
+
 fn decode_source_inner<R, O>(
     source: &R,
     config: &Config,
@@ -86,6 +134,21 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
+    let format = resolve_source_format(source, config)?;
+    if format != Format::Gzip {
+        runtime.set_path(DecoderPath::Sequential);
+        runtime.set_adaptive_target(1);
+        let mut cursor = SourceCursor::new(source, config.input_page_size)?;
+        return crate::single_stream::decode_single_stream(
+            &mut cursor,
+            config,
+            cancelled,
+            output,
+            format,
+            1,
+            runtime,
+        );
+    }
     // BGZF block starts are normally tens of KiB apart and only their short
     // headers are needed for indexing. A small page avoids reading the
     // complete compressed payload before decoding.
@@ -515,6 +578,7 @@ where
         member_count: index.members.len() as u64,
         decoder_threads: config.decoder_threads,
         index: None,
+        format: Format::Gzip,
     })
 }
 
@@ -571,7 +635,20 @@ where
     }
     runtime.set_path(DecoderPath::Sequential);
     runtime.set_adaptive_target(1);
-    let report = decode_members_sequential(cursor, config, cancelled, output, 0, 0, 1, runtime)?;
+    let format = if config.format.is_concrete() {
+        config.format
+    } else {
+        // The stream cursor already buffers a page, so the prefix is inspected
+        // in place and nothing is spooled.
+        crate::format::detect(cursor.buffered_prefix()?).unwrap_or(Format::Gzip)
+    };
+    let report = if format == Format::Gzip {
+        decode_members_sequential(cursor, config, cancelled, output, 0, 0, 1, runtime)?
+    } else {
+        crate::single_stream::decode_single_stream(
+            cursor, config, cancelled, output, format, 1, runtime,
+        )?
+    };
     runtime.attach_index(report)
 }
 
@@ -765,6 +842,7 @@ where
         member_count,
         decoder_threads,
         index: None,
+        format: Format::Gzip,
     })
 }
 
@@ -1862,6 +1940,7 @@ where
         member_count,
         decoder_threads: config.decoder_threads,
         index: None,
+        format: Format::Gzip,
     })
 }
 
@@ -2783,6 +2862,7 @@ where
             member_count: 0,
             decoder_threads: config.decoder_threads,
             index: None,
+            format: Format::Gzip,
         });
     }
 
@@ -3218,6 +3298,7 @@ where
         member_count,
         decoder_threads: config.decoder_threads,
         index: None,
+        format: Format::Gzip,
     })
 }
 
@@ -3685,6 +3766,7 @@ where
         member_count: ranges.len() as u64,
         decoder_threads: config.decoder_threads,
         index: None,
+        format: Format::Gzip,
     })
 }
 

@@ -134,6 +134,7 @@ mod inflate;
 mod read_at;
 mod reader;
 mod runtime;
+mod single_stream;
 mod zlib;
 
 pub mod index;

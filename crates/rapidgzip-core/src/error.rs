@@ -1,3 +1,4 @@
+use crate::format::Format;
 use crate::index::GzipIndex;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -113,6 +114,8 @@ pub enum DeflateErrorKind {
     Truncated,
     /// The decoder made no progress despite having input and output space.
     Stalled,
+    /// Bytes followed a complete DEFLATE stream.
+    TrailingGarbage,
 }
 
 impl Display for DeflateErrorKind {
@@ -127,6 +130,9 @@ impl Display for DeflateErrorKind {
             }
             Self::Truncated => formatter.write_str("truncated DEFLATE stream"),
             Self::Stalled => formatter.write_str("DEFLATE decoder made no progress"),
+            Self::TrailingGarbage => {
+                formatter.write_str("trailing data after a complete DEFLATE stream")
+            }
         }
     }
 }
@@ -184,6 +190,13 @@ pub enum DecodeError {
         /// Computed value.
         actual_mod32: u32,
     },
+    /// The decoded size disagreed with the size the caller expected.
+    UnexpectedOutputSize {
+        /// Size supplied through `DecoderBuilder::expected_uncompressed_size`.
+        expected: u64,
+        /// Size actually decoded.
+        actual: u64,
+    },
     /// Decoded output would exceed the configured limit.
     OutputLimitExceeded {
         /// Configured maximum decoded byte count.
@@ -229,7 +242,8 @@ impl DecodeError {
             | Self::InvalidZlib { .. }
             | Self::InvalidDeflate { .. }
             | Self::ChecksumMismatch { .. }
-            | Self::SizeMismatch { .. } => io::ErrorKind::InvalidData,
+            | Self::SizeMismatch { .. }
+            | Self::UnexpectedOutputSize { .. } => io::ErrorKind::InvalidData,
             Self::OutputLimitExceeded { .. } => io::ErrorKind::FileTooLarge,
             Self::WorkerPanicked => io::ErrorKind::Other,
             Self::Cancelled => io::ErrorKind::Interrupted,
@@ -283,6 +297,10 @@ impl Display for DecodeError {
                 formatter,
                 "gzip member {member} ISIZE mismatch: expected {expected}, got {actual_mod32}"
             ),
+            Self::UnexpectedOutputSize { expected, actual } => write!(
+                formatter,
+                "decoded {actual} bytes, but {expected} were expected"
+            ),
             Self::OutputLimitExceeded { limit } => {
                 write!(formatter, "decoded output exceeded the {limit}-byte limit")
             }
@@ -315,6 +333,8 @@ pub struct DecodeReport {
     pub member_count: u64,
     /// Configured decoder-worker budget.
     pub decoder_threads: usize,
+    /// Container that was decoded, always a concrete variant.
+    pub format: Format,
     /// Random-access index, present when
     /// [`DecoderBuilder::build_index`](crate::DecoderBuilder::build_index) was
     /// enabled.

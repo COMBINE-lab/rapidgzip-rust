@@ -5,18 +5,13 @@
 //! dictionaries are rejected, so the header is always exactly two bytes.
 
 use crate::{DecodeError, ZlibErrorKind};
+use std::ffi::c_ulong;
 
 /// Preset-dictionary flag in the `FLG` byte.
 const FLAG_DICT: u8 = 0x20;
 
 /// Largest window exponent this crate accepts, giving DEFLATE's 32 KiB window.
 const MAX_WINDOW_EXPONENT: u8 = 7;
-
-/// Byte length of a zlib header without a preset dictionary.
-pub(crate) const HEADER_LENGTH: u64 = 2;
-
-/// Byte length of the Adler-32 trailer.
-pub(crate) const TRAILER_LENGTH: u64 = 4;
 
 /// Returns whether `cmf` and `flg` form a legal zlib header.
 ///
@@ -80,12 +75,13 @@ impl Adler32 {
         if bytes.is_empty() {
             return;
         }
+        // The running checksum is a `c_ulong` in the C ABI, which is 32 bits
+        // on Windows and 64 elsewhere; the value itself always fits in 32.
+        let running = self.0 as c_ulong;
         // SAFETY: the pointer and length describe one live, immutable
         // allocation for the duration of the call, and `adler32_z` only reads
         // through them.
-        self.0 = unsafe {
-            libz_rs_sys::adler32_z(u64::from(self.0), bytes.as_ptr(), bytes.len()) as u32
-        };
+        self.0 = unsafe { libz_rs_sys::adler32_z(running, bytes.as_ptr(), bytes.len()) } as u32;
     }
 
     pub(crate) const fn finish(self) -> u32 {

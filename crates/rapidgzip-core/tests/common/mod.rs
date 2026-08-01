@@ -1,4 +1,9 @@
-//! Shared fixtures for the index and seek tests.
+//! Shared fixtures for the index, seek, and multi-format tests.
+//!
+//! Each test binary includes this module and uses part of it, so unused
+//! fixtures are expected here rather than a sign of dead code.
+#![allow(dead_code)]
+
 //!
 //! Compression goes through the `libz-rs-sys` deflate ABI, which the crate
 //! already links, so the tests need no additional dependency.
@@ -22,6 +27,17 @@ pub fn corpus(size: usize) -> Vec<u8> {
     }
     bytes.truncate(size);
     bytes
+}
+
+/// Compresses `bytes` into a zlib stream (RFC 1950) at `level`.
+pub fn zlib(bytes: &[u8], level: i32) -> Vec<u8> {
+    // `15` selects the zlib wrapper over a 32 KiB window.
+    deflate_with(bytes, level, 15)
+}
+
+/// Compresses `bytes` into raw DEFLATE (RFC 1951) at `level`.
+pub fn raw_deflate(bytes: &[u8], level: i32) -> Vec<u8> {
+    deflate_with(bytes, level, -15)
 }
 
 fn deflate_with(bytes: &[u8], level: i32, window_bits: i32) -> Vec<u8> {

@@ -178,7 +178,15 @@ where
     R: Read + Send + 'static,
 {
     let mut cursor = StreamCursor::new(source, config.input_page_size);
-    validate_initial_stream_header(&mut cursor)?;
+    // Only gzip has a header worth checking before the coordinator starts.
+    // zlib framing is validated by the decode itself, and raw DEFLATE has no
+    // header at all.
+    if crate::format::detect(cursor.buffered_prefix()?) != Some(crate::Format::Zlib)
+        && config.format != crate::Format::RawDeflate
+        && config.format != crate::Format::Zlib
+    {
+        validate_initial_stream_header(&mut cursor)?;
+    }
     let in_flight_chunks = config.in_flight_chunks;
     spawn_coordinator(
         move |cancelled, output, runtime| {

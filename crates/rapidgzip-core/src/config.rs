@@ -2,7 +2,7 @@ use crate::backend::{DirectOutput, decode_source, decode_stream};
 use crate::gzip::{StreamCursor, validate_initial_header, validate_initial_stream_header};
 use crate::reader;
 use crate::runtime::RuntimeState;
-use crate::{DecodeError, DecodeReport, DecoderReader, ReadAt};
+use crate::{DecodeError, DecodeReport, DecoderReader, Format, ReadAt};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
@@ -36,6 +36,8 @@ pub(crate) struct Config {
     pub(crate) build_index: bool,
     pub(crate) index_spacing: u64,
     pub(crate) compress_index_windows: bool,
+    pub(crate) format: Format,
+    pub(crate) expected_uncompressed_size: Option<u64>,
 }
 
 /// Builder for an immutable, reusable [`Decoder`].
@@ -66,6 +68,8 @@ impl Default for DecoderBuilder {
                 build_index: false,
                 index_spacing: 4 * MIB as u64,
                 compress_index_windows: true,
+                format: Format::Auto,
+                expected_uncompressed_size: None,
             },
         }
     }
@@ -165,6 +169,30 @@ impl DecoderBuilder {
         self
     }
 
+    /// Selects the container framing of the compressed input.
+    ///
+    /// The default, [`Format::Auto`], reads the first two bytes and accepts
+    /// gzip or zlib. Raw DEFLATE has no header to recognize and must be
+    /// requested with [`Format::RawDeflate`].
+    pub const fn format(mut self, format: Format) -> Self {
+        self.config.format = format;
+        self
+    }
+
+    /// Sets the decompressed size the caller expects, in bytes.
+    ///
+    /// Raw DEFLATE carries neither a checksum nor a length, so this is the
+    /// only end-to-end check available for it. Decoding fails with
+    /// [`DecodeError::UnexpectedOutputSize`] when the sizes disagree.
+    ///
+    /// Supplying a size for any other format is a [`ConfigError`]: gzip and
+    /// zlib verify their own trailers, and a second, weaker check would
+    /// suggest a guarantee that is already stronger.
+    pub const fn expected_uncompressed_size(mut self, bytes: Option<u64>) -> Self {
+        self.config.expected_uncompressed_size = bytes;
+        self
+    }
+
     /// Validates the configuration and creates a reusable decoder.
     ///
     /// # Errors
@@ -195,6 +223,13 @@ impl DecoderBuilder {
         }
         if self.config.index_spacing == 0 {
             return Err(ConfigError("index_spacing must be non-zero"));
+        }
+        if self.config.expected_uncompressed_size.is_some()
+            && self.config.format != Format::RawDeflate
+        {
+            return Err(ConfigError(
+                "expected_uncompressed_size applies to Format::RawDeflate only",
+            ));
         }
         Ok(Decoder {
             config: self.config,
@@ -244,7 +279,15 @@ impl Decoder {
     where
         R: ReadAt + 'static,
     {
-        validate_initial_header(&source, self.config.input_page_size)?;
+        // Only gzip has a header worth checking before the coordinator
+        // starts. zlib framing is validated by the decode itself, and raw
+        // DEFLATE has no header at all.
+        if self.config.format == Format::Gzip
+            || (self.config.format == Format::Auto
+                && crate::backend::looks_like_gzip(&source, self.config.input_page_size)?)
+        {
+            validate_initial_header(&source, self.config.input_page_size)?;
+        }
         reader::spawn(source, self.config.clone())
     }
 
@@ -298,7 +341,12 @@ impl Decoder {
         let mut sink = DirectOutput::new(output);
         let runtime = RuntimeState::new(1);
         let mut cursor = StreamCursor::new(source, self.config.input_page_size);
-        validate_initial_stream_header(&mut cursor)?;
+        if self.config.format != Format::Zlib
+            && self.config.format != Format::RawDeflate
+            && crate::format::detect(cursor.buffered_prefix()?) != Some(Format::Zlib)
+        {
+            validate_initial_stream_header(&mut cursor)?;
+        }
         decode_stream(&mut cursor, &self.config, &cancelled, &mut sink, &runtime)
     }
 

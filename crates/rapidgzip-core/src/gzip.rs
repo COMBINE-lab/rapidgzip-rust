@@ -247,6 +247,15 @@ impl<R: Read> StreamCursor<R> {
     fn buffered(&self) -> &[u8] {
         &self.buffer[self.consumed..self.filled]
     }
+
+    /// Fills the window if needed and returns the unconsumed prefix.
+    ///
+    /// Used to detect the container before decoding starts. Nothing is
+    /// consumed, so the framing code still sees the whole stream.
+    pub(crate) fn buffered_prefix(&mut self) -> Result<&[u8], DecodeError> {
+        self.available()?;
+        Ok(self.buffered())
+    }
 }
 
 impl<R: Read> InputCursor for StreamCursor<R> {
