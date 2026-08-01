@@ -1,3 +1,4 @@
+use crate::index::{GzipIndex, IndexError};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -28,6 +29,26 @@ pub enum GzipErrorKind {
     TrailingGarbage,
 }
 
+/// The reason a zlib (RFC 1950) container was rejected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ZlibErrorKind {
+    /// The CMF/FLG bytes were not a valid zlib header (or were gzip magic).
+    BadHeader,
+    /// The stream did not use the DEFLATE compression method (CM ≠ 8).
+    UnsupportedCompressionMethod(u8),
+    /// CINFO requested a window larger than 32 KiB (CINFO > 7).
+    UnsupportedWindow(u8),
+    /// The CMF/FLG FCHECK residue was not zero modulo 31.
+    BadHeaderChecksum,
+    /// FDICT was set; preset dictionaries are not supported.
+    DictionaryNotSupported,
+    /// The header or Adler-32 trailer was truncated.
+    Truncated,
+    /// Bytes after a valid zlib stream were not another zlib stream.
+    TrailingGarbage,
+}
+
 impl Display for GzipErrorKind {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -45,6 +66,31 @@ impl Display for GzipErrorKind {
             Self::UnterminatedHeaderField => formatter.write_str("unterminated gzip header field"),
             Self::Truncated => formatter.write_str("truncated gzip header or footer"),
             Self::TrailingGarbage => formatter.write_str("trailing non-gzip data"),
+        }
+    }
+}
+
+impl Display for ZlibErrorKind {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadHeader => formatter.write_str("invalid zlib CMF/FLG header"),
+            Self::UnsupportedCompressionMethod(method) => {
+                write!(formatter, "unsupported zlib compression method {method}")
+            }
+            Self::UnsupportedWindow(cinfo) => {
+                write!(
+                    formatter,
+                    "unsupported zlib window size CINFO={cinfo} (max 7)"
+                )
+            }
+            Self::BadHeaderChecksum => {
+                formatter.write_str("zlib header FCHECK failed (CMF/FLG not multiple of 31)")
+            }
+            Self::DictionaryNotSupported => {
+                formatter.write_str("zlib preset dictionary (FDICT) is not supported")
+            }
+            Self::Truncated => formatter.write_str("truncated zlib header or Adler-32 trailer"),
+            Self::TrailingGarbage => formatter.write_str("trailing non-zlib data"),
         }
     }
 }
@@ -102,6 +148,13 @@ pub enum DecodeError {
         /// Detailed reason.
         reason: GzipErrorKind,
     },
+    /// The zlib (RFC 1950) framing was invalid.
+    InvalidZlib {
+        /// Compressed byte offset.
+        offset: u64,
+        /// Detailed reason.
+        reason: ZlibErrorKind,
+    },
     /// The raw DEFLATE payload was invalid.
     InvalidDeflate {
         /// Best-known compressed bit offset.
@@ -109,16 +162,24 @@ pub enum DecodeError {
         /// Detailed reason.
         reason: DeflateErrorKind,
     },
-    /// A member's CRC32 did not match its footer.
+    /// A member's integrity checksum did not match its trailer (or external
+    /// expected value).
+    ///
+    /// For gzip this is the CRC32 footer; for zlib it is the Adler-32 trailer
+    /// (both controlled by [`crate::DecoderBuilder::crc32_enabled`]). For raw
+    /// DEFLATE this is an optional external whole-stream CRC32 from
+    /// [`crate::DecoderBuilder::raw_crc32_list`] (`member` is always 0).
     ChecksumMismatch {
-        /// Zero-based member number.
+        /// Zero-based member number (always 0 for raw DEFLATE external CRC).
         member: u64,
-        /// Footer value.
+        /// Footer or externally supplied expected value.
         expected: u32,
         /// Computed value.
         actual: u32,
     },
     /// A member's modulo-2^32 output size did not match its footer.
+    ///
+    /// Gzip only (ISIZE). zlib streams have no size trailer.
     SizeMismatch {
         /// Zero-based member number.
         member: u64,
@@ -136,6 +197,8 @@ pub enum DecodeError {
     WorkerPanicked,
     /// Decoding was cancelled because the consumer stopped.
     Cancelled,
+    /// A provided random-access index is invalid or does not match the archive.
+    InvalidIndex(IndexError),
 }
 
 impl DecodeError {
@@ -160,17 +223,23 @@ impl DecodeError {
                 reason: GzipErrorKind::Truncated,
                 ..
             }
+            | Self::InvalidZlib {
+                reason: ZlibErrorKind::Truncated,
+                ..
+            }
             | Self::InvalidDeflate {
                 reason: DeflateErrorKind::Truncated,
                 ..
             } => io::ErrorKind::UnexpectedEof,
             Self::InvalidGzip { .. }
+            | Self::InvalidZlib { .. }
             | Self::InvalidDeflate { .. }
             | Self::ChecksumMismatch { .. }
             | Self::SizeMismatch { .. } => io::ErrorKind::InvalidData,
             Self::OutputLimitExceeded { .. } => io::ErrorKind::FileTooLarge,
             Self::WorkerPanicked => io::ErrorKind::Other,
             Self::Cancelled => io::ErrorKind::Interrupted,
+            Self::InvalidIndex(_) => io::ErrorKind::InvalidInput,
         }
     }
 
@@ -196,6 +265,9 @@ impl Display for DecodeError {
             Self::InvalidGzip { offset, reason } => {
                 write!(formatter, "invalid gzip data at byte {offset}: {reason}")
             }
+            Self::InvalidZlib { offset, reason } => {
+                write!(formatter, "invalid zlib data at byte {offset}: {reason}")
+            }
             Self::InvalidDeflate { bit_offset, reason } => {
                 write!(
                     formatter,
@@ -208,7 +280,7 @@ impl Display for DecodeError {
                 actual,
             } => write!(
                 formatter,
-                "gzip member {member} CRC32 mismatch: expected {expected:#010x}, got {actual:#010x}"
+                "member {member} checksum mismatch: expected {expected:#010x}, got {actual:#010x}"
             ),
             Self::SizeMismatch {
                 member,
@@ -223,6 +295,7 @@ impl Display for DecodeError {
             }
             Self::WorkerPanicked => formatter.write_str("a decoder worker panicked"),
             Self::Cancelled => formatter.write_str("decoding was cancelled"),
+            Self::InvalidIndex(error) => write!(formatter, "invalid gzip index: {error}"),
         }
     }
 }
@@ -231,20 +304,31 @@ impl Error for DecodeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source.as_ref()),
+            Self::InvalidIndex(error) => Some(error),
             _ => None,
         }
     }
 }
 
 /// Statistics produced after the complete stream has been verified.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+///
+/// This type is intentionally not [`Copy`] so it can carry an optional
+/// [`GzipIndex`] when [`crate::DecoderBuilder::keep_index`] was enabled.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DecodeReport {
     /// Compressed bytes consumed.
     pub compressed_bytes: u64,
     /// Decompressed bytes emitted.
     pub decompressed_bytes: u64,
-    /// Number of verified gzip members.
+    /// Number of verified members/streams (gzip members, zlib streams, or `1`
+    /// for a successful raw DEFLATE stream).
     pub member_count: u64,
     /// Configured decoder-worker budget.
     pub decoder_threads: usize,
+    /// Built random-access index when [`crate::DecoderBuilder::keep_index`] was enabled.
+    pub index: Option<GzipIndex>,
+    /// Total Unix newline (`\n`) count in the decompressed output when
+    /// [`crate::DecoderBuilder::gather_line_offsets`] was enabled; `None`
+    /// otherwise. Empty files yield `Some(0)`.
+    pub line_count: Option<u64>,
 }

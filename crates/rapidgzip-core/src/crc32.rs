@@ -1,3 +1,5 @@
+use crate::DecodeError;
+
 /// Incremental IEEE CRC32 used by gzip.
 pub(crate) struct Crc32(u32);
 
@@ -17,6 +19,27 @@ impl Crc32 {
     pub(crate) const fn finish(&self) -> u32 {
         self.0
     }
+}
+
+/// Verifies an optional external whole-stream CRC32 for raw DEFLATE.
+///
+/// When `list` is empty, succeeds immediately. Otherwise compares the
+/// gzip-style IEEE CRC32 of the full uncompressed output against `list[0]`.
+/// Multi-element segment lists are accepted but only the first value is used
+/// (MVP).
+pub(crate) fn verify_raw_crc32_list(list: &[u32], crc: &Crc32) -> Result<(), DecodeError> {
+    let Some(&expected) = list.first() else {
+        return Ok(());
+    };
+    let actual = crc.finish();
+    if expected != actual {
+        return Err(DecodeError::ChecksumMismatch {
+            member: 0,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

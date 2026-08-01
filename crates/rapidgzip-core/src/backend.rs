@@ -1,13 +1,15 @@
-use crate::config::Config;
+use crate::config::{Config, Format};
 use crate::crc32::Crc32;
 use crate::gzip::{MemberHeader, SourceCursor, parse_member_header};
+use crate::index::IndexBuilder;
 use crate::parallel::Window;
 use crate::parallel::adaptive::AdaptiveConcurrency;
 use crate::parallel::deflate::{
     ChunkOutput, Error as NativeError, InitialHistory, ResolvedParts, decode_to_estimated_boundary,
     find_next_structural_candidate,
 };
-use crate::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ReadAt};
+use crate::zlib::{Adler32, looks_like_zlib, parse_zlib_header};
+use crate::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ReadAt, ZlibErrorKind};
 use crossbeam_deque::{Injector, Steal};
 use libz_rs_sys as z;
 use std::collections::BTreeMap;
@@ -56,13 +58,13 @@ impl<W: Write> Output for DirectOutput<'_, W> {
 }
 
 /// RAII wrapper around zlib-rs's zlib-compatible raw-inflate ABI.
-struct RawInflater {
-    stream: z::z_stream,
+pub(crate) struct RawInflater {
+    pub(crate) stream: z::z_stream,
     initialized: bool,
 }
 
 impl RawInflater {
-    fn new() -> Result<Self, DecodeError> {
+    pub(crate) fn new() -> Result<Self, DecodeError> {
         let mut result = Self {
             stream: z::z_stream::default(),
             initialized: false,
@@ -91,7 +93,7 @@ impl RawInflater {
         Ok(result)
     }
 
-    fn message(&self) -> Option<String> {
+    pub(crate) fn message(&self) -> Option<String> {
         if self.stream.msg.is_null() {
             return None;
         }
@@ -104,7 +106,7 @@ impl RawInflater {
         )
     }
 
-    fn reset(&mut self, bit_offset: u64) -> Result<(), DecodeError> {
+    pub(crate) fn reset(&mut self, bit_offset: u64) -> Result<(), DecodeError> {
         // SAFETY: this wrapper owns a successfully initialized stream and
         // holds its unique mutable borrow. `inflateReset` retains the raw
         // window mode selected by `inflateInit2_`.
@@ -117,6 +119,105 @@ impl RawInflater {
                 reason: DeflateErrorKind::BackendStatus(status),
             })
         }
+    }
+
+    /// Installs remaining bits from a mid-byte compressed start (LSB-first).
+    pub(crate) fn prime(&mut self, bits: u8, value: u8, bit_offset: u64) -> Result<(), DecodeError> {
+        // SAFETY: the stream is initialized and uniquely borrowed. zlib accepts
+        // at most 16 low-order bits before the first inflate call; this wrapper
+        // supplies at most the seven unread bits from one source byte.
+        let status =
+            unsafe { z::inflatePrime(&mut self.stream, i32::from(bits), i32::from(value)) };
+        if status == z::Z_OK {
+            Ok(())
+        } else {
+            Err(DecodeError::InvalidDeflate {
+                bit_offset,
+                reason: DeflateErrorKind::BackendStatus(status),
+            })
+        }
+    }
+
+    /// Copies a predecessor window into zlib as the inflate dictionary.
+    pub(crate) fn set_dictionary(
+        &mut self,
+        window: &Window,
+        bit_offset: u64,
+    ) -> Result<(), DecodeError> {
+        if window.as_slice().is_empty() {
+            return Ok(());
+        }
+        // SAFETY: `window` remains immutably borrowed for the call, and its
+        // slice is no larger than DEFLATE's 32 KiB history limit.
+        let status = unsafe {
+            z::inflateSetDictionary(
+                &mut self.stream,
+                window.as_slice().as_ptr(),
+                window.as_slice().len() as u32,
+            )
+        };
+        if status == z::Z_OK {
+            Ok(())
+        } else {
+            Err(DecodeError::InvalidDeflate {
+                bit_offset,
+                reason: DeflateErrorKind::BackendStatus(status),
+            })
+        }
+    }
+
+    /// Prepares raw inflate at an absolute compressed bit offset with history.
+    ///
+    /// Returns the compressed **byte** cursor position from which subsequent
+    /// inflate input must be read (past any mid-byte primed bits).
+    ///
+    /// When `skip_gzip_header` is true, `window` is empty, and `start_bit` is
+    /// byte-aligned on a gzip/BGZF member header, inflate begins at the DEFLATE
+    /// payload. htslib `.gzi` / BGZI indexes store block (header) starts; the
+    /// seek and `decode_with_index` paths pass `true`. Parallel marker fallback
+    /// must pass `false` so mid-stream `1f 8b` bytes are never misread as
+    /// headers. Non-empty windows never skip a header.
+    pub(crate) fn prepare_at_bit_offset<R: ReadAt + ?Sized>(
+        start_bit: u64,
+        window: &Window,
+        source: &R,
+        page_size: usize,
+        skip_gzip_header: bool,
+    ) -> Result<(Self, u64), DecodeError> {
+        let mut cursor = SourceCursor::new(source, page_size)?;
+        let mut byte_offset = start_bit / 8;
+        let mut effective_bit = start_bit;
+        cursor.seek(byte_offset)?;
+
+        if skip_gzip_header
+            && window.as_slice().is_empty()
+            && start_bit.is_multiple_of(8)
+            && !cursor.at_end()
+        {
+            // Peek for gzip magic; always restore the cursor so a miss leaves
+            // the offset as a raw DEFLATE bit position.
+            let is_gzip_magic = matches!(
+                cursor.read_exact::<2>(byte_offset),
+                Ok([0x1f, 0x8b])
+            );
+            cursor.seek(byte_offset)?;
+            if is_gzip_magic {
+                let header = parse_member_header(&mut cursor, false)?;
+                byte_offset = header.deflate_start;
+                effective_bit = header.deflate_start.saturating_mul(8);
+                cursor.seek(byte_offset)?;
+            }
+        }
+
+        let mut inflater = Self::new()?;
+        let skipped_bits = (effective_bit % 8) as u8;
+        if skipped_bits != 0 {
+            let byte = cursor.read_exact::<1>(byte_offset)?[0];
+            let remaining_bits = 8 - skipped_bits;
+            inflater.prime(remaining_bits, byte >> skipped_bits, effective_bit)?;
+        }
+        inflater.set_dictionary(window, effective_bit)?;
+        Ok((inflater, cursor.position()))
     }
 }
 
@@ -140,6 +241,15 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
+    match resolve_format(source, config)? {
+        Format::Zlib => return decode_zlib_sequential(source, config, cancelled, output),
+        Format::RawDeflate => {
+            return decode_raw_deflate_sequential(source, config, cancelled, output);
+        }
+        Format::Gzip => {}
+        Format::Auto => unreachable!("resolve_format returns Gzip, Zlib, or RawDeflate only"),
+    }
+
     // BGZF block starts are normally tens of KiB apart and only their short
     // headers are needed for indexing. A small page avoids reading the
     // complete compressed payload before decoding.
@@ -164,11 +274,432 @@ where
     decode_source_sequential(source, config, cancelled, output)
 }
 
+/// Resolves [`Format::Auto`] into gzip or zlib; forced formats are returned as-is.
+///
+/// Auto never selects raw DEFLATE (no magic bytes).
+fn resolve_format<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+) -> Result<Format, DecodeError> {
+    match config.format {
+        Format::Gzip => Ok(Format::Gzip),
+        Format::Zlib => Ok(Format::Zlib),
+        Format::RawDeflate => Ok(Format::RawDeflate),
+        Format::Auto => {
+            if looks_like_zlib(source, config.input_page_size)? {
+                Ok(Format::Zlib)
+            } else {
+                Ok(Format::Gzip)
+            }
+        }
+    }
+}
+
+/// Sequential raw DEFLATE (RFC 1951) decode: no wrapper, no integrity trailer.
+///
+/// Single stream from compressed offset 0 to `Z_STREAM_END`. Leftover input
+/// after end-of-stream is an error. There is no parallel marker path and no
+/// random-access index (`keep_index` is rejected at config build time).
+fn decode_raw_deflate_sequential<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    debug_assert!(
+        !config.keep_index,
+        "keep_index for raw DEFLATE is rejected by DecoderBuilder::build"
+    );
+
+    let mut cursor = SourceCursor::new(source, config.input_page_size)?;
+    if cursor.at_end() {
+        return Err(DecodeError::InvalidDeflate {
+            bit_offset: 0,
+            reason: DeflateErrorKind::Truncated,
+        });
+    }
+
+    let mut index_builder = new_index_builder(config);
+    let mut total_output = 0_u64;
+    let mut inflater = RawInflater::new()?;
+    let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
+    let verify_external_crc = !config.raw_crc32_list.is_empty();
+    let mut external_crc = Crc32::new();
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(DecodeError::Cancelled);
+        }
+        if cursor.at_end() {
+            return Err(DecodeError::InvalidDeflate {
+                bit_offset: cursor.position().saturating_mul(8),
+                reason: DeflateErrorKind::Truncated,
+            });
+        }
+
+        let (input_pointer, input_length) = {
+            let input = cursor.available()?;
+            (input.as_ptr(), input.len().min(u32::MAX as usize))
+        };
+        if decoded.capacity() < config.decoded_chunk_size {
+            decoded.reserve_exact(config.decoded_chunk_size - decoded.capacity());
+        }
+
+        inflater.stream.next_in = input_pointer;
+        inflater.stream.avail_in = input_length as u32;
+        inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+        inflater.stream.avail_out = decoded.capacity() as u32;
+        let input_before = inflater.stream.avail_in;
+        let output_before = inflater.stream.avail_out;
+
+        // SAFETY: live page input, uniquely owned spare output capacity, and
+        // an initialized raw-inflate stream (same contract as sequential gzip).
+        let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
+
+        let consumed = usize::try_from(input_before - inflater.stream.avail_in)
+            .expect("zlib uInt fits usize");
+        let produced = usize::try_from(output_before - inflater.stream.avail_out)
+            .expect("zlib uInt fits usize");
+        cursor.advance(consumed);
+        // SAFETY: `produced` bytes of spare capacity were initialized by inflate.
+        unsafe { decoded.set_len(produced) };
+
+        if !decoded.is_empty() {
+            let new_total = total_output.checked_add(decoded.len() as u64).ok_or(
+                DecodeError::OutputLimitExceeded {
+                    limit: config.output_limit.unwrap_or(u64::MAX),
+                },
+            )?;
+            if config.output_limit.is_some_and(|limit| new_total > limit) {
+                return Err(DecodeError::OutputLimitExceeded {
+                    limit: config.output_limit.expect("checked as some"),
+                });
+            }
+            total_output = new_total;
+            if verify_external_crc {
+                external_crc.update(&decoded);
+            }
+            index_builder.push_output(&decoded);
+            decoded = output.emit_reusable(decoded)?;
+        }
+
+        match status {
+            z::Z_STREAM_END => break,
+            z::Z_OK => {
+                if consumed == 0 && produced == 0 {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: cursor.position().saturating_mul(8),
+                        reason: DeflateErrorKind::Stalled,
+                    });
+                }
+            }
+            z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {}
+            z::Z_BUF_ERROR => {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: cursor.position().saturating_mul(8),
+                    reason: DeflateErrorKind::Truncated,
+                });
+            }
+            z::Z_NEED_DICT => {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: 0,
+                    reason: DeflateErrorKind::UnexpectedDictionary,
+                });
+            }
+            z::Z_DATA_ERROR => {
+                let _diagnostic = inflater.message();
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: cursor.position().saturating_mul(8),
+                    reason: DeflateErrorKind::InvalidData,
+                });
+            }
+            other => {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: cursor.position().saturating_mul(8),
+                    reason: DeflateErrorKind::BackendStatus(other),
+                });
+            }
+        }
+    }
+
+    // Single stream must consume the entire source (no trailer, no concat).
+    if !cursor.at_end() {
+        return Err(DecodeError::InvalidDeflate {
+            bit_offset: cursor.position().saturating_mul(8),
+            reason: DeflateErrorKind::InvalidData,
+        });
+    }
+
+    let final_length = source
+        .len()
+        .map_err(|error| DecodeError::input_io(cursor.position(), error))?;
+    if final_length != cursor.length() {
+        return Err(DecodeError::input_io(
+            cursor.position(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed source length changed during decoding",
+            ),
+        ));
+    }
+
+    crate::crc32::verify_raw_crc32_list(&config.raw_crc32_list, &external_crc)?;
+
+    Ok(finish_report(
+        config,
+        cursor.position(),
+        total_output,
+        1,
+        index_builder,
+    ))
+}
+
+/// Sequential zlib (RFC 1950) decode: CMF/FLG, raw DEFLATE, Adler-32 trailer.
+///
+/// Concatenated zlib streams are accepted. There is no parallel marker path
+/// and no random-access index (checkpoints at stream starts only when
+/// `keep_index` is set). Adler-32 verification follows `crc32_enabled`.
+fn decode_zlib_sequential<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    let mut cursor = SourceCursor::new(source, config.input_page_size)?;
+    let mut index_builder = new_index_builder(config);
+    let mut total_output = 0_u64;
+    let mut member_count = 0_u64;
+    // Prefer Z_BLOCK only when collecting an index so intermediate block
+    // checkpoints are available; default path stays on Z_NO_FLUSH.
+    let flush = if config.keep_index {
+        z::Z_BLOCK
+    } else {
+        z::Z_NO_FLUSH
+    };
+
+    while !cursor.at_end() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(DecodeError::Cancelled);
+        }
+
+        let header = parse_zlib_header(&mut cursor, member_count == 0)?;
+        debug_assert!(header.start <= header.deflate_start);
+        debug_assert_eq!(header.deflate_start, cursor.position());
+        // Empty window at each zlib stream DEFLATE start.
+        index_builder.force_checkpoint(header.deflate_start.saturating_mul(8), true);
+
+        let mut inflater = RawInflater::new()?;
+        let mut adler = Adler32::new();
+        let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
+
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(DecodeError::Cancelled);
+            }
+            if cursor.at_end() {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: cursor.position().saturating_mul(8),
+                    reason: DeflateErrorKind::Truncated,
+                });
+            }
+
+            let (input_pointer, input_length) = {
+                let input = cursor.available()?;
+                (input.as_ptr(), input.len().min(u32::MAX as usize))
+            };
+            if decoded.capacity() < config.decoded_chunk_size {
+                decoded.reserve_exact(config.decoded_chunk_size - decoded.capacity());
+            }
+
+            inflater.stream.next_in = input_pointer;
+            inflater.stream.avail_in = input_length as u32;
+            inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+            inflater.stream.avail_out = decoded.capacity() as u32;
+            let input_before = inflater.stream.avail_in;
+            let output_before = inflater.stream.avail_out;
+
+            // SAFETY: same contract as the sequential gzip path — live page
+            // input, uniquely owned spare output capacity, initialized stream.
+            let status = unsafe { z::inflate(&mut inflater.stream, flush) };
+
+            let consumed = usize::try_from(input_before - inflater.stream.avail_in)
+                .expect("zlib uInt fits usize");
+            let produced = usize::try_from(output_before - inflater.stream.avail_out)
+                .expect("zlib uInt fits usize");
+            cursor.advance(consumed);
+            // SAFETY: `produced` bytes of spare capacity were initialized by inflate.
+            unsafe { decoded.set_len(produced) };
+
+            if !decoded.is_empty() {
+                let new_total = total_output.checked_add(decoded.len() as u64).ok_or(
+                    DecodeError::OutputLimitExceeded {
+                        limit: config.output_limit.unwrap_or(u64::MAX),
+                    },
+                )?;
+                if config.output_limit.is_some_and(|limit| new_total > limit) {
+                    return Err(DecodeError::OutputLimitExceeded {
+                        limit: config.output_limit.expect("checked as some"),
+                    });
+                }
+                total_output = new_total;
+                if config.crc32_enabled {
+                    adler.update(&decoded);
+                }
+                index_builder.push_output(&decoded);
+                decoded = output.emit_reusable(decoded)?;
+            }
+
+            if config.keep_index {
+                let unused_bits = u64::try_from(inflater.stream.data_type & 0x3F)
+                    .expect("the low six data_type bits are non-negative");
+                let bit_pos = cursor
+                    .position()
+                    .saturating_mul(8)
+                    .saturating_sub(unused_bits);
+                let at_block_end = inflater.stream.data_type & 0x80 != 0;
+                if status == z::Z_STREAM_END || at_block_end {
+                    index_builder.maybe_checkpoint(bit_pos);
+                }
+            }
+
+            match status {
+                z::Z_STREAM_END => break,
+                z::Z_OK => {
+                    if consumed == 0 && produced == 0 {
+                        return Err(DecodeError::InvalidDeflate {
+                            bit_offset: cursor.position().saturating_mul(8),
+                            reason: DeflateErrorKind::Stalled,
+                        });
+                    }
+                }
+                z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {}
+                z::Z_BUF_ERROR => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: cursor.position().saturating_mul(8),
+                        reason: DeflateErrorKind::Truncated,
+                    });
+                }
+                z::Z_NEED_DICT => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: header.deflate_start.saturating_mul(8),
+                        reason: DeflateErrorKind::UnexpectedDictionary,
+                    });
+                }
+                z::Z_DATA_ERROR => {
+                    let _diagnostic = inflater.message();
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: cursor.position().saturating_mul(8),
+                        reason: DeflateErrorKind::InvalidData,
+                    });
+                }
+                other => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: cursor.position().saturating_mul(8),
+                        reason: DeflateErrorKind::BackendStatus(other),
+                    });
+                }
+            }
+        }
+
+        // Adler-32 trailer is four big-endian bytes (RFC 1950).
+        let footer_offset = cursor.position();
+        let footer = match cursor.read_exact::<4>(footer_offset) {
+            Ok(bytes) => bytes,
+            Err(DecodeError::InvalidGzip {
+                reason: GzipErrorKind::Truncated,
+                ..
+            }) => {
+                return Err(DecodeError::InvalidZlib {
+                    offset: footer_offset,
+                    reason: ZlibErrorKind::Truncated,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let expected_adler = u32::from_be_bytes(footer);
+        if config.crc32_enabled {
+            let actual_adler = adler.finish();
+            if expected_adler != actual_adler {
+                return Err(DecodeError::ChecksumMismatch {
+                    member: member_count,
+                    expected: expected_adler,
+                    actual: actual_adler,
+                });
+            }
+        }
+
+        member_count += 1;
+    }
+
+    if member_count == 0 {
+        return Err(DecodeError::InvalidZlib {
+            offset: 0,
+            reason: ZlibErrorKind::BadHeader,
+        });
+    }
+
+    let final_length = source
+        .len()
+        .map_err(|error| DecodeError::input_io(cursor.position(), error))?;
+    if final_length != cursor.length() {
+        return Err(DecodeError::input_io(
+            cursor.position(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed source length changed during decoding",
+            ),
+        ));
+    }
+
+    Ok(finish_report(
+        config,
+        cursor.position(),
+        total_output,
+        member_count,
+        index_builder,
+    ))
+}
+
 fn adjusted_compressed_chunk_size<R: ReadAt + ?Sized>(
     _source: &R,
     config: &Config,
 ) -> Result<usize, DecodeError> {
     Ok(config.compressed_chunk_size)
+}
+
+fn new_index_builder(config: &Config) -> IndexBuilder {
+    IndexBuilder::new(
+        config.keep_index,
+        config.gather_line_offsets,
+        config.checkpoint_spacing,
+        config.compress_index_windows,
+    )
+}
+
+fn finish_report(
+    config: &Config,
+    compressed_bytes: u64,
+    decompressed_bytes: u64,
+    member_count: u64,
+    index_builder: IndexBuilder,
+) -> DecodeReport {
+    let line_count = index_builder.report_line_count();
+    DecodeReport {
+        compressed_bytes,
+        decompressed_bytes,
+        member_count,
+        decoder_threads: config.decoder_threads,
+        index: index_builder.finish(compressed_bytes, decompressed_bytes),
+        line_count,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -180,6 +711,9 @@ struct StoredMember {
 #[derive(Clone)]
 struct StoredTask {
     member: usize,
+    /// Set on the first task of each member: absolute byte offset of the
+    /// member's DEFLATE stream start (empty-window seek point).
+    member_deflate_start: Option<u64>,
     ranges: Vec<CompressedRange>,
     decoded_size: usize,
     last_in_member: bool,
@@ -259,16 +793,19 @@ fn index_stored_stream<R: ReadAt + ?Sized>(
 
         let mut task_ranges = Vec::new();
         let mut task_size: usize = 0;
+        let mut first_task_of_member = true;
         for range in member_ranges {
             let range_size =
                 usize::try_from(range.end - range.start).expect("a stored block length fits usize");
             if !task_ranges.is_empty() && task_size.saturating_add(range_size) > 4 * 1024 * 1024 {
                 tasks.push(StoredTask {
                     member,
+                    member_deflate_start: first_task_of_member.then_some(header.deflate_start),
                     ranges: std::mem::take(&mut task_ranges),
                     decoded_size: task_size,
                     last_in_member: false,
                 });
+                first_task_of_member = false;
                 task_size = 0;
             }
             task_ranges.push(range);
@@ -276,6 +813,7 @@ fn index_stored_stream<R: ReadAt + ?Sized>(
         }
         tasks.push(StoredTask {
             member,
+            member_deflate_start: first_task_of_member.then_some(header.deflate_start),
             ranges: task_ranges,
             decoded_size: task_size,
             last_in_member: true,
@@ -361,6 +899,7 @@ where
     let mut reordered = BTreeMap::new();
     let mut total_output = 0_u64;
     let mut accounting = MemberAccounting::new();
+    let mut index_builder = new_index_builder(config);
 
     let scoped_result = thread::scope(|scope| -> Result<(), DecodeError> {
         let _stop_on_exit = StopGuard(&stopped);
@@ -425,17 +964,35 @@ where
             while let Some(result) = reordered.remove(&next_to_emit) {
                 let task = &index.tasks[next_to_emit];
                 let decoded = result?;
-                emit_accounted(decoded, config, output, &mut accounting, &mut total_output)?;
+                if let Some(deflate_start) = task.member_deflate_start {
+                    // Empty history at each independent member DEFLATE start.
+                    // Intermediate within-member points are omitted: stored
+                    // block headers are bit-aligned and task boundaries do not
+                    // expose a safe resume offset with a matching window.
+                    index_builder.force_checkpoint(deflate_start.saturating_mul(8), true);
+                }
+                index_builder.push_output(&decoded);
+                // push_output already recorded lines/windows; do not double-count.
+                emit_accounted(
+                    decoded,
+                    config,
+                    output,
+                    &mut accounting,
+                    &mut total_output,
+                    None,
+                )?;
                 if task.last_in_member {
                     let member = index.members[task.member];
-                    let actual_crc = accounting.crc.finish();
-                    if actual_crc != member.expected_crc {
-                        stopped.store(true, Ordering::Relaxed);
-                        return Err(DecodeError::ChecksumMismatch {
-                            member: task.member as u64,
-                            expected: member.expected_crc,
-                            actual: actual_crc,
-                        });
+                    if config.crc32_enabled {
+                        let actual_crc = accounting.crc.finish();
+                        if actual_crc != member.expected_crc {
+                            stopped.store(true, Ordering::Relaxed);
+                            return Err(DecodeError::ChecksumMismatch {
+                                member: task.member as u64,
+                                expected: member.expected_crc,
+                                actual: actual_crc,
+                            });
+                        }
                     }
                     if accounting.size != member.expected_size {
                         stopped.store(true, Ordering::Relaxed);
@@ -473,12 +1030,13 @@ where
         ));
     }
 
-    Ok(DecodeReport {
-        compressed_bytes: index.compressed_size,
-        decompressed_bytes: total_output,
-        member_count: index.members.len() as u64,
-        decoder_threads: config.decoder_threads,
-    })
+    Ok(finish_report(
+        config,
+        index.compressed_size,
+        total_output,
+        index.members.len() as u64,
+        index_builder,
+    ))
 }
 
 fn decode_source_sequential<R, O>(
@@ -491,7 +1049,17 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    decode_members_sequential(source, config, cancelled, output, 0, 0, 0)
+    let mut index_builder = new_index_builder(config);
+    decode_members_sequential(
+        source,
+        config,
+        cancelled,
+        output,
+        0,
+        0,
+        0,
+        &mut index_builder,
+    )
 }
 
 /// Decodes complete members beginning at a known member boundary.
@@ -500,6 +1068,11 @@ where
 /// sequence inside DEFLATE happened to look like a gzip header. Previously
 /// emitted members remain valid, so resuming from the first uncommitted task
 /// avoids both duplicate output and trusting the speculative candidate index.
+///
+/// When `keep_index` is enabled, the sequential inflate loop uses `Z_BLOCK` so
+/// intermediate checkpoints can be recorded at DEFLATE block boundaries with
+/// bit-accurate compressed offsets and a rolling 32 KiB predecessor window.
+#[allow(clippy::too_many_arguments)]
 fn decode_members_sequential<R, O>(
     source: &R,
     config: &Config,
@@ -508,6 +1081,7 @@ fn decode_members_sequential<R, O>(
     start_offset: u64,
     mut total_output: u64,
     mut member_count: u64,
+    index_builder: &mut IndexBuilder,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
@@ -515,16 +1089,25 @@ where
 {
     let mut cursor = SourceCursor::new(source, config.input_page_size)?;
     cursor.seek(start_offset)?;
+    // Prefer Z_BLOCK only when collecting an index so the default path stays
+    // unchanged (Z_NO_FLUSH). Z_BLOCK exposes block ends via data_type.
+    let flush = if config.keep_index {
+        z::Z_BLOCK
+    } else {
+        z::Z_NO_FLUSH
+    };
 
     while !cursor.at_end() {
         if cancelled.load(Ordering::Relaxed) {
             return Err(DecodeError::Cancelled);
         }
 
-        let header = parse_member_header(&mut cursor, member_count == 0)?;
+        let header = parse_member_header(&mut cursor, member_count == 0 && start_offset == 0)?;
         debug_assert!(header.start <= header.deflate_start);
         debug_assert_eq!(header.deflate_start, cursor.position());
         let _observed_bgzf_size = header.bgzf_block_size;
+        // Empty window at each member DEFLATE start (history resets).
+        index_builder.force_checkpoint(header.deflate_start.saturating_mul(8), true);
         let mut inflater = RawInflater::new()?;
         let mut crc = Crc32::new();
         let mut member_output = 0_u32;
@@ -563,7 +1146,9 @@ where
             // - `next_out/avail_out` describe the uniquely owned spare
             //   capacity of `decoded`. The backend reports how many bytes it
             //   initialized before that length is exposed below.
-            let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
+            // - When `keep_index`, flush is Z_BLOCK so data_type reports block
+            //   boundaries and buffered bit counts for checkpoint offsets.
+            let status = unsafe { z::inflate(&mut inflater.stream, flush) };
 
             let consumed = usize::try_from(input_before - inflater.stream.avail_in)
                 .expect("zlib uInt fits usize");
@@ -589,8 +1174,27 @@ where
                 }
                 total_output = new_total;
                 member_output = member_output.wrapping_add(decoded.len() as u32);
-                crc.update(&decoded);
+                if config.crc32_enabled {
+                    crc.update(&decoded);
+                }
+                index_builder.push_output(&decoded);
                 decoded = output.emit_reusable(decoded)?;
+            }
+
+            // Bit-accurate offset: bytes consumed so far, less bits still in
+            // zlib's bit buffer (low six data_type bits). Only meaningful with
+            // Z_BLOCK; with Z_NO_FLUSH keep_index is false and this is unused.
+            if config.keep_index {
+                let unused_bits = u64::try_from(inflater.stream.data_type & 0x3F)
+                    .expect("the low six data_type bits are non-negative");
+                let bit_pos = cursor
+                    .position()
+                    .saturating_mul(8)
+                    .saturating_sub(unused_bits);
+                let at_block_end = inflater.stream.data_type & 0x80 != 0;
+                if status == z::Z_STREAM_END || at_block_end {
+                    index_builder.maybe_checkpoint(bit_pos);
+                }
             }
 
             match status {
@@ -636,13 +1240,15 @@ where
         let footer = cursor.read_exact::<8>(footer_offset)?;
         let expected_crc = u32::from_le_bytes(footer[0..4].try_into().expect("four bytes"));
         let expected_size = u32::from_le_bytes(footer[4..8].try_into().expect("four bytes"));
-        let actual_crc = crc.finish();
-        if expected_crc != actual_crc {
-            return Err(DecodeError::ChecksumMismatch {
-                member: member_count,
-                expected: expected_crc,
-                actual: actual_crc,
-            });
+        if config.crc32_enabled {
+            let actual_crc = crc.finish();
+            if expected_crc != actual_crc {
+                return Err(DecodeError::ChecksumMismatch {
+                    member: member_count,
+                    expected: expected_crc,
+                    actual: actual_crc,
+                });
+            }
         }
         if expected_size != member_output {
             return Err(DecodeError::SizeMismatch {
@@ -675,12 +1281,16 @@ where
         ));
     }
 
-    Ok(DecodeReport {
-        compressed_bytes: cursor.position(),
-        decompressed_bytes: total_output,
+    // Take ownership of the builder for finish without cloning checkpoints.
+    let index_builder =
+        std::mem::replace(index_builder, IndexBuilder::new(false, false, 1, false));
+    Ok(finish_report(
+        config,
+        cursor.position(),
+        total_output,
         member_count,
-        decoder_threads: config.decoder_threads,
-    })
+        index_builder,
+    ))
 }
 
 const INDEPENDENT_MEMBER_SCAN_BYTES: usize = 4 * 1024 * 1024;
@@ -1100,23 +1710,23 @@ fn inflate_independent_member_into<R: ReadAt + ?Sized>(
             match status {
                 z::Z_STREAM_END => {
                     let member_output = &decoded[member_output_start..];
-                    let actual_crc = {
-                        let mut crc = Crc32::new();
-                        crc.update(member_output);
-                        crc.finish()
-                    };
                     let footer_offset = input_offset;
                     read_range_reuse(source, footer_offset, 8, compressed)?;
                     let expected_crc =
                         u32::from_le_bytes(compressed[0..4].try_into().expect("four bytes"));
                     let expected_size =
                         u32::from_le_bytes(compressed[4..8].try_into().expect("four bytes"));
-                    if actual_crc != expected_crc {
-                        return Err(DecodeError::ChecksumMismatch {
-                            member: member_number,
-                            expected: expected_crc,
-                            actual: actual_crc,
-                        });
+                    if config.crc32_enabled {
+                        let mut crc = Crc32::new();
+                        crc.update(member_output);
+                        let actual_crc = crc.finish();
+                        if actual_crc != expected_crc {
+                            return Err(DecodeError::ChecksumMismatch {
+                                member: member_number,
+                                expected: expected_crc,
+                                actual: actual_crc,
+                            });
+                        }
                     }
                     let actual_size = member_output.len() as u32;
                     if actual_size != expected_size {
@@ -1173,13 +1783,15 @@ struct DecodedIndependentMembers {
     end: u64,
     bytes: Vec<u8>,
     member_sizes: [usize; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
+    member_deflate_starts: [u64; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
     member_count: usize,
 }
 
 impl DecodedIndependentMembers {
-    fn push_member_size(&mut self, size: usize) {
+    fn push_member(&mut self, size: usize, deflate_start: u64) {
         debug_assert!(self.member_count < self.member_sizes.len());
         self.member_sizes[self.member_count] = size;
+        self.member_deflate_starts[self.member_count] = deflate_start;
         self.member_count += 1;
     }
 
@@ -1189,6 +1801,10 @@ impl DecodedIndependentMembers {
 
     fn member_size(&self, index: usize) -> usize {
         self.member_sizes[index]
+    }
+
+    fn member_deflate_start(&self, index: usize) -> u64 {
+        self.member_deflate_starts[index]
     }
 
     fn member_sizes(&self) -> impl Iterator<Item = usize> + '_ {
@@ -1283,6 +1899,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
                 end: header.start,
                 bytes: Vec::new(),
                 member_sizes: [0; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
+                member_deflate_starts: [0; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
                 member_count: 0,
             },
         });
@@ -1301,7 +1918,8 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
             Ok(end) => {
                 let member_size = run.decoded.bytes.len() - member_output_start;
                 run.decoded.end = end;
-                run.decoded.push_member_size(member_size);
+                run.decoded
+                    .push_member(member_size, header.deflate_start);
                 if (member_size > maximum_collatable_member_size
                     || run.decoded.bytes.len() >= target_result_size)
                     && !send_finished_independent_run(&mut active, sender, stopped)
@@ -1378,6 +1996,7 @@ where
     let mut total_output = 0_u64;
     let mut member_count = 0_u64;
     let mut expected_start = 0_u64;
+    let mut index_builder = new_index_builder(config);
 
     let outcome = thread::scope(|scope| -> Result<IndependentOutcome, DecodeError> {
         let _stop_on_exit = StopGuard(&stopped);
@@ -1612,6 +2231,16 @@ where
                             limit: config.output_limit.unwrap_or(u64::MAX),
                         });
                     }
+                    // Empty-window checkpoint at each verified member's DEFLATE start.
+                    index_builder.force_checkpoint(
+                        decoded
+                            .member_deflate_start(member_index)
+                            .saturating_mul(8),
+                        true,
+                    );
+                    let member_bytes =
+                        &decoded.bytes[accepted_bytes..accepted_bytes + member_size];
+                    index_builder.push_output(member_bytes);
                     total_output =
                         next_total.expect("the overflow case returned immediately above");
                     member_count += 1;
@@ -1651,6 +2280,7 @@ where
             offset,
             total_output,
             member_count,
+            &mut index_builder,
         );
     }
 
@@ -1667,12 +2297,13 @@ where
         ));
     }
 
-    Ok(DecodeReport {
-        compressed_bytes: index.compressed_size,
-        decompressed_bytes: total_output,
+    Ok(finish_report(
+        config,
+        index.compressed_size,
+        total_output,
         member_count,
-        decoder_threads: config.decoder_threads,
-    })
+        index_builder,
+    ))
 }
 
 fn read_range<R: ReadAt + ?Sized>(
@@ -1712,47 +2343,6 @@ fn read_range_reuse<R: ReadAt + ?Sized>(
     Ok(())
 }
 
-impl RawInflater {
-    fn prime(&mut self, bits: u8, value: u8, bit_offset: u64) -> Result<(), DecodeError> {
-        // SAFETY: the stream is initialized and uniquely borrowed. zlib accepts
-        // at most 16 low-order bits before the first inflate call; this wrapper
-        // supplies at most the seven unread bits from one source byte.
-        let status =
-            unsafe { z::inflatePrime(&mut self.stream, i32::from(bits), i32::from(value)) };
-        if status == z::Z_OK {
-            Ok(())
-        } else {
-            Err(DecodeError::InvalidDeflate {
-                bit_offset,
-                reason: DeflateErrorKind::BackendStatus(status),
-            })
-        }
-    }
-
-    fn set_dictionary(&mut self, window: &Window, bit_offset: u64) -> Result<(), DecodeError> {
-        if window.as_slice().is_empty() {
-            return Ok(());
-        }
-        // SAFETY: `window` remains immutably borrowed for the call, and its
-        // slice is no larger than DEFLATE's 32 KiB history limit.
-        let status = unsafe {
-            z::inflateSetDictionary(
-                &mut self.stream,
-                window.as_slice().as_ptr(),
-                window.as_slice().len() as u32,
-            )
-        };
-        if status == z::Z_OK {
-            Ok(())
-        } else {
-            Err(DecodeError::InvalidDeflate {
-                bit_offset,
-                reason: DeflateErrorKind::BackendStatus(status),
-            })
-        }
-    }
-}
-
 struct MemberAccounting {
     crc: Crc32,
     size: u32,
@@ -1773,6 +2363,7 @@ fn emit_accounted<O: Output>(
     output: &mut O,
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
+    index_builder: Option<&mut IndexBuilder>,
 ) -> Result<(), DecodeError> {
     let next_total =
         total_output
@@ -1787,7 +2378,12 @@ fn emit_accounted<O: Output>(
     }
     *total_output = next_total;
     accounting.size = accounting.size.wrapping_add(decoded.len() as u32);
-    accounting.crc.update(&decoded);
+    if config.crc32_enabled {
+        accounting.crc.update(&decoded);
+    }
+    if let Some(index_builder) = index_builder {
+        index_builder.push_output(&decoded);
+    }
     if !decoded.is_empty() {
         output.emit(decoded)?;
     }
@@ -1804,22 +2400,21 @@ fn inflate_from_block<R, O>(
     window: &Window,
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
+    index_builder: &mut IndexBuilder,
 ) -> Result<u64, DecodeError>
 where
     R: ReadAt + ?Sized,
     O: Output,
 {
+    let (mut inflater, resume_byte) = RawInflater::prepare_at_bit_offset(
+        start_bit,
+        window,
+        source,
+        config.input_page_size,
+        false,
+    )?;
     let mut cursor = SourceCursor::new(source, config.input_page_size)?;
-    let byte_offset = start_bit / 8;
-    cursor.seek(byte_offset)?;
-    let mut inflater = RawInflater::new()?;
-    let skipped_bits = (start_bit % 8) as u8;
-    if skipped_bits != 0 {
-        let byte = cursor.read_exact::<1>(byte_offset)?[0];
-        let remaining_bits = 8 - skipped_bits;
-        inflater.prime(remaining_bits, byte >> skipped_bits, start_bit)?;
-    }
-    inflater.set_dictionary(window, start_bit)?;
+    cursor.seek(resume_byte)?;
 
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -1854,7 +2449,14 @@ where
         cursor.advance(consumed);
         decoded.truncate(produced);
         if !decoded.is_empty() {
-            emit_accounted(decoded, config, output, accounting, total_output)?;
+            emit_accounted(
+                decoded,
+                config,
+                output,
+                accounting,
+                total_output,
+                Some(index_builder),
+            )?;
         }
         match status {
             z::Z_STREAM_END => return Ok(cursor.position()),
@@ -2386,11 +2988,33 @@ fn emit_resolved_parts<O: Output>(
     output: &mut O,
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
+    index_builder: &mut IndexBuilder,
 ) -> Result<(), DecodeError> {
     let (marked, clean, backend_tail) = parts;
-    emit_accounted(marked, config, output, accounting, total_output)?;
-    emit_accounted(clean, config, output, accounting, total_output)?;
-    emit_accounted(backend_tail, config, output, accounting, total_output)?;
+    emit_accounted(
+        marked,
+        config,
+        output,
+        accounting,
+        total_output,
+        Some(index_builder),
+    )?;
+    emit_accounted(
+        clean,
+        config,
+        output,
+        accounting,
+        total_output,
+        Some(index_builder),
+    )?;
+    emit_accounted(
+        backend_tail,
+        config,
+        output,
+        accounting,
+        total_output,
+        Some(index_builder),
+    )?;
     Ok(())
 }
 
@@ -2438,7 +3062,26 @@ fn enqueue_native_resolution(
     queue: &Injector<ResolveTask>,
     available_resolve_tasks: &AtomicUsize,
     work_signal: &(Mutex<()>, Condvar),
+    index_builder: &mut IndexBuilder,
 ) -> Result<bool, DecodeError> {
+    // Record a seek point at this chunk's start using the predecessor window
+    // that will be installed as the inflate dictionary. Spacing is soft: tiny
+    // chunks denser than checkpoint_spacing are skipped unless this is the
+    // first point after a member reset (empty window / force via spacing).
+    let start_bit = *current_bit;
+    let uncompressed_at_start = *prepared_total;
+    let predecessor_window = window.as_slice();
+    index_builder.checkpoint_at(
+        start_bit,
+        uncompressed_at_start,
+        if predecessor_window.is_empty() {
+            None
+        } else {
+            Some(predecessor_window)
+        },
+        false,
+    );
+
     let prepared = prepare_native_chunk(chunk, *next_sequence, window, *current_bit)?;
     let next_total = prepared_total
         .checked_add(prepared.decoded_size as u64)
@@ -2477,10 +3120,18 @@ fn drain_native_resolutions<O: Output>(
     output: &mut O,
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
+    index_builder: &mut IndexBuilder,
 ) -> Result<(), DecodeError> {
     while *outstanding != 0 {
         let parts = wait_for_resolved(receiver, pending, *next_sequence, cancelled, bit_offset)?;
-        emit_resolved_parts(parts, config, output, accounting, total_output)?;
+        emit_resolved_parts(
+            parts,
+            config,
+            output,
+            accounting,
+            total_output,
+            index_builder,
+        )?;
         *next_sequence += 1;
         *outstanding -= 1;
     }
@@ -2492,9 +3143,14 @@ fn validate_footer<R: ReadAt + ?Sized>(
     footer_offset: u64,
     member: u64,
     accounting: &MemberAccounting,
+    crc32_enabled: bool,
 ) -> Result<u64, DecodeError> {
     const MAX_BACKEND_READ_AHEAD: u64 = 16;
-    let actual_crc = accounting.crc.finish();
+    let actual_crc = if crc32_enabled {
+        accounting.crc.finish()
+    } else {
+        0
+    };
     let actual_size = accounting.size;
     let mut reported_footer = None;
     let mut first_error = None;
@@ -2520,7 +3176,8 @@ fn validate_footer<R: ReadAt + ?Sized>(
         if read_ahead == 0 {
             reported_footer = Some((expected_crc, expected_size));
         }
-        if expected_crc == actual_crc && expected_size == actual_size {
+        let crc_ok = !crc32_enabled || expected_crc == actual_crc;
+        if crc_ok && expected_size == actual_size {
             return Ok(candidate);
         }
     }
@@ -2531,7 +3188,7 @@ fn validate_footer<R: ReadAt + ?Sized>(
             reason: GzipErrorKind::Truncated,
         }));
     };
-    if expected_crc != actual_crc {
+    if crc32_enabled && expected_crc != actual_crc {
         return Err(DecodeError::ChecksumMismatch {
             member,
             expected: expected_crc,
@@ -2564,17 +3221,19 @@ where
     // This cursor touches only gzip headers and footers. Large pages would
     // copy compressed payload that the positional workers read independently.
     let mut frame_cursor = SourceCursor::new(source, config.input_page_size.min(256))?;
+    let mut index_builder = new_index_builder(config);
     if frame_cursor.at_end() {
-        return Ok(DecodeReport {
-            compressed_bytes: 0,
-            decompressed_bytes: 0,
-            member_count: 0,
-            decoder_threads: config.decoder_threads,
+        // Match sequential path: empty input is not a valid gzip stream.
+        return Err(DecodeError::InvalidGzip {
+            offset: 0,
+            reason: GzipErrorKind::BadMagic,
         });
     }
 
     let first_header = parse_member_header(&mut frame_cursor, true)?;
     let first_deflate_bit = first_header.deflate_start.saturating_mul(8);
+    // Empty window at the start of the first DEFLATE stream.
+    index_builder.force_checkpoint(first_deflate_bit, true);
     let length_bits = frame_cursor.length().saturating_mul(8);
     let spacing_bits = (compressed_chunk_size as u64).saturating_mul(8);
     let task_count = usize::try_from(
@@ -2714,9 +3373,15 @@ where
                     output,
                     &mut accounting,
                     &mut total_output,
+                    &mut index_builder,
                 )?;
-                let actual_footer =
-                    validate_footer(&mut frame_cursor, offset, member_count, &accounting)?;
+                let actual_footer = validate_footer(
+                    &mut frame_cursor,
+                    offset,
+                    member_count,
+                    &accounting,
+                    config.crc32_enabled,
+                )?;
                 member_count += 1;
                 if actual_footer.saturating_add(8) == frame_cursor.length() {
                     break 'decode;
@@ -2726,6 +3391,8 @@ where
                 current_bit = header.deflate_start.saturating_mul(8);
                 window = Window::empty();
                 accounting = MemberAccounting::new();
+                // History resets at each member; empty-window seek point.
+                index_builder.checkpoint_at(current_bit, total_output, None, true);
 
                 // Use the first file-wide grid point strictly after this
                 // member header. The exact bridge chunk ends at the same
@@ -2749,6 +3416,7 @@ where
                         &window,
                         &mut accounting,
                         &mut total_output,
+                        &mut index_builder,
                     )?);
                     prepared_total_output = total_output;
                     continue 'decode;
@@ -2797,6 +3465,7 @@ where
                             &resolve_queue,
                             &available_resolve_tasks,
                             &work_signal,
+                            &mut index_builder,
                         )?;
                         let resolve_window =
                             adaptive_workers.current_limit().min(pipeline_capacity);
@@ -2814,6 +3483,7 @@ where
                                 output,
                                 &mut accounting,
                                 &mut total_output,
+                                &mut index_builder,
                             )?;
                             next_resolve_to_emit += 1;
                             outstanding_resolves -= 1;
@@ -2832,6 +3502,7 @@ where
                             &window,
                             &mut accounting,
                             &mut total_output,
+                            &mut index_builder,
                         )?);
                         prepared_total_output = total_output;
                     }
@@ -2875,6 +3546,7 @@ where
                         &resolve_queue,
                         &available_resolve_tasks,
                         &work_signal,
+                        &mut index_builder,
                     )?;
                     let resolve_window = adaptive_workers.current_limit().min(pipeline_capacity);
                     if outstanding_resolves >= resolve_window {
@@ -2891,6 +3563,7 @@ where
                             output,
                             &mut accounting,
                             &mut total_output,
+                            &mut index_builder,
                         )?;
                         next_resolve_to_emit += 1;
                         outstanding_resolves -= 1;
@@ -2922,6 +3595,7 @@ where
                             output,
                             &mut accounting,
                             &mut total_output,
+                            &mut index_builder,
                         )?;
                         footer_offset = Some(inflate_from_block(
                             source,
@@ -2932,6 +3606,7 @@ where
                             &window,
                             &mut accounting,
                             &mut total_output,
+                            &mut index_builder,
                         )?);
                         prepared_total_output = total_output;
                     }
@@ -2948,6 +3623,7 @@ where
                         output,
                         &mut accounting,
                         &mut total_output,
+                        &mut index_builder,
                     )?;
                     footer_offset = Some(inflate_from_block(
                         source,
@@ -2958,6 +3634,7 @@ where
                         &window,
                         &mut accounting,
                         &mut total_output,
+                        &mut index_builder,
                     )?);
                     prepared_total_output = total_output;
                 }
@@ -2984,12 +3661,13 @@ where
             ),
         ));
     }
-    Ok(DecodeReport {
-        compressed_bytes: frame_cursor.position(),
-        decompressed_bytes: total_output,
+    Ok(finish_report(
+        config,
+        frame_cursor.position(),
+        total_output,
         member_count,
-        decoder_threads: config.decoder_threads,
-    })
+        index_builder,
+    ))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3055,9 +3733,10 @@ fn index_bgzf<R: ReadAt + ?Sized>(
 
 struct BgzfResult {
     index: usize,
-    result: Result<Vec<u8>, DecodeError>,
+    result: Result<BgzfDecoded, DecodeError>,
 }
 
+/// Decodes one BGZF block, appending to `output`. Returns the produced length.
 fn decode_bgzf_block_into<R: ReadAt + ?Sized>(
     source: &R,
     range: BgzfRange,
@@ -3065,7 +3744,8 @@ fn decode_bgzf_block_into<R: ReadAt + ?Sized>(
     compressed: &mut Vec<u8>,
     output: &mut Vec<u8>,
     inflater: &mut RawInflater,
-) -> Result<(), DecodeError> {
+    crc32_enabled: bool,
+) -> Result<usize, DecodeError> {
     const MAX_BGZF_OUTPUT: usize = 64 * 1024;
     let compressed_length =
         usize::try_from(range.end.saturating_sub(range.start)).map_err(|_| {
@@ -3144,17 +3824,25 @@ fn decode_bgzf_block_into<R: ReadAt + ?Sized>(
     unsafe {
         output.set_len(old_length + produced);
     }
-    let mut crc = Crc32::new();
-    crc.update(&output[old_length..]);
-    let actual_crc = crc.finish();
-    if actual_crc != expected_crc {
-        return Err(DecodeError::ChecksumMismatch {
-            member,
-            expected: expected_crc,
-            actual: actual_crc,
-        });
+    if crc32_enabled {
+        let mut crc = Crc32::new();
+        crc.update(&output[old_length..]);
+        let actual_crc = crc.finish();
+        if actual_crc != expected_crc {
+            return Err(DecodeError::ChecksumMismatch {
+                member,
+                expected: expected_crc,
+                actual: actual_crc,
+            });
+        }
     }
-    Ok(())
+    Ok(produced)
+}
+
+struct BgzfDecoded {
+    bytes: Vec<u8>,
+    /// Uncompressed size of each block in this task, in emission order.
+    block_sizes: Vec<usize>,
 }
 
 fn send_bgzf_result(
@@ -3206,7 +3894,9 @@ where
     let mut running = task_window;
     let mut reordered = BTreeMap::new();
     let mut total_output = 0_u64;
+    let mut index_builder = new_index_builder(config);
 
+    let crc32_enabled = config.crc32_enabled;
     let scoped_result = thread::scope(|scope| -> Result<(), DecodeError> {
         let _stop_on_exit = StopGuard(&stopped);
         for _ in 0..worker_count {
@@ -3248,9 +3938,9 @@ where
                     };
                     let first_block = index * BLOCKS_PER_TASK;
                     let past_last_block = (first_block + BLOCKS_PER_TASK).min(ranges.len());
-                    let mut decoded = Vec::with_capacity(
-                        (past_last_block - first_block).saturating_mul(64 * 1024),
-                    );
+                    let block_count = past_last_block - first_block;
+                    let mut decoded = Vec::with_capacity(block_count.saturating_mul(64 * 1024));
+                    let mut block_sizes = Vec::with_capacity(block_count);
                     let result = (|| {
                         if inflater.is_none() {
                             inflater = Some(RawInflater::new()?);
@@ -3267,16 +3957,21 @@ where
                             if cancelled.load(Ordering::Relaxed) {
                                 return Err(DecodeError::Cancelled);
                             }
-                            decode_bgzf_block_into(
+                            let produced = decode_bgzf_block_into(
                                 source,
                                 range,
                                 range_index as u64,
                                 &mut compressed,
                                 &mut decoded,
                                 inflater,
+                                crc32_enabled,
                             )?;
+                            block_sizes.push(produced);
                         }
-                        Ok(decoded)
+                        Ok(BgzfDecoded {
+                            bytes: decoded,
+                            block_sizes,
+                        })
                     })();
                     send_bgzf_result(&sender, &worker_stopped, BgzfResult { index, result });
                 }
@@ -3310,20 +4005,34 @@ where
                         return Err(error);
                     }
                 };
-                let next_total = total_output.checked_add(decoded.len() as u64).ok_or(
-                    DecodeError::OutputLimitExceeded {
+                let next_total = total_output
+                    .checked_add(decoded.bytes.len() as u64)
+                    .ok_or(DecodeError::OutputLimitExceeded {
                         limit: config.output_limit.unwrap_or(u64::MAX),
-                    },
-                )?;
+                    })?;
                 if config.output_limit.is_some_and(|limit| next_total > limit) {
                     stopped.store(true, Ordering::Relaxed);
                     return Err(DecodeError::OutputLimitExceeded {
                         limit: config.output_limit.expect("checked as some"),
                     });
                 }
+                // Each BGZF block is an independent inflate with empty history.
+                if index_builder.tracks_output() {
+                    let first_block = next_to_emit * BLOCKS_PER_TASK;
+                    let mut offset = 0_usize;
+                    for (i, &size) in decoded.block_sizes.iter().enumerate() {
+                        let range = ranges[first_block + i];
+                        if index_builder.enabled() {
+                            index_builder
+                                .force_checkpoint(range.deflate_start.saturating_mul(8), true);
+                        }
+                        index_builder.push_output(&decoded.bytes[offset..offset + size]);
+                        offset += size;
+                    }
+                }
                 total_output = next_total;
-                if !decoded.is_empty() {
-                    output.emit(decoded)?;
+                if !decoded.bytes.is_empty() {
+                    output.emit(decoded.bytes)?;
                 }
                 next_to_emit += 1;
             }
@@ -3361,12 +4070,13 @@ where
         ));
     }
 
-    Ok(DecodeReport {
+    Ok(finish_report(
+        config,
         compressed_bytes,
-        decompressed_bytes: total_output,
-        member_count: ranges.len() as u64,
-        decoder_threads: config.decoder_threads,
-    })
+        total_output,
+        ranges.len() as u64,
+        index_builder,
+    ))
 }
 
 #[cfg(test)]
@@ -3471,7 +4181,10 @@ mod tests {
         encoded.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
 
         let mut cursor = SourceCursor::new(encoded.as_slice(), 4).unwrap();
-        assert_eq!(validate_footer(&mut cursor, 6, 0, &accounting).unwrap(), 0);
+        assert_eq!(
+            validate_footer(&mut cursor, 6, 0, &accounting, true).unwrap(),
+            0
+        );
         assert_eq!(cursor.position(), 8);
     }
 }

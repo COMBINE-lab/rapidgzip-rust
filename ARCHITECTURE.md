@@ -3,19 +3,42 @@
 ## Data flow
 
 `rapidgzip-core` accepts an immutable positional `ReadAt` source. A decode
-snapshots its length, parses gzip framing itself, and routes the raw DEFLATE
-payload through one of five bounded paths:
+snapshots its length, detects gzip (`1f 8b`) vs zlib (RFC 1950 CMF/FLG) from
+the prefix (or an explicit `DecoderBuilder::format`), then routes the payload.
+Auto never selects raw DEFLATE (no magic). Non-seekable `Read` sources
+(`Decoder::decode_read`, CLI stdin decompress) use a buffered pull reader:
 
-1. Standard zlib-rs raw inflate is the authoritative fallback and the
-   single-thread path.
-2. A fully stored stream is indexed from its exact block headers and copied by
-   ordered worker tasks.
+- **Sequential** when `decoder_threads == 1` or the resolved format is zlib /
+  raw DEFLATE: gzip/zlib/raw inflate only; no parallel workers and no
+  full-archive buffer (O(input page) compressed-side memory).
+- **Parallel gzip** when `decoder_threads > 1` and the format resolves to gzip
+  (explicit Gzip or Auto after prefix peek): the stream is spilled to a private
+  temporary file (secure temp-dir defaults; deleted on drop), then the usual
+  positional parallel path below runs on that file. Peak cost is compressed size
+  on disk plus the decoder working set.
+
+CLI paths that need a known length / `ReadAt` on stdin (`--analyze`,
+`--import-index`, `--ranges`) likewise spill stdin to a tempfile rather than
+holding the full archive only in RAM.
+
+Positional routes after format resolution:
+
+0. **zlib wrapper** (sequential only): parse CMF/FLG, raw-inflate with zlib-rs,
+   verify the big-endian Adler-32 trailer (gated by `crc32_enabled`). Supports
+   concatenated zlib streams. No marker/window parallel path and no seek index.
+0b. **raw DEFLATE** (RFC 1951, sequential only, explicit `Format::RawDeflate`):
+   zlib-rs raw inflate (`windowBits = -15`) from offset 0 to `Z_STREAM_END`;
+   leftover compressed bytes are an error. No integrity trailer and no index.
+1. Standard zlib-rs raw inflate is the authoritative gzip fallback and the
+   single-thread gzip path.
+2. A fully stored gzip stream is indexed from its exact block headers and
+   copied by ordered worker tasks.
 3. A consistently formed BGZF stream is indexed from `BC/BSIZE` and its
    independently verified members are decoded by ordered worker tasks.
-4. Ordinary streams with densely spaced members use candidate-header
+4. Ordinary gzip streams with densely spaced members use candidate-header
    discovery and independently verified member workers.
-5. Other streams use a file-wide estimated grid and rapidgzip's marker/window
-   path, with zlib-rs fallback from the last authoritative boundary.
+5. Other gzip streams use a file-wide estimated grid and rapidgzip's
+   marker/window path, with zlib-rs fallback from the last authoritative boundary.
 
 All paths return ordered owned chunks to one coordinator. The coordinator alone
 updates member accounting and calls the user's `Write`, so a writer need not be
@@ -167,3 +190,58 @@ oversized regions continue through zlib-rs instead. `DecoderReader` adds at most
 the configured in-flight chunk count plus its currently partially consumed
 chunk. Dropping it closes the consumer edge, sets cancellation, and joins the
 coordinator.
+
+## Structure analysis
+
+`Decoder::analyze` (CLI `--analyze`) walks the archive sequentially with raw
+inflate and `Z_BLOCK`. Format follows `DecoderBuilder::format` (default
+auto-detect): gzip/BGZF, zlib (RFC 1950), or explicit raw DEFLATE (RFC 1951).
+It reports per-member (or per stream) compressed ranges, uncompressed sizes,
+footer check status, and per-block type (stored/fixed/dynamic), final bit, and
+bit spans. For zlib it also records CMF/FLG and Adler-32 status
+(`crc32_enabled` gates Adler the same way as gzip CRC). Concatenated zlib
+streams appear as separate members. No payload is emitted and no index is
+required.
+
+Raw DEFLATE (`Format::RawDeflate`, never auto-selected) walks a single stream
+from bit 0 to `Z_STREAM_END`, reports `ArchiveKind::RawDeflate` with
+`crc32_ok: None` (no integrity trailer), and treats trailing bytes after EOS as
+an error (same policy as decode).
+
+## Random access and indexes
+
+When `DecoderBuilder::keep_index` is enabled, the coordinator records
+checkpoints (compressed bit offset, uncompressed offset, optional line
+offset) and predecessor 32 KiB windows at resolved boundaries. BGZF and
+independent member starts use empty windows. By default
+(`compress_index_windows`, on), non-empty windows may be held
+zlib-compressed in memory when smaller than raw (decompress on demand for
+seek/export; `IndexedReader` caches expanded zlib windows in a small LRU
+aligned with seek-cache chunk budget). The in-memory `GzipIndex`
+exports/imports **indexed_gzip** (`GZIDX`), **gztool** (`gzipindx` /
+`gzipindX`), and htslib **BGZI** (`.gzi` block index: little-endian pair
+list of compressed/uncompressed block starts after the first). BGZI export
+emits only empty-window member boundaries (no synthetic EOF pair, no
+mid-stream windows). Import leaves uncompressed size unknown (`u64::MAX`);
+full decode schedules an open-ended final segment for the last block.
+`read_gzip_index` auto-detects the format (GZIDX magic, then gztool magic,
+then exact-length BGZI).
+
+`Decoder::decode_with_index` splits the archive on consecutive checkpoints and
+inflates each span with zlib-rs (no marker speculation). Segments may start
+mid-member, so this path does **not** verify member CRC32/ISIZE (same policy
+as seek). Self-built indexes append an EOF checkpoint; imported indexes that
+omit one still get a final tail segment when the declared uncompressed size is
+known. Empty-window checkpoints that land on gzip magic (BGZI header starts)
+skip the member header so inflate begins at the DEFLATE payload; marker-path
+fallbacks never perform that skip.
+
+`IndexedReader` (`Read` + `Seek`) restarts inflate at the nearest preceding
+checkpoint, discards skip bytes, and serves sequential traffic from an LRU of
+decoded windows with optional single-threaded readahead into the next window
+plus best-effort parallel background prefetch of further windows
+(`DecoderBuilder::seek_prefetch_windows`, default 2; workers inflate from
+independent checkpoint resumes and never share the consumer session). Far seeks
+invalidate in-flight prefetch inserts via a generation counter. `seek_to_line`
+requires an index with line offsets (`gather_line_offsets` or a
+gztool-with-lines import).

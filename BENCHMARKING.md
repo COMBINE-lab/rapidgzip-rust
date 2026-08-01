@@ -11,24 +11,114 @@ The Criterion benchmark drains the public `DecoderReader`, so channel
 handoff, ordered assembly, verification, and the unavoidable `Read` copy are
 included.
 
-For corpus and competitor runs, build the Rust release binary and use the
-matrix driver:
+## Fair comparative harness (Rust vs C++ rapidgzip)
+
+Use the one-shot driver for reproducible, fair runs:
 
 ```bash
-cargo build --locked --release
+# CI-light: synthetic few-MiB corpora, threads 1 2, 2 runs; C++ optional
+./benchmarks/run-fair.sh --ci --threads "1 2" --runs 2
+
+# Full local compare (requires C++ rapidgzip on PATH or RAPIDGZIP_CPP*)
+./benchmarks/run-fair.sh --threads "1 4 16 44" --runs 9
+
+# Same entry point via scripts/
+./scripts/bench-vs-rapidgzip.sh --ci
+```
+
+Results land in `target/bench-results/<UTC-timestamp>/` (`matrix-verify.tsv`,
+`matrix-verify.json`, optional `parity.tsv` / `parity.json`, `SUMMARY.md`,
+`env.txt`). Synthetic corpora are generated under `target/bench-corpora/` by
+`benchmarks/gen-corpora.sh` (no network; deterministic given `SEED`).
+
+### Fairness rules
+
+| Rule | Detail |
+|------|--------|
+| Same thread budgets | `THREAD_CELLS` / `--threads` applied to every tool |
+| CRC verify on | Rust `-t` (or default verify on `-c`); C++ `-t --verify` when accepted, else `--verify -c -f` |
+| Same sink | Discard payload (`-t` / sink, or `-c` with stdout discarded by the harness) |
+| Warmups + median | Default 2 warmups + 9 measured runs for release; CI uses fewer. Report **median** wall time, MiB/s, peak RSS |
+| Affinity | Optional `TASKSET=0-43` or `TASKSET="taskset -c 0-43"` wraps every timed process |
+| Auto-detect | If `RAPIDGZIP_CPP*` unset, use `rapidgzip` on `PATH` |
+| Throughput | `DECODED_BYTES` or auto via `rapidgzip-rust --count` |
+
+**Intentionally not equalized:** inflate backend. C++ may use ISA-L and/or
+zlib-ng; Rust uses zlib-rs. That is an implementation difference, not a
+methodology bug — report **both** C++ builds when available
+(`RAPIDGZIP_CPP_ISAL` and `RAPIDGZIP_CPP_ZLIB_NG`) and do not claim ISA-L
+parity from a zlib-ng-only binary.
+
+### Installing C++ rapidgzip for comparison
+
+```bash
+python3 -m pip install --user rapidgzip
+# or build from https://github.com/mxmlnkn/rapidgzip
+export RAPIDGZIP_CPP=$(command -v rapidgzip)
+# Optional separate builds:
+#   RAPIDGZIP_CPP_ISAL=/path/to/rapidgzip-with-isal
+#   RAPIDGZIP_CPP_ZLIB_NG=/path/to/rapidgzip-zlib-ng-only
+```
+
+`--ci` continues with Rust-only cells if C++ is missing (prints a note).
+Non-CI `run-fair.sh` errors with the install hint above.
+
+### Mode matrix (`benchmarks/parity-compare.sh`)
+
+| Mode | Rust | C++ rapidgzip |
+|------|------|----------------|
+| `verify` | `-P N -t` | `-P N -t --verify` (fallback: `--verify -c -f`) |
+| `stdout` | `-P N -c` (stdout discarded) | `-P N --verify -c -f` |
+| `index` | export GZIDX; `-P N -c --import-index` | export; `--import-index --verify -c -f` |
+| `stdin` | `rust -P N -c - < file` | `rapidgzip -P N -c -f - < file` (sequential) |
+
+C++ may skip real decode when writing to `/dev/null` without `-f` / `-l` /
+`--count`; the harness always forces a real decode for sink modes. Rust
+`--test` with `--import-index` does **not** use the index decode path (it
+re-verifies via the parallel pipeline); index mode therefore uses `-c
+--import-index` on Rust. Stdin is sequential on both tools — not a
+parallel-scaling cell.
+
+### CI-light vs full FASTQ parity
+
+| Profile | How | Corpora |
+|---------|-----|---------|
+| CI-light | `./benchmarks/run-fair.sh --ci` | `gen-corpora.sh` defaults (~2–4 MiB uncompressed) |
+| Local full synthetic | `./benchmarks/run-fair.sh --threads "1 4 16 44"` | larger `CORPUS_BYTES` / `LARGE_BYTES` |
+| Release FASTQ | `run-matrix.sh` on a pinned public FASTQ | e.g. SRR22403185 (manual download; **not** default CI) |
+
+Do **not** put multi-hundred-MB FASTQ downloads in default CI. Keep the public
+FASTQ snapshot procedure below for release gates only.
+
+### Script map
+
+| Script | Role |
+|--------|------|
+| `benchmarks/run-fair.sh` | One-shot: build, corpora, matrix, parity, markdown summary |
+| `benchmarks/run-matrix.sh` | Thread × tool TSV (+ optional JSON medians); multi-file / `--corpus-dir` |
+| `benchmarks/parity-compare.sh` | verify / stdout / index / stdin modes |
+| `benchmarks/gen-corpora.sh` | Deterministic single/multi/BGZF-like/zlib fixtures |
+| `scripts/bench-vs-rapidgzip.sh` | Forwards to `run-fair.sh` |
+
+### Low-level matrix driver
+
+```bash
+cargo build --locked --release -p rapidgzip-rust-cli
 RUNS=9 \
 DECODED_BYTES=268435456 \
 RAPIDGZIP_CPP_ISAL=/path/to/rapidgzip-with-isal \
 RAPIDGZIP_CPP_ZLIB_NG=/path/to/rapidgzip-with-zlib-ng \
 GZIPPY=/path/to/gzippy \
 benchmarks/run-matrix.sh corpus.fastq.gz > results.tsv
+# or: --corpus-dir target/bench-corpora --json results.json --mode verify
 ```
 
 The driver runs 1, 4, 16, and 44 threads by default, records wall/user/system
 time and peak RSS, and reports the ISA-L and zlib-ng rapidgzip builds separately.
 It includes gzippy whenever its executable is available. `RAPIDGZIP_CPP` remains
-an alias for `RAPIDGZIP_CPP_ZLIB_NG` for older invocations. The competitor is
-named `gzippy`; references to "zippy" in benchmark discussions mean that same
+an alias for `RAPIDGZIP_CPP_ZLIB_NG` for older invocations; if no `RAPIDGZIP_CPP*`
+variable is set, `rapidgzip` on `PATH` is used. The competitor is named
+`gzippy`; references to "zippy" in benchmark discussions mean that same
 program.
 Set `THREAD_CELLS` or `RUNS` to override the matrix. The Rust CLI uses the push
 API in `--test` mode; Criterion separately measures the paraseq-facing pull
@@ -260,3 +350,7 @@ This deliberately pathological fixture is a scheduling diagnostic rather than
 a throughput or release-parity corpus. High-thread measurements were noisy on
 the shared dual-Xeon host, but every run verified all one million trailers and
 the decoded digest matched GNU gzip.
+
+## Local fair-harness snapshot
+
+See [benchmarks/RESULTS-SNAPSHOT.md](benchmarks/RESULTS-SNAPSHOT.md) for a machine-local fair compare of release `rapidgzip-rust` vs C++ rapidgzip 0.15.2 on synthetic corpora (verify mode, median of 5 runs).

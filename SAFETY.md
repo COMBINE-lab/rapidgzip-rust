@@ -29,6 +29,11 @@ There is no unsafe public API and no manual `Send` or `Sync` implementation.
   raw-window mode and is never called concurrently with `inflate`.
 - `inflateEnd` runs exactly once for each successfully initialized stream.
 - `crc32_z` receives a live immutable byte slice and uses its exact length.
+- `compress_z` / `uncompress_z` (index window zlib helpers in
+  `index/mod.rs`, used for in-memory keep_index windows and gztool on-disk
+  window payloads) receive a live exclusive destination buffer sized to
+  `compressBound_z` or 32 KiB and a live immutable source slice; only the
+  backend-reported length is retained after success.
 
 The BGZF fast path reserves the footer-declared output size plus one byte,
 passes only that spare capacity to zlib-rs, checks `Z_STREAM_END`, exact input

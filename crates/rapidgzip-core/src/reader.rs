@@ -165,12 +165,16 @@ impl DecoderReader {
     pub fn finish(mut self) -> Result<DecodeReport, DecodeError> {
         self.current.clear();
         loop {
-            match &self.terminal {
-                Terminal::Finished(report) => return Ok(*report),
-                Terminal::Failed(error) => return Err(error.clone()),
-                Terminal::Open => self.receive(),
+            if matches!(self.terminal, Terminal::Open) {
+                self.receive();
+                self.current.clear();
+                continue;
             }
-            self.current.clear();
+            return match std::mem::replace(&mut self.terminal, Terminal::Open) {
+                Terminal::Finished(report) => Ok(report),
+                Terminal::Failed(error) => Err(error),
+                Terminal::Open => unreachable!("Open is handled above"),
+            };
         }
     }
 }

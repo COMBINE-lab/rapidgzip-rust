@@ -1,6 +1,6 @@
 [package]
 name = "rapidgzip-core"
-description = "Parallel, multi-member gzip decoder based on the rapidgzip marker/window algorithm"
+description = "Parallel multi-member gzip and sequential zlib decoder based on the rapidgzip marker/window algorithm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,12 +9,13 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 documentation = "https://docs.rs/rapidgzip-core"
-keywords = ["gzip", "deflate", "parallel", "bgzf", "fastq"]
+keywords = ["gzip", "zlib", "deflate", "parallel", "bgzf"]
 categories = ["compression", "filesystem"]
 
 [dependencies]
 crossbeam-deque.workspace = true
 libz-rs-sys.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 paraseq.workspace = true

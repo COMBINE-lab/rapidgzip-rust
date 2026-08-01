@@ -818,6 +818,7 @@ dependencies = [
  "libz-rs-sys",
  "paraseq",
  "proptest",
+ "tempfile",
 ]
 
 [[package]]
@@ -826,6 +827,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "rapidgzip-core",
+ "tempfile",
 ]
 
 [[package]]
