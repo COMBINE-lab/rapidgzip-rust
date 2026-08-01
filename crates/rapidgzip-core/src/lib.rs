@@ -151,6 +151,8 @@ mod gzip;
 mod indexed;
 mod inflate;
 mod inflate_backend;
+#[cfg(feature = "isal")]
+mod isal_backend;
 mod read_at;
 mod reader;
 mod runtime;

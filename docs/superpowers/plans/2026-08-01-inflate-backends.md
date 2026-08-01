@@ -19,7 +19,7 @@
   on `RawInflater`, with a comment saying why.
   Verify: full suite unchanged.
 
-- [ ] **3. ISA-L backend behind the `isal` feature**
+- [x] **3. ISA-L backend behind the `isal` feature**
   `isal_backend.rs` implementing the trait over `isal-sys`, feature off by
   default.
   Verify: `cargo test -p rapidgzip-core --features isal` locally against

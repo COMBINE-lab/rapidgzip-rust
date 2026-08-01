@@ -18,10 +18,13 @@ default = []
 # Requires a system `libisal` (`libisal-dev` on Debian and Ubuntu, `isa-l` on
 # Homebrew), or `ISAL_INSTALL_PREFIX` pointing at a prefix that contains it.
 # Default builds stay on zlib-rs.
-isal = []
+isal = ["dep:isal-sys"]
 
 [dependencies]
 crossbeam-deque.workspace = true
+# `use-system-isal` and `shared` keep the build from compiling ISA-L from
+# source, which would need autotools and an assembler.
+isal-sys = { workspace = true, optional = true }
 libz-rs-sys.workspace = true
 
 [dev-dependencies]
