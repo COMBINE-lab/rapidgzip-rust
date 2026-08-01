@@ -89,10 +89,12 @@ mod read_at;
 mod reader;
 mod runtime;
 
+pub mod index;
 pub mod parallel;
 
 pub use config::{ConfigError, Decoder, DecoderBuilder};
 pub use error::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind};
+pub use index::{Checkpoint, GzipIndex, IndexError, StoredWindow, WindowMap};
 pub use read_at::ReadAt;
 pub use reader::DecoderReader;
 pub use runtime::{DecoderHandle, DecoderPath, DecoderPressure, DecoderStats, WorkerLimitError};
