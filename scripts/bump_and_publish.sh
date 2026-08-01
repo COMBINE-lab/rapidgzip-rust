@@ -1,9 +1,24 @@
 #!/usr/bin/env bash
 # Prepare, validate, tag, and publish a rapidgzip-rust workspace release.
 #
+# Publishable crates (dependency order):
+#   1. rapidgzip-core
+#   2. rapidgzip-rust-cli  (depends on rapidgzip-core by version on crates.io)
+#
+# rapidgzip-bench has publish = false and is never uploaded.
+#
 # A dry run restores Cargo.toml and Cargo.lock before exiting. A real release
-# pushes its commit and tag before uploading the publishable workspace crates,
-# so the source referenced by crates.io is already available upstream.
+# pushes its commit and tag before uploading, so the source referenced by
+# crates.io is already available upstream.
+#
+# Dry-run packaging uses a single multi-package `cargo publish -p … -p …`
+# invocation so CLI verification can use the just-packaged core via Cargo's
+# temporary registry. Standalone `cargo package -p rapidgzip-rust-cli` fails
+# until that core version exists on crates.io (and would wrongly resolve the
+# incomplete 0.1.0 stub if the workspace were still at 0.1.0).
+#
+# Real publish uploads core first, waits until crates.io serves that version,
+# then publishes the CLI.
 
 set -euo pipefail
 
@@ -19,6 +34,13 @@ Options:
   --dry-run  Validate and package the release, then restore version files
   --yes      Skip the final interactive confirmation
   -h, --help Show this help
+
+Publish order (always):
+  rapidgzip-core, then rapidgzip-rust-cli
+
+Notes:
+  crates.io has an incomplete rapidgzip-core 0.1.0 stub. Ship 0.2.0+ so
+  dependents do not resolve that API. Do not treat 0.1.0 as the library contract.
 EOF
 }
 
@@ -178,6 +200,8 @@ if package_updates != 1 or dependency_updates != 1:
 
 path.write_text("".join(lines), encoding="utf-8")
 PY
+    # Path packages record their version in Cargo.lock; keep it aligned.
+    cargo update -p rapidgzip-core -p rapidgzip-rust-cli -p rapidgzip-bench
 fi
 
 if [[ "$version_changed" == true ]]; then
@@ -185,12 +209,25 @@ if [[ "$version_changed" == true ]]; then
 else
     echo "Preparing initial rapidgzip-rust v$version release"
 fi
+
 cargo check --workspace --locked
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
-cargo publish --workspace --dry-run --allow-dirty --locked
+
+# Multi-package dry-run: packages both crates, verifies core, then verifies the
+# CLI against the just-packaged core via Cargo's temporary registry. Prefer
+# explicit -p over --workspace so the publish set is obvious (bench is
+# publish=false and would be skipped either way).
+#
+# Standalone alternatives that are *not* a full CLI crates.io verify:
+#   cargo package -p rapidgzip-core --locked --allow-dirty
+#   cargo check -p rapidgzip-rust-cli --locked   # path dep only
+# Standalone `cargo package -p rapidgzip-rust-cli` fails until core@$VERSION
+# exists on crates.io.
+echo "Packaging/verifying publishable crates (core, then CLI)…"
+cargo publish -p rapidgzip-core -p rapidgzip-rust-cli --dry-run --allow-dirty --locked
 
 if [[ "$dry_run" == true ]]; then
     echo "Dry run for v$version passed; version files will be restored."
@@ -204,7 +241,8 @@ if [[ "$assume_yes" == false ]]; then
     else
         echo "The checks passed. This will tag the current commit as v$version, push it to origin,"
     fi
-    echo "and publish the workspace crates to crates.io."
+    echo "then publish rapidgzip-core@$version, wait for crates.io, and publish"
+    echo "rapidgzip-rust-cli@$version."
     read -r -p "Continue? [y/N] " reply
     if [[ ! "$reply" =~ ^[Yy]$ ]]; then
         echo "Release cancelled; restoring version files."
@@ -222,6 +260,63 @@ release_committed=true
 trap - ERR
 
 git push origin main "v$version"
-cargo publish --workspace --locked
 
-echo "Published rapidgzip-rust v$version."
+# Wait until crates.io serves a crate version (HTTP 200 on the version API).
+# Required so the subsequent CLI publish can resolve rapidgzip-core = "^$version"
+# from the registry after path deps are rewritten.
+wait_for_crate_version() {
+    local crate_name="$1"
+    local crate_version="$2"
+    local max_attempts="${3:-90}"
+    local sleep_secs="${4:-10}"
+    local url="https://crates.io/api/v1/crates/${crate_name}/${crate_version}"
+    local user_agent="rapidgzip-rust-bump-and-publish (https://github.com/COMBINE-lab/rapidgzip-rust)"
+    local attempt http_code
+
+    echo "Waiting for ${crate_name}@${crate_version} on crates.io…"
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        http_code=$(
+            curl -sS -A "$user_agent" -o /tmp/rapidgzip-crate-wait.json \
+                -w '%{http_code}' "$url" || echo "000"
+        )
+        if [[ "$http_code" == "200" ]]; then
+            echo "${crate_name}@${crate_version} is available on crates.io (attempt ${attempt})."
+            return 0
+        fi
+        echo "  attempt ${attempt}/${max_attempts}: HTTP ${http_code}; retrying in ${sleep_secs}s…"
+        sleep "$sleep_secs"
+    done
+    echo "error: timed out waiting for ${crate_name}@${crate_version} on crates.io" >&2
+    return 1
+}
+
+echo "Publishing rapidgzip-core@$version…"
+cargo publish -p rapidgzip-core --locked
+wait_for_crate_version rapidgzip-core "$version"
+
+# Cargo's crates.io *index* can lag the HTTP API slightly. Retry CLI publish
+# so packaging can resolve rapidgzip-core = "^$version" after path rewrite.
+echo "Publishing rapidgzip-rust-cli@$version…"
+cli_publish_attempts=30
+cli_publish_sleep=15
+cli_published=false
+for ((attempt = 1; attempt <= cli_publish_attempts; attempt++)); do
+    set +e
+    cargo publish -p rapidgzip-rust-cli --locked
+    cli_status=$?
+    set -e
+    if [[ "$cli_status" -eq 0 ]]; then
+        cli_published=true
+        break
+    fi
+    echo "CLI publish failed with exit ${cli_status} (attempt ${attempt}/${cli_publish_attempts})."
+    echo "Retrying in ${cli_publish_sleep}s in case the crates.io index is still catching up…"
+    sleep "$cli_publish_sleep"
+done
+if [[ "$cli_published" != true ]]; then
+    echo "error: failed to publish rapidgzip-rust-cli@$version after ${cli_publish_attempts} attempts" >&2
+    echo "note: rapidgzip-core@$version was already uploaded; publish the CLI manually once the index shows core." >&2
+    exit 1
+fi
+
+echo "Published rapidgzip-core and rapidgzip-rust-cli v$version."

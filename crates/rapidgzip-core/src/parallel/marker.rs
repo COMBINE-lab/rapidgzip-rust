@@ -105,6 +105,14 @@ impl MarkerBuffer {
         &self.symbols
     }
 
+    /// Consumes the buffer, returning the underlying symbol allocation.
+    ///
+    /// Used by estimated workers to recycle capacity after a failed attempt that
+    /// already packaged a [`MarkerBuffer`] into a chunk.
+    pub(crate) fn into_symbols(self) -> Vec<Symbol> {
+        self.symbols
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.symbols.len()
     }
@@ -127,30 +135,57 @@ impl MarkerBuffer {
     }
 
     /// Resolves marker references without re-decoding the chunk.
-    pub fn resolve(self, window: &Window) -> Result<Vec<u8>, MarkerError> {
-        if self.symbols.len() >= 128 * 1024 && window.0.len() == WINDOW_SIZE {
-            let output = resolve_lut(&self.symbols, window);
-            return Ok(output);
-        }
-        let mut output = vec![0_u8; self.len()];
-        #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("sse4.1") {
-            // SAFETY: runtime feature detection proves SSE4.1 availability.
-            // The function receives slices whose bounds it checks before every
-            // 128-bit load and 64-bit store.
-            unsafe { resolve_sse41(&self.symbols, &mut output, window)? };
-            return Ok(output);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            // SAFETY: Advanced SIMD is part of the baseline AArch64 ISA. The
-            // function bounds-checks each vector load/store through chunking.
-            unsafe { resolve_neon(&self.symbols, &mut output, window)? };
-            return Ok(output);
-        }
-        resolve_scalar(&self.symbols, &mut output, window)?;
-        Ok(output)
+    ///
+    /// On success returns the resolved bytes together with the emptied symbol
+    /// allocation (`symbols` cleared, capacity retained) so the resolving
+    /// worker can recycle it into a local scratch without a cross-thread
+    /// free-list.
+    pub fn resolve(self, window: &Window) -> Result<(Vec<u8>, Vec<Symbol>), MarkerError> {
+        let (result, symbols) = self.resolve_with_symbols(window);
+        result.map(|bytes| (bytes, symbols))
     }
+
+    /// Resolves markers and always returns the cleared symbol allocation.
+    ///
+    /// Used by estimated workers so both success and failure paths can recycle
+    /// capacity into a worker-local scratch without aliasing buffers still
+    /// owned by the resolve queue.
+    pub(crate) fn resolve_with_symbols(
+        self,
+        window: &Window,
+    ) -> (Result<Vec<u8>, MarkerError>, Vec<Symbol>) {
+        let MarkerBuffer { mut symbols } = self;
+        let result = resolve_into_bytes(&symbols, window);
+        // Clear content before recycling: scratch is `mem::take`n into the next
+        // decode and must not retain unresolved markers.
+        symbols.clear();
+        (result, symbols)
+    }
+}
+
+/// Resolves a symbol slice into a fresh byte buffer (does not consume `symbols`).
+fn resolve_into_bytes(symbols: &[Symbol], window: &Window) -> Result<Vec<u8>, MarkerError> {
+    if symbols.len() >= 128 * 1024 && window.0.len() == WINDOW_SIZE {
+        return Ok(resolve_lut(symbols, window));
+    }
+    let mut output = vec![0_u8; symbols.len()];
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        // SAFETY: runtime feature detection proves SSE4.1 availability.
+        // The function receives slices whose bounds it checks before every
+        // 128-bit load and 64-bit store.
+        unsafe { resolve_sse41(symbols, &mut output, window)? };
+        return Ok(output);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: Advanced SIMD is part of the baseline AArch64 ISA. The
+        // function bounds-checks each vector load/store through chunking.
+        unsafe { resolve_neon(symbols, &mut output, window)? };
+        return Ok(output);
+    }
+    resolve_scalar(symbols, &mut output, window)?;
+    Ok(output)
 }
 
 /// Resolves a large marker buffer through a branch-free 16-bit lookup table.
@@ -320,14 +355,19 @@ mod tests {
             Symbol::marker(0).unwrap(),
             Symbol::marker(32 * 1024 - 1).unwrap(),
         ]);
-        assert_eq!(buffer.resolve(&window).unwrap(), [b'x', 0, 255]);
+        let (resolved, emptied) = buffer.resolve(&window).unwrap();
+        assert_eq!(resolved, [b'x', 0, 255]);
+        assert!(emptied.is_empty());
+        assert!(emptied.capacity() >= 3);
     }
 
     #[test]
     fn partial_window_uses_newest_alignment() {
         let window = Window::new(vec![10, 11, 12]).unwrap();
         let buffer = MarkerBuffer::new(vec![Symbol::marker(32 * 1024 - 3).unwrap()]);
-        assert_eq!(buffer.resolve(&window).unwrap(), [10]);
+        let (resolved, emptied) = buffer.resolve(&window).unwrap();
+        assert_eq!(resolved, [10]);
+        assert!(emptied.is_empty());
     }
 
     #[test]
@@ -349,8 +389,11 @@ mod tests {
             .collect();
         let mut scalar = vec![0; symbols.len()];
         resolve_scalar(&symbols, &mut scalar, &window).unwrap();
-        let dispatched = MarkerBuffer::new(symbols).resolve(&window).unwrap();
+        let symbol_cap = symbols.capacity();
+        let (dispatched, emptied) = MarkerBuffer::new(symbols).resolve(&window).unwrap();
         assert_eq!(dispatched, scalar);
+        assert!(emptied.is_empty());
+        assert_eq!(emptied.capacity(), symbol_cap);
     }
 
     proptest! {
@@ -376,8 +419,9 @@ mod tests {
                 .collect();
             let mut scalar = vec![0; symbols.len()];
             resolve_scalar(&symbols, &mut scalar, &window).unwrap();
-            let dispatched = MarkerBuffer::new(symbols).resolve(&window).unwrap();
+            let (dispatched, emptied) = MarkerBuffer::new(symbols).resolve(&window).unwrap();
             prop_assert_eq!(dispatched, scalar);
+            prop_assert!(emptied.is_empty());
         }
     }
 }

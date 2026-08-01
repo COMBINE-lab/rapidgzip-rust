@@ -1,9 +1,7 @@
 //! End-to-end decoder and paraseq integration tests.
 
 use paraseq::{Record, fastq};
-use rapidgzip_core::{
-    DecodeError, Decoder, Format, GzipIndex, WindowCompression, ZlibErrorKind,
-};
+use rapidgzip_core::{DecodeError, Decoder, Format, GzipIndex, WindowCompression, ZlibErrorKind};
 use std::io::{self, Cursor, Read};
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -231,10 +229,7 @@ fn decode_read_matches_decode_on_single_member() {
     assert_eq!(from_read, from_readat);
     assert_eq!(report_read.member_count, report_at.member_count);
     assert_eq!(report_read.compressed_bytes, report_at.compressed_bytes);
-    assert_eq!(
-        report_read.decompressed_bytes,
-        report_at.decompressed_bytes
-    );
+    assert_eq!(report_read.decompressed_bytes, report_at.decompressed_bytes);
 }
 
 #[test]
@@ -298,7 +293,7 @@ fn decode_read_streams_gzip_multi_member_limited_reader() {
 
     let mut decoded = Vec::new();
     let report = Decoder::builder()
-        .decoder_threads(8) // still sequential on decode_read
+        .decoder_threads(8) // multi-thread: spill-to-temp then positional decode
         .build()
         .unwrap()
         .decode_read(
@@ -396,7 +391,10 @@ fn decode_read_large_synthetic_stream() {
     assert_eq!(from_stream, expected);
     assert_eq!(from_stream, from_decode);
     assert_eq!(report_stream.member_count, report_decode.member_count);
-    assert_eq!(report_stream.compressed_bytes, report_decode.compressed_bytes);
+    assert_eq!(
+        report_stream.compressed_bytes,
+        report_decode.compressed_bytes
+    );
     assert_eq!(
         report_stream.decompressed_bytes,
         report_decode.decompressed_bytes
@@ -881,7 +879,10 @@ fn keep_index_multi_member_empty_windows_at_boundaries() {
         .unwrap()
         .decode(&compressed, &mut decoded)
         .unwrap();
-    assert_eq!(decoded, [m1.as_slice(), m2.as_slice(), m3.as_slice()].concat());
+    assert_eq!(
+        decoded,
+        [m1.as_slice(), m2.as_slice(), m3.as_slice()].concat()
+    );
     let index = report.index.expect("index");
     index.validate().unwrap();
 
@@ -1266,6 +1267,215 @@ fn zlib_empty_payload() {
     assert_eq!(report.member_count, 1);
 }
 
+/// Large enough that default 1 MiB grid yields multiple estimated tasks.
+fn large_zlib_payload() -> Vec<u8> {
+    // ~2.5 MiB of non-trivial content (stored DEFLATE ≈ same compressed size).
+    let mut payload = Vec::with_capacity(2 * 1024 * 1024 + 256 * 1024);
+    for i in 0..(2 * 1024 * 1024 + 256 * 1024) {
+        payload.push(((i * 131) ^ (i >> 8)) as u8);
+    }
+    payload
+}
+
+#[test]
+fn parallel_zlib_matches_sequential_and_adler() {
+    let payload = large_zlib_payload();
+    let compressed = zlib_member(&payload);
+    // Two full grid cells of DEFLATE so the parallel path is selected.
+    assert!(compressed.len() >= 2 * 1024 * 1024 + 6);
+
+    let mut sequential = Vec::new();
+    let seq_report = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(1)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut sequential)
+        .unwrap();
+    assert_eq!(sequential, payload);
+    assert_eq!(seq_report.member_count, 1);
+
+    let mut parallel = Vec::new();
+    let par_report = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(4)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut parallel)
+        .unwrap();
+    assert_eq!(parallel, sequential);
+    assert_eq!(par_report.member_count, 1);
+    assert_eq!(par_report.compressed_bytes, compressed.len() as u64);
+    assert_eq!(par_report.decompressed_bytes, payload.len() as u64);
+    assert_eq!(par_report.decoder_threads, 4);
+}
+
+#[test]
+fn parallel_zlib_rejects_corrupt_adler() {
+    let payload = large_zlib_payload();
+    let compressed = with_corrupt_adler(zlib_member(&payload));
+    let mut decoded = Vec::new();
+    let error = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(4)
+        .crc32_enabled(true)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut decoded)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DecodeError::ChecksumMismatch { member: 0, .. }
+    ));
+}
+
+#[test]
+fn parallel_zlib_first_stream_then_multi_tail() {
+    // First stream large enough for single-stream marker parallel; remaining
+    // streams are decoded via multi-stream stream-granularity parallel (or
+    // sequential for a single tiny tail).
+    let head = large_zlib_payload();
+    let mut compressed = zlib_member(&head);
+    compressed.extend(zlib_member(b"concat-tail\n"));
+
+    let mut expected = head;
+    expected.extend_from_slice(b"concat-tail\n");
+
+    let mut sequential = Vec::new();
+    Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(1)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut sequential)
+        .unwrap();
+    assert_eq!(sequential, expected);
+
+    let mut parallel = Vec::new();
+    let report = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(8)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut parallel)
+        .unwrap();
+    assert_eq!(parallel, sequential);
+    assert_eq!(report.member_count, 2);
+}
+
+#[test]
+fn parallel_multi_stream_zlib_matches_sequential() {
+    // Several complete CMF/FLG…Adler frames: stream-granularity parallel path.
+    let mut compressed = zlib_member(b"stream-zero\n");
+    compressed.extend(zlib_member(b""));
+    compressed.extend(zlib_member(b"stream-two-payload-with-more-bytes\n"));
+    compressed.extend(zlib_member(b"stream-three\n"));
+    let expected = b"stream-zero\nstream-two-payload-with-more-bytes\nstream-three\n";
+
+    let mut sequential = Vec::new();
+    let seq_report = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(1)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut sequential)
+        .unwrap();
+    assert_eq!(sequential, expected);
+    assert_eq!(seq_report.member_count, 4);
+
+    let mut parallel = Vec::new();
+    let par_report = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(8)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut parallel)
+        .unwrap();
+    assert_eq!(parallel, sequential);
+    assert_eq!(par_report.member_count, 4);
+    assert_eq!(par_report.compressed_bytes, compressed.len() as u64);
+    assert_eq!(par_report.decompressed_bytes, expected.len() as u64);
+}
+
+#[test]
+fn parallel_multi_stream_zlib_empty_middle_stream() {
+    let mut compressed = zlib_member(b"before\n");
+    compressed.extend(zlib_member(b""));
+    compressed.extend(zlib_member(b"after\n"));
+
+    let mut sequential = Vec::new();
+    Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(1)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut sequential)
+        .unwrap();
+    assert_eq!(sequential, b"before\nafter\n");
+
+    let mut parallel = Vec::new();
+    let report = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(8)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut parallel)
+        .unwrap();
+    assert_eq!(parallel, sequential);
+    assert_eq!(report.member_count, 3);
+}
+
+#[test]
+fn parallel_multi_stream_zlib_corrupt_second_stream_adler() {
+    let mut compressed = zlib_member(b"first-ok\n");
+    compressed.extend(with_corrupt_adler(zlib_member(b"second-bad\n")));
+    compressed.extend(zlib_member(b"third-should-not-verify-as-success\n"));
+
+    let mut decoded = Vec::new();
+    let error = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(8)
+        .crc32_enabled(true)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut decoded)
+        .unwrap_err();
+    assert!(
+        matches!(error, DecodeError::ChecksumMismatch { member: 1, .. }),
+        "expected checksum error on stream index 1, got {error:?}"
+    );
+    // May have emitted a verified prefix of stream 0, but must not report success.
+    assert!(
+        decoded == b"first-ok\n" || decoded.is_empty() || decoded.starts_with(b"first-ok\n"),
+        "must not emit later streams as a verified full success; got {} bytes",
+        decoded.len()
+    );
+    // Specifically: full concatenation including stream 2 must never appear.
+    assert!(
+        !decoded
+            .windows(b"third-should-not-verify-as-success\n".len())
+            .any(|w| { w == b"third-should-not-verify-as-success\n" }),
+        "must not emit stream 2 payload after a stream-1 checksum failure"
+    );
+}
+
+#[test]
+fn small_zlib_stays_sequential_even_with_many_threads() {
+    // Below the 2×compressed_chunk_size amortization gate.
+    let payload = b"tiny zlib stream";
+    let compressed = zlib_member(payload);
+    let mut decoded = Vec::new();
+    let report = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(8)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut decoded)
+        .unwrap();
+    assert_eq!(decoded, payload);
+    assert_eq!(report.member_count, 1);
+}
+
 #[test]
 fn zlib_reader_and_decode_read() {
     let payload = b"reader path zlib";
@@ -1323,8 +1533,9 @@ fn zlib_trailing_garbage_errors() {
 }
 
 #[test]
-fn multi_thread_budget_still_decodes_zlib_sequentially() {
-    // Parallel budget must not break zlib (no parallel zlib path).
+fn multi_thread_budget_still_decodes_small_zlib() {
+    // Small zlib stays correct under a large thread budget (amortization gate
+    // keeps it sequential; parallel path is covered by parallel_zlib_* tests).
     let payload = b"parallel budget zlib payload with enough text to matter";
     let compressed = zlib_member(payload);
     let mut decoded = Vec::new();
@@ -1459,7 +1670,8 @@ fn raw_deflate_trailing_garbage_errors() {
 }
 
 #[test]
-fn multi_thread_budget_still_decodes_raw_deflate_sequentially() {
+fn multi_thread_budget_still_decodes_small_raw_deflate() {
+    // Below the 2×compressed_chunk_size amortization gate → sequential.
     let payload = b"parallel budget raw deflate payload with enough text to matter";
     let compressed = stored_deflate(payload);
     let mut decoded = Vec::new();
@@ -1472,6 +1684,104 @@ fn multi_thread_budget_still_decodes_raw_deflate_sequentially() {
         .unwrap();
     assert_eq!(decoded, payload);
     assert_eq!(report.member_count, 1);
+}
+
+/// Large enough that default 1 MiB grid yields multiple estimated tasks.
+fn large_raw_deflate_payload() -> Vec<u8> {
+    // ~2.5 MiB of non-trivial content (stored DEFLATE ≈ same compressed size).
+    large_zlib_payload()
+}
+
+#[test]
+fn parallel_raw_deflate_matches_sequential() {
+    let payload = large_raw_deflate_payload();
+    let compressed = stored_deflate(&payload);
+    // Two full grid cells so the parallel path is selected (no wrapper bytes).
+    assert!(compressed.len() >= 2 * 1024 * 1024);
+
+    let mut sequential = Vec::new();
+    let seq_report = Decoder::builder()
+        .format(Format::RawDeflate)
+        .decoder_threads(1)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut sequential)
+        .unwrap();
+    assert_eq!(sequential, payload);
+    assert_eq!(seq_report.member_count, 1);
+
+    let mut parallel = Vec::new();
+    let par_report = Decoder::builder()
+        .format(Format::RawDeflate)
+        .decoder_threads(4)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut parallel)
+        .unwrap();
+    assert_eq!(parallel, sequential);
+    assert_eq!(par_report.member_count, 1);
+    assert_eq!(par_report.compressed_bytes, compressed.len() as u64);
+    assert_eq!(par_report.decompressed_bytes, payload.len() as u64);
+    assert_eq!(par_report.decoder_threads, 4);
+}
+
+#[test]
+fn parallel_raw_deflate_external_crc32_ok_and_mismatch() {
+    let payload = large_raw_deflate_payload();
+    let compressed = stored_deflate(&payload);
+    let expected = crc32(&payload);
+
+    let mut decoded = Vec::new();
+    Decoder::builder()
+        .format(Format::RawDeflate)
+        .decoder_threads(4)
+        .raw_crc32_list(vec![expected])
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut decoded)
+        .unwrap();
+    assert_eq!(decoded, payload);
+
+    let error = Decoder::builder()
+        .format(Format::RawDeflate)
+        .decoder_threads(4)
+        .raw_crc32_list(vec![0xDEAD_BEEF])
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut Vec::new())
+        .unwrap_err();
+    match error {
+        DecodeError::ChecksumMismatch {
+            member: 0,
+            expected: 0xDEAD_BEEF,
+            actual,
+        } => {
+            assert_eq!(actual, expected);
+        }
+        other => panic!("expected ChecksumMismatch, got {other}"),
+    }
+}
+
+#[test]
+fn parallel_raw_deflate_trailing_garbage_errors() {
+    let payload = large_raw_deflate_payload();
+    let mut compressed = stored_deflate(&payload);
+    compressed.extend_from_slice(b"garbage");
+    let mut decoded = Vec::new();
+    let error = Decoder::builder()
+        .format(Format::RawDeflate)
+        .decoder_threads(4)
+        .build()
+        .unwrap()
+        .decode(&compressed, &mut decoded)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DecodeError::InvalidDeflate {
+            reason: rapidgzip_core::DeflateErrorKind::InvalidData,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -1688,12 +1998,115 @@ fn decode_read_multi_thread_matches_decode_on_multi_member_gzip() {
         .unwrap();
 
     assert_eq!(from_read, from_readat);
-    assert_eq!(from_read, b"first multi-member payload\nsecond multi-member payload\nthird\n");
+    assert_eq!(
+        from_read,
+        b"first multi-member payload\nsecond multi-member payload\nthird\n"
+    );
     assert_eq!(report_read.member_count, report_at.member_count);
     assert_eq!(report_read.member_count, 4);
     assert_eq!(report_read.compressed_bytes, report_at.compressed_bytes);
-    assert_eq!(
-        report_read.decompressed_bytes,
-        report_at.decompressed_bytes
-    );
+    assert_eq!(report_read.decompressed_bytes, report_at.decompressed_bytes);
+}
+
+#[test]
+fn decode_read_multi_thread_matches_decode_on_multi_stream_zlib() {
+    // Spill + positional multi-stream zlib parallel after decode_read.
+    let mut compressed = zlib_member(b"first multi-stream zlib\n");
+    compressed.extend(zlib_member(b""));
+    compressed.extend(zlib_member(b"second multi-stream zlib\n"));
+    compressed.extend(zlib_member(b"third\n"));
+    let expected = b"first multi-stream zlib\nsecond multi-stream zlib\nthird\n";
+
+    let decoder = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(4)
+        .build()
+        .unwrap();
+
+    let mut from_readat = Vec::new();
+    let report_at = decoder.decode(&compressed, &mut from_readat).unwrap();
+
+    let mut from_read = Vec::new();
+    let report_read = decoder
+        .decode_read(Cursor::new(compressed.as_slice()), &mut from_read)
+        .unwrap();
+
+    assert_eq!(from_read, from_readat);
+    assert_eq!(from_read, expected);
+    assert_eq!(report_read.member_count, report_at.member_count);
+    assert_eq!(report_read.member_count, 4);
+    assert_eq!(report_read.compressed_bytes, report_at.compressed_bytes);
+    assert_eq!(report_read.decompressed_bytes, report_at.decompressed_bytes);
+}
+
+#[test]
+fn decode_read_multi_thread_raw_matches_decode() {
+    // Spill path for raw: backend may still be sequential; bytes must match.
+    let payload = b"multi-thread raw deflate via decode_read spill";
+    let compressed = stored_deflate(payload);
+
+    let decoder = Decoder::builder()
+        .format(Format::RawDeflate)
+        .decoder_threads(4)
+        .build()
+        .unwrap();
+
+    let mut from_readat = Vec::new();
+    let report_at = decoder.decode(&compressed, &mut from_readat).unwrap();
+
+    let mut from_read = Vec::new();
+    let report_read = decoder
+        .decode_read(Cursor::new(compressed.as_slice()), &mut from_read)
+        .unwrap();
+
+    assert_eq!(from_read, from_readat);
+    assert_eq!(from_read, payload);
+    assert_eq!(report_read.member_count, 1);
+    assert_eq!(report_read.member_count, report_at.member_count);
+    assert_eq!(report_read.compressed_bytes, report_at.compressed_bytes);
+    assert_eq!(report_read.decompressed_bytes, report_at.decompressed_bytes);
+}
+
+#[test]
+fn decode_read_single_thread_zlib_and_raw_still_stream() {
+    // Threads == 1: no spill required; pure streaming decode_read.
+    let zlib_payload = b"single-thread zlib stream path";
+    let zlib = zlib_member(zlib_payload);
+    let mut decoded = Vec::new();
+    let report = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(1)
+        .build()
+        .unwrap()
+        .decode_read(
+            LimitedReader {
+                data: &zlib,
+                pos: 0,
+                max_per_read: 2,
+            },
+            &mut decoded,
+        )
+        .unwrap();
+    assert_eq!(decoded, zlib_payload);
+    assert_eq!(report.member_count, 1);
+
+    let raw_payload = b"single-thread raw stream path";
+    let raw = stored_deflate(raw_payload);
+    let mut decoded = Vec::new();
+    let report = Decoder::builder()
+        .format(Format::RawDeflate)
+        .decoder_threads(1)
+        .build()
+        .unwrap()
+        .decode_read(
+            LimitedReader {
+                data: &raw,
+                pos: 0,
+                max_per_read: 1,
+            },
+            &mut decoded,
+        )
+        .unwrap();
+    assert_eq!(decoded, raw_payload);
+    assert_eq!(report.member_count, 1);
 }

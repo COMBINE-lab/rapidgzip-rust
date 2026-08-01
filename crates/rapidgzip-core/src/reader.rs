@@ -1,4 +1,5 @@
 use crate::backend::{Output, decode_source};
+use crate::buffer_pool::ByteBufferFreeList;
 use crate::config::Config;
 use crate::{DecodeError, DecodeReport, ReadAt};
 use std::io::{self, IoSliceMut, Read};
@@ -17,6 +18,10 @@ enum Message {
 struct ChannelOutput {
     sender: SyncSender<Message>,
     cancelled: Arc<AtomicBool>,
+    /// Reader-local free list: consumer recycles fully-read chunks; this sink
+    /// steals empty capacity for `emit_reusable` returns so sequential emit
+    /// loops can reuse buffers without cold-allocating.
+    free_list: Arc<ByteBufferFreeList>,
 }
 
 impl ChannelOutput {
@@ -40,6 +45,15 @@ impl ChannelOutput {
 impl Output for ChannelOutput {
     fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError> {
         self.send(Message::Data(chunk))
+    }
+
+    fn emit_reusable(&mut self, chunk: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
+        // Ownership of the payload moves to the reader via the channel. Return
+        // a *different* free-list buffer (if any) so the coordinator can reuse
+        // capacity for the next fill. The sent buffer is recycled when the
+        // consumer finishes reading that chunk (`DecoderReader::recycle_current`).
+        self.send(Message::Data(chunk))?;
+        Ok(self.free_list.try_steal().unwrap_or_default())
     }
 }
 
@@ -66,6 +80,11 @@ pub struct DecoderReader {
     current: Vec<u8>,
     current_offset: usize,
     terminal: Terminal,
+    /// Soft-capped pool of empty channel-chunk buffers. Shared with the
+    /// background `ChannelOutput` so `emit_reusable` can steal capacity that
+    /// this reader recycles after fully consuming a chunk. Separate from the
+    /// estimated-path free list inside `decode_rapidgzip_estimated`.
+    free_list: Arc<ByteBufferFreeList>,
 }
 
 pub(crate) fn spawn<R>(source: R, config: Config) -> Result<DecoderReader, DecodeError>
@@ -75,12 +94,20 @@ where
     let (sender, receiver) = mpsc::sync_channel(config.in_flight_chunks);
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
+    // Soft-cap near channel depth: enough headroom for in-flight messages plus
+    // the chunk currently being read / one extra emit_reusable steal without
+    // unbounded RSS growth if the consumer is slow.
+    let free_list = Arc::new(ByteBufferFreeList::new(
+        config.in_flight_chunks.saturating_mul(2),
+    ));
+    let worker_free_list = Arc::clone(&free_list);
     let worker = thread::Builder::new()
         .name("rapidgzip-coordinator".to_owned())
         .spawn(move || {
             let mut output = ChannelOutput {
                 sender,
                 cancelled: Arc::clone(&worker_cancelled),
+                free_list: worker_free_list,
             };
             let terminal = match decode_source(&source, &config, &worker_cancelled, &mut output) {
                 Ok(report) => Message::Finished(report),
@@ -98,6 +125,7 @@ where
         current: Vec::new(),
         current_offset: 0,
         terminal: Terminal::Open,
+        free_list,
     })
 }
 
@@ -110,6 +138,13 @@ impl DecoderReader {
             Terminal::Finished(report) => Some(report),
             Terminal::Open | Terminal::Failed(_) => None,
         }
+    }
+
+    /// Recycle fully-consumed (or discarded) `current` capacity into the
+    /// reader free list and reset the read cursor.
+    fn recycle_current(&mut self) {
+        self.free_list.recycle(std::mem::take(&mut self.current));
+        self.current_offset = 0;
     }
 
     fn join_worker(&mut self) -> Result<(), DecodeError> {
@@ -163,11 +198,13 @@ impl DecoderReader {
     ///
     /// Returns the first decoding, verification, input, or worker failure.
     pub fn finish(mut self) -> Result<DecodeReport, DecodeError> {
-        self.current.clear();
+        self.recycle_current();
         loop {
             if matches!(self.terminal, Terminal::Open) {
                 self.receive();
-                self.current.clear();
+                // Discard unread payload but retain capacity in the free list
+                // so a concurrent emit_reusable can still steal.
+                self.recycle_current();
                 continue;
             }
             return match std::mem::replace(&mut self.terminal, Terminal::Open) {
@@ -195,8 +232,7 @@ impl Read for DecoderReader {
                 );
                 self.current_offset += count;
                 if self.current_offset == self.current.len() {
-                    self.current.clear();
-                    self.current_offset = 0;
+                    self.recycle_current();
                 }
                 return Ok(count);
             }
@@ -242,12 +278,31 @@ impl Drop for DecoderReader {
 #[cfg(test)]
 mod tests {
     use super::DecoderReader;
+    use crate::buffer_pool::ByteBufferFreeList;
     use std::io::Read;
+    use std::sync::Arc;
 
     fn assert_traits<T: Read + Send + Unpin>() {}
 
     #[test]
     fn decoder_reader_is_read_send_and_unpin() {
         assert_traits::<DecoderReader>();
+    }
+
+    #[test]
+    fn free_list_recycle_after_consume_is_stealable() {
+        // Mirrors the DecoderReader / ChannelOutput hand-off without spinning
+        // up a full coordinator: recycle a finished chunk, then steal it as
+        // emit_reusable would.
+        let free_list = Arc::new(ByteBufferFreeList::new(4));
+        let mut current = Vec::with_capacity(4096);
+        current.extend_from_slice(&[0u8; 100]);
+        free_list.recycle(std::mem::take(&mut current));
+        assert_eq!(free_list.len(), 1);
+
+        let stolen = free_list.try_steal().expect("recycled buffer available");
+        assert!(stolen.is_empty());
+        assert!(stolen.capacity() >= 4096);
+        assert_eq!(free_list.len(), 0);
     }
 }

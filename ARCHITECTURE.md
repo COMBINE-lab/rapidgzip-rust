@@ -8,14 +8,31 @@ the prefix (or an explicit `DecoderBuilder::format`), then routes the payload.
 Auto never selects raw DEFLATE (no magic). Non-seekable `Read` sources
 (`Decoder::decode_read`, CLI stdin decompress) use a buffered pull reader:
 
-- **Sequential** when `decoder_threads == 1` or the resolved format is zlib /
-  raw DEFLATE: gzip/zlib/raw inflate only; no parallel workers and no
-  full-archive buffer (O(input page) compressed-side memory).
-- **Parallel gzip** when `decoder_threads > 1` and the format resolves to gzip
-  (explicit Gzip or Auto after prefix peek): the stream is spilled to a private
-  temporary file (secure temp-dir defaults; deleted on drop), then the usual
-  positional parallel path below runs on that file. Peak cost is compressed size
-  on disk plus the decoder working set.
+- **Sequential streaming** when `decoder_threads == 1`: zlib-rs inflate only; no
+  parallel workers and no full-archive buffer (O(input page) compressed-side
+  memory). Applies to gzip, zlib, and raw DEFLATE.
+- **Spill + positional backend** when `decoder_threads > 1` on non-seekable
+  `decode_read` (any resolved format: gzip, zlib, or raw DEFLATE): the stream is
+  spilled to a private temporary file (secure temp-dir defaults; deleted on
+  drop), then the usual positional path below runs on that file. Peak cost is
+  compressed size on disk plus the decoder working set. After spill, gzip, zlib,
+  and raw DEFLATE use the same parallel gates as file/`ReadAt` input.
+- **Parallel multi-stream zlib** on positional `ReadAt` (including after spill)
+  when `decoder_threads > 1` and the input is ≥2 concatenated independent
+  CMF/FLG…Adler frames: two-pass discard-index of stream boundaries, then ordered
+  worker re-decode with zlib-rs (stream granularity). Skipped when a large single
+  stream will take the marker path (avoids a full discard re-inflate of solitary
+  long streams).
+- **Parallel single-stream zlib** on positional `ReadAt` (including after spill)
+  when `decoder_threads >= 4` and the compressed length is at least about two grid
+  cells (`2 × compressed_chunk_size` plus header/trailer): same estimated
+  marker/window path as ordinary gzip, with Adler-32 trailer checks. Concatenated
+  streams after the first are multi-stream-parallel when ≥1 remain (else
+  sequential).
+- **Parallel single-stream raw DEFLATE** on positional `ReadAt` (including after
+  spill) when `decoder_threads >= 4` and compressed length is at least about two
+  grid cells (`2 × compressed_chunk_size`; no wrapper bytes): same estimated
+  marker/window path; leftover compressed bytes after stream end are an error.
 
 CLI paths that need a known length / `ReadAt` on stdin (`--analyze`,
 `--import-index`, `--ranges`) likewise spill stdin to a tempfile rather than
@@ -23,14 +40,59 @@ holding the full archive only in RAM.
 
 Positional routes after format resolution:
 
-0. **zlib wrapper** (sequential only): parse CMF/FLG, raw-inflate with zlib-rs,
-   verify the big-endian Adler-32 trailer (gated by `crc32_enabled`). Supports
-   concatenated zlib streams. No marker/window parallel path and no seek index.
-0b. **raw DEFLATE** (RFC 1951, sequential only, explicit `Format::RawDeflate`):
-   zlib-rs raw inflate (`windowBits = -15`) from offset 0 to `Z_STREAM_END`;
-   leftover compressed bytes are an error. No integrity trailer and no index.
+0. **zlib wrapper**: parse CMF/FLG, raw-inflate, verify the big-endian Adler-32
+   trailer (gated by `crc32_enabled`). Supports concatenated zlib streams.
+   Routing when `decoder_threads > 1`: (a) multi-stream stream-granularity
+   parallel if a discard index finds ≥2 frames (unless a large single stream is
+   preferred for the marker path); (b) single long streams use the estimated
+   marker/window path when `decoder_threads >= 4` and size amortizes the grid;
+   (c) multi-stream tails after a parallel first stream use stream-granularity
+   parallel (or sequential for a single remainder); else sequential zlib-rs.
+0b. **raw DEFLATE** (RFC 1951, explicit `Format::RawDeflate` only; Auto never
+   selects it): single long streams use the estimated marker/window path when
+   `decoder_threads >= 4` and size amortizes ~2× the compressed grid; otherwise
+   sequential zlib-rs raw inflate (`windowBits = -15`) from offset 0 to
+   `Z_STREAM_END`. Leftover compressed bytes are an error. No container integrity
+   trailer and no random-access index (`keep_index` rejected at build time);
+   optional whole-stream CRC via `raw_crc32_list`.
 1. Standard zlib-rs raw inflate is the authoritative gzip fallback and the
-   single-thread gzip path.
+   single-thread gzip path. Paths that go through the crate-private
+   `InflateBackend` trait (generic, monomorphized to zlib-rs `RawInflater`
+   today — see `inflate_backend.rs` and the commented `isal` feature stub;
+   **no real ISA-L second backend is wired**):
+   - sequential positional multi-member gzip, sequential zlib, sequential raw
+     DEFLATE, and streaming gzip/zlib/raw via `stream_decode` (`create` /
+     `reset` / trait `inflate`);
+   - structure analysis (`Decoder::analyze` / CLI `--analyze`) with
+     `InflateFlush::Block` (block spans + `last_block`);
+   - parallel BGZF one-shot block inflate via trait `inflate`
+     (`InflateFlush::Finish`);
+   - parallel independent-member workers: trait `create`/`reset`/
+     `inflate_capped` so the per-member output budget cannot overshoot spare
+     capacity (no raw `stream.avail_out` at the call site);
+   - multi-stream zlib index discard-inflate and parallel zlib stream workers
+     via trait `create`/`reset`/`inflate`/`inflate_capped`;
+   - mid-stream bit resume first-class on the trait (`prime`,
+     `set_dictionary`, default `install_bit_resume` /
+     `prepare_at_bit_offset`): estimated-path setup uses trait
+     `prime`/`set_dictionary`, and source-backed seeks /
+     `inflate_from_block` build streams via
+     `InflateBackend::prepare_at_bit_offset` (zlib-rs `RawInflater` inherent
+     helpers still own ReadAt/header skip);
+   - estimated-path residual continue (`inflate_from_block`) and
+     `inflate_tail` via trait `inflate_capped` (`NoFlush` / `Block`;
+     block-end bit state from `InflateStep`);
+   - seek sessions and indexed segment decode via trait
+     `inflate_into_slice` (fixed caller `out` slices; member restarts use
+     trait `create`/`set_dictionary`).
+
+   All sequential/block inflate call sites go through `InflateBackend`
+   (monomorphized to `RawInflater`). Raw `z::inflate` lives **only** in the
+   trait implementor in `inflate_backend.rs`; zlib lifecycle
+   (`inflateInit2_` / `Reset` / `Prime` / `SetDictionary` / `End`) lives in
+   `RawInflater` inherent methods. **No real ISA-L second backend is wired** —
+   that is the remaining architectural inflate gap, not further call-site
+   migration.
 2. A fully stored gzip stream is indexed from its exact block headers and
    copied by ordered worker tasks.
 3. A consistently formed BGZF stream is indexed from `BC/BSIZE` and its
@@ -129,7 +191,9 @@ FASTQ members from losing parallelism or inflating result-buffer residency.
 
 CRC32 and modulo-2^32 ISIZE are tracked and checked per member. History resets
 to empty after every footer. Empty members, concatenated gzip, and BGZF EOF
-members therefore use the same semantics.
+members therefore use the same semantics. Sequential multi-member gzip and
+zlib paths (positional and streaming) reuse one raw-inflate stream across
+members via `inflateReset`, which clears window history at each boundary.
 
 The BGZF route is selected only when every declared `BSIZE` leads exactly to
 another `BC` header or EOF. Mixed BGZF/plain streams and gzip members with an
@@ -164,9 +228,17 @@ Each candidate uses the median of three intervals. Work carries a controller
 generation, and completions begun under an earlier limit do not inflate the new
 candidate's byte count. The search probes downward first, preferring a lower
 setting within a 3% noise margin, or climbs in quarter-bootstrap steps while
-throughput materially improves. Its empirical search extent is at most twice
+throughput improves by more than 5% (stricter than the down-probe tolerance so
+noise does not keep adding ranks). Its empirical search extent is at most 1.5×
 the bootstrap and never exceeds the configured budget. This bounds calibration
 and speculative-memory exposure without a compiled-in worker cap.
+
+Ordinary single-member gzip **and** large single-stream zlib enter the
+estimated/marker pipeline only when the requested budget is at least four
+workers; at two or three threads sequential zlib-rs is faster end-to-end
+(measured). Zlib also requires enough compressed bytes for at least two grid
+cells (see zlib route above). BGZF, stored-block, and independent multi-member
+gzip paths still parallelize for any budget greater than one.
 
 The active limit also controls the decode/resolve scheduling horizon because
 each speculative result commonly owns several MiB of `u16` symbols. Workers
@@ -183,25 +255,34 @@ At each ordinary gzip member transition, the coordinator resets
 history/accounting and decodes an exact bridge from the new header to the first
 later file-wide grid point; already-running tasks beyond that point remain
 useful. Results and resolved buffers are reordered by ordinal before being
-committed. No speculative worker calls the user's output object.
+committed. No speculative worker calls the user's output object. After a
+successful resolve+emit, empty `Vec<u8>` capacity (marked resolved bytes,
+clean, backend tail) is returned to a soft-capped free-list
+(`2 × worker_count`) so workers can reuse it for the next task's clean/tail
+scratch. After resolve on an estimated worker, emptied `Vec<Symbol>` capacity
+is recycled into that worker's `marked_scratch` (resolve clears symbols and
+returns the allocation; never while the buffer is still on the resolve queue).
 
 Input is paged with positional reads. Speculative output is capped per task;
 oversized regions continue through zlib-rs instead. `DecoderReader` adds at most
 the configured in-flight chunk count plus its currently partially consumed
-chunk. Dropping it closes the consumer edge, sets cancellation, and joins the
-coordinator.
+chunk, and shares a soft-capped reader-local free-list (`2 × in_flight_chunks`,
+`buffer_pool::ByteBufferFreeList`) with `ChannelOutput`: fully-consumed channel
+chunks are recycled so `emit_reusable` can return capacity for the next fill.
+That pool is separate from the estimated-path free-list. Dropping the reader
+closes the consumer edge, sets cancellation, and joins the coordinator.
 
 ## Structure analysis
 
-`Decoder::analyze` (CLI `--analyze`) walks the archive sequentially with raw
-inflate and `Z_BLOCK`. Format follows `DecoderBuilder::format` (default
-auto-detect): gzip/BGZF, zlib (RFC 1950), or explicit raw DEFLATE (RFC 1951).
-It reports per-member (or per stream) compressed ranges, uncompressed sizes,
-footer check status, and per-block type (stored/fixed/dynamic), final bit, and
-bit spans. For zlib it also records CMF/FLG and Adler-32 status
-(`crc32_enabled` gates Adler the same way as gzip CRC). Concatenated zlib
-streams appear as separate members. No payload is emitted and no index is
-required.
+`Decoder::analyze` (CLI `--analyze`) walks the archive sequentially via
+`InflateBackend` with `InflateFlush::Block` (monomorphized to `RawInflater`).
+Format follows `DecoderBuilder::format` (default auto-detect): gzip/BGZF, zlib
+(RFC 1950), or explicit raw DEFLATE (RFC 1951). It reports per-member (or per
+stream) compressed ranges, uncompressed sizes, footer check status, and
+per-block type (stored/fixed/dynamic), final bit, and bit spans. For zlib it
+also records CMF/FLG and Adler-32 status (`crc32_enabled` gates Adler the same
+way as gzip CRC). Concatenated zlib streams appear as separate members. No
+payload is emitted and no index is required.
 
 Raw DEFLATE (`Format::RawDeflate`, never auto-selected) walks a single stream
 from bit 0 to `Z_STREAM_END`, reports `ArchiveKind::RawDeflate` with

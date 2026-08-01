@@ -21,7 +21,13 @@ jobs:
       - run: cmp LICENSE-MIT crates/rapidgzip-rust-cli/LICENSE-MIT
       - run: cmp LICENSE-BSD-3-CLAUSE crates/rapidgzip-core/LICENSE-BSD-3-CLAUSE
       - run: cmp LICENSE-BSD-3-CLAUSE crates/rapidgzip-rust-cli/LICENSE-BSD-3-CLAUSE
-      - run: cargo package --workspace --locked
+      # Verify the publishable core tarball builds in isolation.
+      - run: cargo package -p rapidgzip-core --locked
+      # CLI depends on rapidgzip-core via a path dep in this workspace; that always
+      # checks cleanly. Full `cargo package -p rapidgzip-rust-cli` verification
+      # pulls core from crates.io at the same version and only succeeds after that
+      # core release is published (or when packaging both together at release time).
+      - run: cargo check -p rapidgzip-rust-cli --locked
 
   test:
     strategy:

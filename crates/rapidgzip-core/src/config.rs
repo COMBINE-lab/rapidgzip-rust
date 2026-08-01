@@ -335,7 +335,6 @@ impl DecoderBuilder {
         self
     }
 
-
     /// Sets the maximum number of decoded windows kept by [`IndexedReader`].
     ///
     /// Zero disables the seek cache and the expanded zlib index-window cache.
@@ -418,9 +417,7 @@ impl DecoderBuilder {
             ));
         }
         if self.config.keep_index && matches!(self.config.format, Format::RawDeflate) {
-            return Err(ConfigError(
-                "index not supported for raw deflate",
-            ));
+            return Err(ConfigError("index not supported for raw deflate"));
         }
         Ok(Decoder {
             config: self.config,
@@ -444,10 +441,15 @@ impl Decoder {
     ///
     /// The writer is used only by the calling thread and need not implement
     /// [`Send`]. With the default [`Format::Auto`], the stream is detected as
-    /// gzip or zlib from its header; zlib is decoded sequentially (no parallel
-    /// marker path, no random-access index). Raw DEFLATE requires an explicit
-    /// [`Format::RawDeflate`] and is always sequential; it has no on-stream
-    /// integrity trailer unless [`DecoderBuilder::raw_crc32_list`] is set.
+    /// gzip or zlib from its header. Concatenated multi-stream zlib uses
+    /// stream-granularity parallel zlib-rs when `decoder_threads > 1`. Long
+    /// single zlib streams use the same estimated marker path as ordinary gzip
+    /// when `decoder_threads >= 4` and the compressed size amortizes the grid;
+    /// smaller single streams stay sequential. Raw DEFLATE requires an explicit
+    /// [`Format::RawDeflate`]; long streams use the same estimated marker path
+    /// when `decoder_threads >= 4` and compressed size amortizes the grid.
+    /// Raw has no on-stream integrity trailer unless
+    /// [`DecoderBuilder::raw_crc32_list`] is set.
     ///
     /// The compressed source must keep its length and contents stable for the
     /// duration of this call. On error, `output` can contain a verified prefix;
@@ -506,27 +508,30 @@ impl Decoder {
 
     /// Decodes gzip, zlib, or raw DEFLATE from a streaming [`Read`] (stdin, sockets, pipes).
     ///
-    /// Always sequential: pulls compressed bytes as needed without buffering
-    /// the full archive. Prefer [`Decoder::decode`] / [`Decoder::open`] on
-    /// files when you want the parallel gzip paths.
+    /// When `decoder_threads == 1`, pulls compressed bytes page-at-a-time without
+    /// buffering the full archive. When `decoder_threads > 1`, spills the stream
+    /// to a private temporary file and runs the positional backend (parallel
+    /// gzip / multi-stream or marker zlib / marker raw DEFLATE when each
+    /// format’s thread and size gates allow). Prefer [`Decoder::decode`] /
+    /// [`Decoder::open`] on files when you already have positional input and
+    /// want to avoid the spill.
     ///
     /// # Memory
     ///
-    /// Peak compressed-side memory is a small input page (see
-    /// [`DecoderBuilder::input_page_size`]) plus inflate working set and any
-    /// index/window state — not the full archive.
+    /// - **Single-thread**: peak compressed-side memory is a small input page
+    ///   (see [`DecoderBuilder::input_page_size`]) plus inflate working set and
+    ///   any index/window state — not the full archive.
+    /// - **Multi-thread**: compressed size **on disk** (private tempfile) plus
+    ///   the usual decoder working set — not a second full RAM copy.
     ///
     /// # Errors
     ///
-    /// Returns [`DecodeError::Io`] when reading from `reader` fails. Framing,
-    /// truncate, checksum, and deflate errors match the sequential paths used
-    /// by [`Decoder::decode`]. With [`DecoderBuilder::keep_index`] enabled, a
-    /// successful report may include a [`crate::GzipIndex`].
-    pub fn decode_read<R, W>(
-        &self,
-        reader: R,
-        output: &mut W,
-    ) -> Result<DecodeReport, DecodeError>
+    /// Returns [`DecodeError::Io`] when reading from `reader` or writing the
+    /// spill tempfile fails. Framing, truncate, checksum, and deflate errors
+    /// match the paths used by [`Decoder::decode`]. With
+    /// [`DecoderBuilder::keep_index`] enabled, a successful report may include a
+    /// [`crate::GzipIndex`].
+    pub fn decode_read<R, W>(&self, reader: R, output: &mut W) -> Result<DecodeReport, DecodeError>
     where
         R: Read,
         W: Write,
@@ -573,10 +578,7 @@ impl Decoder {
     /// Returns framing, DEFLATE, checksum, or I/O errors when the archive is
     /// truncated or corrupt. Successful return means every member footer was
     /// checked under the configured verification settings.
-    pub fn analyze<R: ReadAt + ?Sized>(
-        &self,
-        source: &R,
-    ) -> Result<ArchiveAnalysis, DecodeError> {
+    pub fn analyze<R: ReadAt + ?Sized>(&self, source: &R) -> Result<ArchiveAnalysis, DecodeError> {
         analyze::analyze_source_with_format(
             source,
             self.config.input_page_size,

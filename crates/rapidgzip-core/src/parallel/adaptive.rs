@@ -8,7 +8,13 @@
 
 use std::time::Instant;
 
+/// Relative tolerance used when deciding a lower concurrency is "close enough"
+/// to the peak rate (prefer lower → less memory / futex pressure).
 const RATE_TOLERANCE: f64 = 0.03;
+/// Minimum relative improvement required before an upward probe is accepted.
+/// Stricter than [`RATE_TOLERANCE`] so measurement noise does not keep climbing
+/// worker ranks after throughput has plateaued.
+const UP_RATE_IMPROVEMENT: f64 = 0.05;
 const SAMPLES_PER_CANDIDATE: usize = 3;
 const MINIMUM_CALIBRATION_WAVES: usize = 16;
 
@@ -26,9 +32,13 @@ enum Phase {
 /// visible processor count.  That grows with the machine without immediately
 /// multiplying speculative memory by every processor.  Calibration first
 /// checks lower nearby settings, then searches upward in larger increments if
-/// the lower probe loses.  A lower setting within the noise tolerance is
-/// preferred because it reduces memory pressure without a material throughput
-/// loss.
+/// the lower probe loses.  Upward search is capped at roughly 1.5× the
+/// bootstrap (not 2×) so mid-size work on large machines does not spin up a
+/// full worker pool that RSS and contention never repay.  An upward candidate
+/// must beat the peak by more than [`UP_RATE_IMPROVEMENT`] (5%); the first
+/// non-improving median finishes calibration at the best limit seen so far.
+/// A lower setting within the noise tolerance is preferred because it reduces
+/// memory pressure without a material throughput loss.
 #[derive(Debug)]
 pub(crate) struct AdaptiveConcurrency {
     maximum: usize,
@@ -177,7 +187,10 @@ impl AdaptiveConcurrency {
                 }
             }
             Phase::Up => {
-                if rate > self.peak_rate * (1.0 + RATE_TOLERANCE) {
+                // Require a clear win before climbing further. Flat or noisy
+                // rates finish immediately at the previous peak so the pool
+                // does not keep growing ranks that only cost RSS and futexes.
+                if rate > self.peak_rate * (1.0 + UP_RATE_IMPROVEMENT) {
                     self.peak_rate = rate;
                     self.best_limit = self.current;
                     let higher = self.current.saturating_add(self.up_step).min(self.maximum);
@@ -272,7 +285,10 @@ fn controller_limits(
         .min(maximum);
     let down_step = (initial / 8).max(1);
     let up_step = (initial / 4).max(1);
-    let search_maximum = initial.saturating_mul(2).min(maximum);
+    // Cap upward search at 1.5× the bootstrap. A 2× window on large machines
+    // routinely overshoots the throughput plateau (often near the bootstrap)
+    // and pays permanent speculative-buffer RSS for flat thrpt.
+    let search_maximum = initial.saturating_add(initial / 2).min(maximum);
     // Each candidate needs several waves of independent tasks to get beyond
     // startup and transition costs. On shorter streams, probing consumes a
     // material fraction of the entire decode, so the machine-derived bootstrap
@@ -308,18 +324,23 @@ mod tests {
 
     #[test]
     fn machine_wide_pool_is_sublinear_and_bidirectional() {
+        // initial ≈ 2·√visible (via √(4·visible)); search_maximum = 1.5× initial.
         assert_eq!(
             controller_limits(64, 88, usize::MAX),
             ControllerLimits {
                 initial: 19,
-                maximum: 38,
+                maximum: 28, // 19 + 19/2
                 down_step: 2,
                 up_step: 4,
                 calibrate: true,
             }
         );
-        assert_eq!(controller_limits(64, 64, usize::MAX).initial, 16);
-        assert_eq!(controller_limits(44, 44, usize::MAX).initial, 14);
+        let on_64 = controller_limits(64, 64, usize::MAX);
+        assert_eq!(on_64.initial, 16);
+        assert_eq!(on_64.maximum, 24); // 16 + 16/2
+        let on_44 = controller_limits(44, 44, usize::MAX);
+        assert_eq!(on_44.initial, 14);
+        assert_eq!(on_44.maximum, 21); // 14 + 14/2
         assert_eq!(controller_limits(64, 8, usize::MAX).initial, 8);
     }
 
@@ -358,18 +379,58 @@ mod tests {
 
     #[test]
     fn searches_up_until_a_candidate_stops_improving() {
+        // 81 visible → initial 18, search_maximum 27 (18 + 9), up_step 4.
         let mut cursor = Instant::now();
         let mut controller = AdaptiveConcurrency::new(64, 81, SAMPLE_BYTES, usize::MAX);
+        assert_eq!(controller.worker_pool_limit(), 27);
         assert!(feed_rate(&mut controller, &mut cursor, 1_000));
         assert_eq!(controller.current_limit(), 16);
         assert!(feed_rate(&mut controller, &mut cursor, 900));
         assert_eq!(controller.current_limit(), 22);
+        // 1100 > 1000 · 1.05 → accept and climb.
         assert!(feed_rate(&mut controller, &mut cursor, 1_100));
         assert_eq!(controller.current_limit(), 26);
+        // 1180 > 1100 · 1.05 → accept; next step clamps at search_maximum 27.
         assert!(feed_rate(&mut controller, &mut cursor, 1_180));
-        assert_eq!(controller.current_limit(), 30);
+        assert_eq!(controller.current_limit(), 27);
+        // Flat / slightly worse → finish at best (26), not stay at ceiling.
         assert!(feed_rate(&mut controller, &mut cursor, 1_170));
         assert_eq!(controller.current_limit(), 26);
+        assert!(controller.is_stable());
+    }
+
+    #[test]
+    fn upward_plateau_finishes_without_climbing_to_maximum() {
+        // Simulate the profiled single-member case: thrpt peaks early and stays
+        // flat. Calibration must stabilize well below the search ceiling.
+        let mut cursor = Instant::now();
+        let mut controller = AdaptiveConcurrency::new(64, 81, SAMPLE_BYTES, usize::MAX);
+        assert_eq!(controller.current_limit(), 18);
+        assert_eq!(controller.worker_pool_limit(), 27);
+        // Baseline, then a clearly worse down probe → start upward search.
+        assert!(feed_rate(&mut controller, &mut cursor, 1_000));
+        assert_eq!(controller.current_limit(), 16);
+        assert!(feed_rate(&mut controller, &mut cursor, 900));
+        assert_eq!(controller.current_limit(), 22);
+        // First up step is only ~3% better than peak — below UP_RATE_IMPROVEMENT
+        // (5%), so treat as plateau and finish at the baseline best (18).
+        assert!(feed_rate(&mut controller, &mut cursor, 1_030));
+        assert_eq!(controller.current_limit(), 18);
+        assert!(controller.is_stable());
+        assert!(controller.worker_pool_limit() > controller.current_limit());
+    }
+
+    #[test]
+    fn upward_noise_within_tolerance_does_not_keep_climbing() {
+        // A 4% bump would have passed the old 3% up threshold and invited another
+        // step; the 5% gate keeps the pool at the first true peak.
+        let mut cursor = Instant::now();
+        let mut controller = AdaptiveConcurrency::new(64, 81, SAMPLE_BYTES, usize::MAX);
+        assert!(feed_rate(&mut controller, &mut cursor, 1_000));
+        assert!(feed_rate(&mut controller, &mut cursor, 900));
+        assert_eq!(controller.current_limit(), 22);
+        assert!(feed_rate(&mut controller, &mut cursor, 1_040));
+        assert_eq!(controller.current_limit(), 18);
         assert!(controller.is_stable());
     }
 

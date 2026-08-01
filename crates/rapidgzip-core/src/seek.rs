@@ -24,11 +24,11 @@ use crate::backend::RawInflater;
 use crate::config::Config;
 use crate::gzip::{SourceCursor, parse_member_header};
 use crate::index::{
-    GzipIndex, IndexError, StoredWindow, WindowCompression, INDEXED_GZIP_WINDOW_SIZE,
+    GzipIndex, INDEXED_GZIP_WINDOW_SIZE, IndexError, StoredWindow, WindowCompression,
 };
+use crate::inflate_backend::{InflateBackend, InflateFlush, status as inflate_status};
 use crate::parallel::Window;
 use crate::{DecodeError, DeflateErrorKind, ReadAt};
-use libz_rs_sys as z;
 use std::cmp::min;
 use std::collections::HashSet;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -367,7 +367,10 @@ impl ExpandedWindowCache {
         if !self.enabled() {
             return None;
         }
-        let index = self.entries.iter().position(|(key, _)| *key == bit_offset)?;
+        let index = self
+            .entries
+            .iter()
+            .position(|(key, _)| *key == bit_offset)?;
         let entry = self.entries.remove(index);
         let data = entry.1.clone();
         self.entries.push(entry);
@@ -401,9 +404,7 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
     /// `source.len()`. Prefer [`crate::Decoder::reader_with_index`] or
     /// [`crate::Decoder::open_with_index`] from outside this crate.
     pub(crate) fn new(source: R, index: GzipIndex, config: Config) -> Result<Self, DecodeError> {
-        index
-            .validate()
-            .map_err(DecodeError::InvalidIndex)?;
+        index.validate().map_err(DecodeError::InvalidIndex)?;
         if index.checkpoints.is_empty() {
             return Err(DecodeError::InvalidIndex(IndexError::InvalidCheckpoint(
                 "index has no checkpoints",
@@ -459,11 +460,7 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
     #[must_use]
     pub fn len(&self) -> Option<u64> {
         let size = self.index.uncompressed_size_in_bytes;
-        if size == u64::MAX {
-            None
-        } else {
-            Some(size)
-        }
+        if size == u64::MAX { None } else { Some(size) }
     }
 
     /// Returns `true` when the index reports a known zero-length payload.
@@ -611,7 +608,8 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
 
         let start_byte = checkpoint.uncompressed_offset_in_bytes;
         let mut newlines = checkpoint.line_offset;
-        self.seek_to(start_byte).map_err(|error| error.to_io_error())?;
+        self.seek_to(start_byte)
+            .map_err(|error| error.to_io_error())?;
 
         // Scan forward from the checkpoint, counting `\n` until the target
         // line start (the byte after the (target_newlines)-th newline overall).
@@ -683,11 +681,7 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
 
     fn uncompressed_len_or_max(&self) -> u64 {
         let size = self.index.uncompressed_size_in_bytes;
-        if size == u64::MAX {
-            u64::MAX
-        } else {
-            size
-        }
+        if size == u64::MAX { u64::MAX } else { size }
     }
 
     fn buffer_contains(&self, absolute: u64) -> bool {
@@ -741,12 +735,12 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
             return Ok(());
         }
 
-        let checkpoint = self
-            .index
-            .checkpoint_at_or_before(target)
-            .ok_or(DecodeError::InvalidIndex(IndexError::InvalidCheckpoint(
-                "no checkpoint at or before target offset",
-            )))?;
+        let checkpoint =
+            self.index
+                .checkpoint_at_or_before(target)
+                .ok_or(DecodeError::InvalidIndex(IndexError::InvalidCheckpoint(
+                    "no checkpoint at or before target offset",
+                )))?;
 
         let start_bit = checkpoint.compressed_offset_in_bits;
         let checkpoint_u = checkpoint.uncompressed_offset_in_bytes;
@@ -857,44 +851,28 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
                 });
             }
 
-            let (input_pointer, input_length) = {
-                let input = cursor.available()?;
-                (input.as_ptr(), input.len().min(u32::MAX as usize))
-            };
-
             let dest = &mut out[total_produced..];
             if dest.is_empty() {
                 self.session = Some(session);
                 return Ok(total_produced);
             }
 
-            session.inflater.stream.next_in = input_pointer;
-            session.inflater.stream.avail_in = input_length as u32;
-            session.inflater.stream.next_out = dest.as_mut_ptr();
-            session.inflater.stream.avail_out = dest.len() as u32;
-            let input_before = session.inflater.stream.avail_in;
-            let output_before = session.inflater.stream.avail_out;
-
-            // SAFETY:
-            // - `session.inflater.stream` was initialized (optionally primed + dict).
-            // - `next_in/avail_in` describe the current immutable cursor page.
-            // - `next_out/avail_out` describe the remaining caller-owned `out`
-            //   slice; zlib only reduces avail_out after initializing those bytes.
-            let status = unsafe { z::inflate(&mut session.inflater.stream, z::Z_NO_FLUSH) };
-
-            let consumed = usize::try_from(input_before - session.inflater.stream.avail_in)
-                .expect("zlib uInt fits usize");
-            let produced = usize::try_from(output_before - session.inflater.stream.avail_out)
-                .expect("zlib uInt fits usize");
-            cursor.advance(consumed);
+            let input = cursor.available()?;
+            let step = InflateBackend::inflate_into_slice(
+                &mut session.inflater,
+                input,
+                dest,
+                InflateFlush::NoFlush,
+            )?;
+            cursor.advance(step.consumed);
             session.compressed_byte = cursor.position();
             session.uncompressed_pos = session
                 .uncompressed_pos
-                .saturating_add(produced as u64);
-            total_produced += produced;
+                .saturating_add(step.produced as u64);
+            total_produced += step.produced;
 
-            match status {
-                z::Z_STREAM_END => {
+            match step.status {
+                inflate_status::STREAM_END => {
                     // Skip gzip footer (CRC32 + ISIZE); do not verify for seek reads.
                     if cursor.position() + 8 > cursor.length() {
                         return Err(DecodeError::InvalidGzip {
@@ -913,9 +891,13 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
                     // Next gzip member: parse header and start raw inflate with empty window.
                     let header = parse_member_header(&mut cursor, false)?;
                     debug_assert_eq!(header.deflate_start, cursor.position());
-                    let mut inflater = RawInflater::new()?;
+                    let mut inflater = <RawInflater as InflateBackend>::create()?;
                     let empty = Window::empty();
-                    inflater.set_dictionary(&empty, header.deflate_start.saturating_mul(8))?;
+                    InflateBackend::set_dictionary(
+                        &mut inflater,
+                        &empty,
+                        header.deflate_start.saturating_mul(8),
+                    )?;
                     session.inflater = inflater;
                     session.compressed_byte = cursor.position();
 
@@ -926,7 +908,9 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
                     // Member produced no bytes yet (empty member); continue into the next.
                     continue;
                 }
-                z::Z_OK | z::Z_BUF_ERROR if consumed != 0 || produced != 0 => {
+                inflate_status::OK | inflate_status::BUF_ERROR
+                    if step.consumed != 0 || step.produced != 0 =>
+                {
                     if total_produced > 0 {
                         self.session = Some(session);
                         return Ok(total_produced);
@@ -934,19 +918,19 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
                     // Consumed only compressed input; keep inflating into `out`.
                     continue;
                 }
-                z::Z_DATA_ERROR => {
+                inflate_status::DATA_ERROR => {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: session.compressed_byte.saturating_mul(8),
                         reason: DeflateErrorKind::InvalidData,
                     });
                 }
-                z::Z_NEED_DICT => {
+                inflate_status::NEED_DICT => {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: session.compressed_byte.saturating_mul(8),
                         reason: DeflateErrorKind::UnexpectedDictionary,
                     });
                 }
-                z::Z_OK | z::Z_BUF_ERROR => {
+                inflate_status::OK | inflate_status::BUF_ERROR => {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: session.compressed_byte.saturating_mul(8),
                         reason: DeflateErrorKind::Stalled,
@@ -1151,7 +1135,8 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
                         return;
                     }
                     // Confirm capacity with the same policy as the consumer path.
-                    let capacity = window_capacity_at(&index, decoded_chunk_size, start).min(capacity);
+                    let capacity =
+                        window_capacity_at(&index, decoded_chunk_size, start).min(capacity);
                     if capacity == 0 {
                         return;
                     }
@@ -1379,11 +1364,7 @@ fn is_eof_checkpoint(index: &GzipIndex, checkpoint_uncompressed: u64, start_bit:
 fn window_capacity_at(index: &GzipIndex, decoded_chunk_size: usize, start: u64) -> usize {
     let total = {
         let size = index.uncompressed_size_in_bytes;
-        if size == u64::MAX {
-            u64::MAX
-        } else {
-            size
-        }
+        if size == u64::MAX { u64::MAX } else { size }
     };
     if start >= total {
         return 0;
@@ -1397,9 +1378,7 @@ fn window_capacity_at(index: &GzipIndex, decoded_chunk_size: usize, start: u64) 
         .iter()
         .find(|cp| cp.uncompressed_offset_in_bytes > start)
     {
-        let span = next
-            .uncompressed_offset_in_bytes
-            .saturating_sub(start);
+        let span = next.uncompressed_offset_in_bytes.saturating_sub(start);
         if span > 0 && span < capacity {
             capacity = span;
         }
@@ -1492,11 +1471,7 @@ fn decode_window_independent<R: ReadAt + ?Sized>(
 
     let total = {
         let size = index.uncompressed_size_in_bytes;
-        if size == u64::MAX {
-            u64::MAX
-        } else {
-            size
-        }
+        if size == u64::MAX { u64::MAX } else { size }
     };
     if target >= total {
         return Ok(Vec::new());
@@ -1601,40 +1576,21 @@ fn inflate_into<R: ReadAt + ?Sized>(
             });
         }
 
-        let (input_pointer, input_length) = {
-            let input = cursor.available()?;
-            (input.as_ptr(), input.len().min(u32::MAX as usize))
-        };
-
         let dest = &mut out[total_produced..];
         if dest.is_empty() {
             return Ok(total_produced);
         }
 
-        inflater.stream.next_in = input_pointer;
-        inflater.stream.avail_in = input_length as u32;
-        inflater.stream.next_out = dest.as_mut_ptr();
-        inflater.stream.avail_out = dest.len() as u32;
-        let input_before = inflater.stream.avail_in;
-        let output_before = inflater.stream.avail_out;
-
-        // SAFETY:
-        // - `inflater.stream` was initialized (optionally primed + dictionary).
-        // - `next_in/avail_in` describe the current immutable cursor page.
-        // - `next_out/avail_out` describe the remaining caller-owned `out` slice.
-        let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
-
-        let consumed = usize::try_from(input_before - inflater.stream.avail_in)
-            .expect("zlib uInt fits usize");
-        let produced = usize::try_from(output_before - inflater.stream.avail_out)
-            .expect("zlib uInt fits usize");
-        cursor.advance(consumed);
+        let input = cursor.available()?;
+        let step =
+            InflateBackend::inflate_into_slice(inflater, input, dest, InflateFlush::NoFlush)?;
+        cursor.advance(step.consumed);
         *compressed_byte = cursor.position();
-        *uncompressed_pos = uncompressed_pos.saturating_add(produced as u64);
-        total_produced += produced;
+        *uncompressed_pos = uncompressed_pos.saturating_add(step.produced as u64);
+        total_produced += step.produced;
 
-        match status {
-            z::Z_STREAM_END => {
+        match step.status {
+            inflate_status::STREAM_END => {
                 if cursor.position() + 8 > cursor.length() {
                     return Err(DecodeError::InvalidGzip {
                         offset: cursor.position(),
@@ -1650,9 +1606,13 @@ fn inflate_into<R: ReadAt + ?Sized>(
 
                 let header = parse_member_header(&mut cursor, false)?;
                 debug_assert_eq!(header.deflate_start, cursor.position());
-                *inflater = RawInflater::new()?;
+                *inflater = <RawInflater as InflateBackend>::create()?;
                 let empty = Window::empty();
-                inflater.set_dictionary(&empty, header.deflate_start.saturating_mul(8))?;
+                InflateBackend::set_dictionary(
+                    inflater,
+                    &empty,
+                    header.deflate_start.saturating_mul(8),
+                )?;
                 *compressed_byte = cursor.position();
 
                 if total_produced > 0 {
@@ -1660,25 +1620,27 @@ fn inflate_into<R: ReadAt + ?Sized>(
                 }
                 continue;
             }
-            z::Z_OK | z::Z_BUF_ERROR if consumed != 0 || produced != 0 => {
+            inflate_status::OK | inflate_status::BUF_ERROR
+                if step.consumed != 0 || step.produced != 0 =>
+            {
                 if total_produced > 0 {
                     return Ok(total_produced);
                 }
                 continue;
             }
-            z::Z_DATA_ERROR => {
+            inflate_status::DATA_ERROR => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: compressed_byte.saturating_mul(8),
                     reason: DeflateErrorKind::InvalidData,
                 });
             }
-            z::Z_NEED_DICT => {
+            inflate_status::NEED_DICT => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: compressed_byte.saturating_mul(8),
                     reason: DeflateErrorKind::UnexpectedDictionary,
                 });
             }
-            z::Z_OK | z::Z_BUF_ERROR => {
+            inflate_status::OK | inflate_status::BUF_ERROR => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: compressed_byte.saturating_mul(8),
                     reason: DeflateErrorKind::Stalled,

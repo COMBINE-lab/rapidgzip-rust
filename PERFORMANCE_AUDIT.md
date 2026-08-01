@@ -1,5 +1,112 @@
 # Performance audit
 
+## Follow-up optimizations (2026-08-01)
+
+Shipped in-tree after a wall-clock + code profile on 128 MiB synthetic corpora
+(kernel `perf` unavailable on the host):
+
+1. **Bulk clean/marked LZ77 copy** in `parallel/deflate.rs` — overlap-aware
+   `extend_from_within` + geometric doubling (same strategy as speculative
+   `copy_match_unknown`), replacing per-byte ring loops once markers drain.
+2. **Marker-path threshold** — ordinary single-member estimated pipeline only
+   for `decoder_threads >= 4`; P=2/3 stay on sequential zlib-rs. BGZF / stored /
+   independent multi-member still parallelize at `> 1`.
+3. **Tighter coordination waits** — worker idle/full-channel parks 100 µs
+   (native full-channel remains 25 µs); coordinator `recv_timeout` 2 ms.
+4. **Adaptive plateau** — upward search needs **+5%** thrpt to climb; search
+   ceiling **1.5×** bootstrap (was 2×).
+5. **Parallel single-stream zlib** — positional `Format::Zlib` (and Auto that
+   resolves to zlib) reuses the estimated marker/window path when
+   `decoder_threads >= 4` and compressed length is at least
+   `2 × compressed_chunk_size + 6` (CMF/FLG + Adler). Adler-32 still gated by
+   `crc32_enabled`.
+6. **Parallel multi-stream zlib** — concatenated independent CMF/FLG…Adler
+   frames (≥2) with `decoder_threads > 1` use two-pass discard-index + ordered
+   stream-granularity zlib-rs workers. Large solitary streams prefer the
+   marker path (skip discard index); multi-stream tails after a parallel first
+   stream also use stream-granularity parallel. Small/low-thread single streams
+   and single-thread `decode_read` zlib remain sequential. Multi-thread
+   `decode_read` zlib spills to a tempfile then uses the positional parallel
+   gates.
+7. **Parallel single-stream raw DEFLATE** — positional `Format::RawDeflate`
+   reuses the estimated marker/window path when `decoder_threads >= 4` and
+   compressed length is at least `2 × compressed_chunk_size` (no wrapper).
+   Optional whole-stream CRC via `raw_crc32_list`. Small/low-thread streams
+   stay sequential zlib-rs raw inflate.
+8. **Multi-thread `decode_read` spill** — for gzip, zlib, and raw when
+   `decoder_threads > 1`, non-seekable input is copied to a private tempfile
+   then routed through the same positional backend gates (so parallel raw and
+   zlib apply after spill without a second streaming parallel path).
+9. **Post-emit byte free-list + post-resolve symbol recycle (estimated/marker
+   path)** — after the coordinator emits resolved marked/clean/backend_tail
+   parts via `emit_reusable`, empty `Vec<u8>` capacity is pushed to a shared
+   free-list (`Arc` + `crossbeam_deque::Injector`, soft-capped at
+   `2 × worker_count`; type lives in `buffer_pool.rs`). Estimated workers
+   `try_steal` into `clean_scratch` before each new task. Only byte buffers
+   exclusively owned after successful emit are recycled (never while live in
+   the resolve queue). After a worker steals a resolve task,
+   `resolve_parts` / `MarkerBuffer::resolve_with_symbols` clears the symbol
+   vec and returns it; the worker `prefer_capacity`s into `marked_scratch`
+   (success or error) before sending `ResolvedParts` to the coordinator — no
+   cross-thread `Vec<Symbol>` free-list. Resolve still allocates a fresh
+   `Vec<u8>` for marked bytes (those join the post-emit byte free-list after
+   emit).
+10. **DecoderReader channel buffer pool** — `DecoderReader::spawn` creates a
+    separate reader-local `Arc<ByteBufferFreeList>` soft-capped at
+    `2 × in_flight_chunks`. Fully-consumed (or `finish`-discarded) channel
+    chunks are `recycle`d into that pool. `ChannelOutput::emit_reusable` sends
+    the payload on the channel, then `try_steal`s an empty buffer (or returns
+    a zero-capacity `Vec`) for the coordinator’s next fill. This does **not**
+    merge with the estimated-path free-list: the estimated pool still only
+    sees capacity returned from `emit_reusable`. With `DirectOutput`, that is
+    the same cleared chunk; with `ChannelOutput`, steals come from the reader
+    pool after the consumer finishes reading, so sequential estimated emit
+    loops can recover capacity on the `Decoder::reader` / `open` path as well.
+    Default `emit_reusable` (no free-list) still returns zero-capacity vecs.
+
+Not done (architectural residual only): **faster single-thread inflater** —
+zlib-rs multi-symbol / match-copy improvements and/or a **real ISA-L second
+backend** behind an explicit feature (stub `isal` feature only; **no**
+`isal-sys` dependency is declared yet — host autoreconf / system lib often
+missing). **No alternate `InflateBackend` implementor ships.**
+
+`InflateBackend` coverage today (`crates/rapidgzip-core/src/inflate_backend.rs`,
+monomorphized to zlib-rs `RawInflater` only — zero intended thrpt cost vs
+direct calls):
+
+| Path | Trait surface used |
+|------|--------------------|
+| Sequential positional gzip / zlib / raw | `create` / `reset` / `inflate` (`NoFlush` / `Block` for `keep_index`) |
+| Streaming `stream_decode` (gzip / zlib / raw) | same |
+| Structure analysis (`analyze` / `--analyze`) | `create` / `inflate` (`Block`; `last_block` from `data_type`) |
+| Parallel BGZF Finish | `create` / `reset` / `inflate` (`Finish`) |
+| Parallel independent-member workers | `create` / `reset` / `inflate_capped` (per-member output budget) |
+| Multi-stream zlib index + workers | `create` / `reset` / `inflate` / `inflate_capped` |
+| Mid-stream bit resume (estimated setup, seeks) | `prime` / `set_dictionary` / `prepare_at_bit_offset` |
+| Estimated residual continue (`inflate_from_block`) | `prepare_at_bit_offset` + `inflate_capped` (`NoFlush`) |
+| Estimated `inflate_tail` (`Z_BLOCK` walk) | `create` / `reset` / `prime` / `set_dictionary` / `inflate_capped` (`Block`; `unused_bits` / `at_block_end` / `last_block`) |
+| Seek sessions + indexed segment decode | source `prepare_at_bit_offset` + `create` / `set_dictionary` / `inflate_into_slice` (fixed caller `out` slices) |
+
+**Unsafe inflate ABI inventory** (grep `z::inflate*` under
+`crates/rapidgzip-core/src`):
+
+- **`z::inflate` only** in `inflate_backend.rs` (`RawInflater` implementor of
+  `inflate_capped` / `inflate_into_slice`; trait `inflate` defaults to
+  unlimited `inflate_capped`). No residual direct call sites in `backend.rs`
+  sequential/estimated paths, `stream_decode`, `analyze`, `seek`, or
+  `indexed_decode`.
+- **Lifecycle only** on `RawInflater` in `backend.rs`: `inflateInit2_`,
+  `inflateReset`, `inflatePrime`, `inflateSetDictionary`, `inflateEnd`.
+  Trait `create` / `reset` / `prime` / `set_dictionary` thin-wrap those.
+
+The only remaining **architectural** inflate gap is a **real ISA-L (or other)
+second `InflateBackend` implementor** — not more call-site migration.
+
+Shipped parallel paths and format coverage are listed in
+[CHANGELOG.md](CHANGELOG.md); intentional sequential product gates (P=1 stream
+`decode_read`, P=1–3 marker skip, small streams under ~2× grid amortization)
+are not unfinished work.
+
 ## Current conclusion
 
 The optimized generic marker pipeline now clears the intermediate public-FASTQ

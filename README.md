@@ -11,17 +11,22 @@ The project provides:
 - the `rapidgzip-core` library crate;
 - the `rapidgzip-rust` binary, distributed by the `rapidgzip-rust-cli` package;
 - verified decoding of single-member gzip, concatenated/multi-member gzip,
-  BGZF, zlib-wrapped DEFLATE (RFC 1950; sequential, auto-detected), and raw
-  DEFLATE (RFC 1951; sequential, explicit `--format raw`);
+  BGZF, zlib-wrapped DEFLATE (RFC 1950; auto-detected; parallel multi-stream
+  and long single-stream estimated paths), and raw DEFLATE (RFC 1951;
+  explicit `--format raw`; long streams use the same estimated marker path
+  when `decoder_threads >= 4`);
 - both a push API over `std::io::Write` and an owned `std::io::Read + Send`
   stream suitable for parsers such as [paraseq].
 
-This is currently a release candidate for the initial `0.1.0` crates.io
-publication. The project intentionally does not yet provide compression.
+This is currently a release candidate for the feature-complete `0.2.0`
+crates.io publication (crates.io `rapidgzip-core` 0.1.0 was an incomplete early
+stub with a smaller API). The project intentionally does not yet provide
+compression.
 Non-seekable compressed input (stdin/pipes) uses [`Decoder::decode_read`]:
 single-thread gzip, zlib, and raw DEFLATE stream page-at-a-time (no full-archive
-RAM buffer); multi-thread gzip spills to a private temporary file then runs the
-parallel positional path.
+RAM buffer); multi-thread paths spill to a private temporary file then run the
+positional backend (parallel gzip / multi-stream or marker zlib / marker raw
+when each format’s thread and size gates allow).
 
 ## Library installation
 
@@ -91,8 +96,8 @@ length and contents stable for the complete decode.
 
 | Condition | Behavior | Memory (compressed side) |
 |-----------|----------|---------------------------|
-| `decoder_threads == 1`, or zlib / raw DEFLATE | Sequential stream | O(input page) + inflate working set |
-| `decoder_threads > 1` and gzip (Auto after peek, or explicit Gzip) | Spill stream to a private tempfile, then parallel positional decode | Compressed size **on disk** + decoder working set |
+| `decoder_threads == 1` | Sequential stream (gzip / zlib / raw) | O(input page) + inflate working set |
+| `decoder_threads > 1` | Spill stream to a private tempfile, then positional backend (parallel gzip; multi-stream or marker zlib; marker raw DEFLATE when `decoder_threads >= 4` and size amortizes ~2× the compressed grid) | Compressed size **on disk** + decoder working set |
 
 Prefer a file or other [`ReadAt`] source with [`Decoder::decode`] /
 [`Decoder::open`] when you already have positional input and want to avoid the
@@ -192,7 +197,7 @@ rapidgzip-rust --import-index reads.gzidx -c reads.fastq.gz
 rapidgzip-rust --seek-prefetch 0 --ranges '100@0' --import-index reads.gzidx reads.fastq.gz
 
 # Read compressed data from stdin (`-`, or omit INPUT when stdin is a pipe).
-# Ordinary decompress: sequential page stream, or multi-thread gzip spill-to-temp + parallel.
+# Ordinary decompress: sequential page stream, or multi-thread spill-to-temp + positional backend.
 printf 'hello\n' | gzip | rapidgzip-rust -P 8 -c -
 
 # --ranges / --analyze / --import-index on stdin spill to a private temp file (not full RAM).
@@ -227,15 +232,35 @@ and optional background prefetch of further windows (see
 
 - Every accepted gzip member is terminated by an actual final DEFLATE block
   and checked against its CRC32 and modulo-2^32 uncompressed size.
-- zlib streams (RFC 1950 CMF/FLG + DEFLATE + Adler-32) are auto-detected and
-  decoded sequentially; Adler-32 is gated by the same verify flag as gzip CRC.
-- raw DEFLATE (RFC 1951) requires explicit format selection; sequential only,
-  no integrity trailer, and no random-access index.
-- Residual: sequential zlib/raw (no parallel path for those formats);
-  random-access indexes remain gzip/BGZF-oriented. Multi-thread
-  `decode_read` / CLI stdin for gzip uses a **temp file** (secure temp-dir
-  defaults, deleted on drop) rather than keeping the full archive only in RAM;
-  single-thread gzip and zlib/raw stay pure streaming.
+- zlib streams (RFC 1950 CMF/FLG + DEFLATE + Adler-32) are auto-detected. On
+  positional `ReadAt` input:
+  - **≥2 concatenated streams** with `decoder_threads > 1` use stream-granularity
+    parallel zlib-rs (two-pass discard-index of boundaries, then ordered workers),
+    unless a large solitary stream is preferred for the marker path below.
+  - A **single long stream** uses the estimated marker/window path when
+    `decoder_threads >= 4` and compressed size is at least about two grid cells
+    (`2 × compressed_chunk_size` plus CMF/FLG + Adler trailer; default grid is
+    1 MiB). Multi-stream tails after that first stream use stream-granularity
+    parallel when remaining frames exist.
+  - Budgets of 1 thread and small single streams stay on sequential zlib-rs.
+    Multi-thread non-seekable `decode_read` spills to a temp file so the same
+    positional parallel gates apply.
+  - Adler-32 is gated by the same `crc32_enabled` / verify flag as gzip CRC.
+- raw DEFLATE (RFC 1951) requires explicit format selection; no container
+  integrity trailer and no random-access index. On positional `ReadAt` (and
+  after multi-thread `decode_read` spill):
+  - **Long streams** use the estimated marker/window path when
+    `decoder_threads >= 4` and compressed size is at least about two grid cells
+    (`2 × compressed_chunk_size`; default 1 MiB cells → ~2 MiB). Optional
+    whole-stream check via `raw_crc32_list`.
+  - **P=1–3** and **small streams** stay on sequential zlib-rs raw inflate.
+- Residual: ISA-L / a faster single-thread inflater is not shipped (P=1 still
+  zlib-rs); small streams and marker budgets of 1–3 threads stay sequential for
+  ordinary single-member gzip, single-stream zlib, and raw DEFLATE; random-access
+  indexes remain gzip/BGZF-oriented. Multi-thread `decode_read` / CLI stdin
+  spills to a **temp file** (secure temp-dir defaults, deleted on drop) rather
+  than keeping the full archive only in RAM; single-thread paths stay pure
+  streaming.
 - Concatenated members, empty members, optional gzip headers, BGZF data, and
   the conventional BGZF EOF member are supported.
 - Bytes resembling a gzip header inside DEFLATE data are never trusted as a
@@ -299,18 +324,30 @@ and large sequencing files are deliberately not stored in the repository.
 
 ## Releasing
 
-Maintainers can validate a prospective release without retaining version-file
-changes:
+Full checklist, script behavior, and post-publish steps:
+[docs/RELEASE.md](docs/RELEASE.md). Shipped surface for this series:
+[CHANGELOG.md](CHANGELOG.md).
 
 ```console
-scripts/bump_and_publish.sh --dry-run 0.1.0
+scripts/bump_and_publish.sh --dry-run 0.2.0
 ```
 
-Omitting `--dry-run` updates the workspace version, repeats formatting, lint,
-test, documentation, and package checks, creates and pushes a release commit
-and annotated tag, and publishes the crates to crates.io. The script requires a
-clean `main` branch and asks for confirmation before external changes;
-`--yes` is available for an intentional unattended release.
+### Packaging
+
+CI verifies the `rapidgzip-core` crates.io tarball and that the CLI still
+checks against the in-tree path dependency:
+
+```console
+cargo package -p rapidgzip-core --locked
+cargo check -p rapidgzip-rust-cli --locked
+```
+
+Full CLI package verification (`cargo package -p rapidgzip-rust-cli`) needs
+`rapidgzip-core` published on crates.io at the same version (or the release
+script’s multi-package dry-run:
+`cargo publish -p rapidgzip-core -p rapidgzip-rust-cli --dry-run`).
+Publish order is **core first**, then CLI. See [docs/RELEASE.md](docs/RELEASE.md)
+for packaging notes and the pre-release checklist.
 
 ## License
 

@@ -1,8 +1,10 @@
 //! Sequential gzip / BGZF / zlib / raw DEFLATE structure analysis.
 //!
-//! Walks members and DEFLATE blocks with zlib-rs raw inflate (`Z_BLOCK`) so
-//! callers can inspect framing without writing payload. Used by the CLI
-//! `--analyze` path and available as [`crate::Decoder::analyze`].
+//! Walks members and DEFLATE blocks with raw inflate via
+//! [`InflateBackend`] and [`InflateFlush::Block`] so callers can inspect
+//! framing without writing payload. Used by the CLI `--analyze` path and
+//! available as [`crate::Decoder::analyze`]. Monomorphized to zlib-rs
+//! [`RawInflater`] today.
 //!
 //! Supports gzip (including BGZF), zlib (RFC 1950), and raw DEFLATE (RFC 1951
 //! via explicit [`Format::RawDeflate`]; never auto-selected).
@@ -11,9 +13,9 @@ use crate::backend::RawInflater;
 use crate::config::Format;
 use crate::crc32::Crc32;
 use crate::gzip::{SourceCursor, parse_member_header};
+use crate::inflate_backend::{InflateBackend, InflateFlush, status as inflate_status};
 use crate::zlib::{Adler32, looks_like_zlib, parse_zlib_header};
 use crate::{DecodeError, DeflateErrorKind, GzipErrorKind, ReadAt, ZlibErrorKind};
-use libz_rs_sys as z;
 use std::fmt::{self, Display, Formatter};
 
 /// Container kind reported by structure analysis.
@@ -176,10 +178,14 @@ impl Display for ArchiveAnalysis {
         )?;
         for member in &self.members {
             writeln!(formatter)?;
-            write!(formatter, "{}", MemberDisplay {
-                member,
-                kind: self.kind,
-            })?;
+            write!(
+                formatter,
+                "{}",
+                MemberDisplay {
+                    member,
+                    kind: self.kind,
+                }
+            )?;
         }
         Ok(())
     }
@@ -194,7 +200,9 @@ struct MemberDisplay<'a> {
 impl Display for MemberDisplay<'_> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         let member = self.member;
-        let compressed_len = member.compressed_end.saturating_sub(member.compressed_start);
+        let compressed_len = member
+            .compressed_end
+            .saturating_sub(member.compressed_start);
         let label = match self.kind {
             ArchiveKind::Gzip => "member",
             ArchiveKind::Zlib | ArchiveKind::RawDeflate => "stream",
@@ -269,14 +277,7 @@ impl Display for MemberAnalysis {
         } else {
             ArchiveKind::Gzip
         };
-        write!(
-            formatter,
-            "{}",
-            MemberDisplay {
-                member: self,
-                kind,
-            }
-        )
+        write!(formatter, "{}", MemberDisplay { member: self, kind })
     }
 }
 
@@ -464,7 +465,8 @@ fn analyze_raw_deflate<R: ReadAt + ?Sized>(
     let deflate_start = cursor.position();
     debug_assert_eq!(deflate_start, 0);
 
-    let walk = walk_deflate_blocks(source, &mut cursor, deflate_start, |_| Ok(()))?;
+    let walk =
+        walk_deflate_blocks::<_, _, RawInflater>(source, &mut cursor, deflate_start, |_| Ok(()))?;
 
     // Single stream must consume the entire source (no trailer, no concat).
     if !cursor.at_end() {
@@ -506,12 +508,13 @@ fn analyze_gzip_member<R: ReadAt + ?Sized>(
     debug_assert_eq!(header.deflate_start, cursor.position());
 
     let mut crc = Crc32::new();
-    let walk = walk_deflate_blocks(source, cursor, header.deflate_start, |chunk| {
-        if crc32_enabled {
-            crc.update(chunk);
-        }
-        Ok(())
-    })?;
+    let walk =
+        walk_deflate_blocks::<_, _, RawInflater>(source, cursor, header.deflate_start, |chunk| {
+            if crc32_enabled {
+                crc.update(chunk);
+            }
+            Ok(())
+        })?;
 
     let footer_offset = cursor.position();
     let footer = cursor.read_exact::<8>(footer_offset)?;
@@ -565,12 +568,13 @@ fn analyze_zlib_stream<R: ReadAt + ?Sized>(
     debug_assert_eq!(header.deflate_start, cursor.position());
 
     let mut adler = Adler32::new();
-    let walk = walk_deflate_blocks(source, cursor, header.deflate_start, |chunk| {
-        if crc32_enabled {
-            adler.update(chunk);
-        }
-        Ok(())
-    })?;
+    let walk =
+        walk_deflate_blocks::<_, _, RawInflater>(source, cursor, header.deflate_start, |chunk| {
+            if crc32_enabled {
+                adler.update(chunk);
+            }
+            Ok(())
+        })?;
 
     // Adler-32 trailer is four big-endian bytes (RFC 1950).
     let footer_offset = cursor.position();
@@ -623,8 +627,9 @@ struct DeflateWalk {
     output_mod32: u32,
 }
 
-/// Inflates raw DEFLATE from the cursor with `Z_BLOCK`, recording block spans.
-fn walk_deflate_blocks<R, F>(
+/// Inflates raw DEFLATE from the cursor with [`InflateFlush::Block`], recording
+/// block spans. Generic over [`InflateBackend`]; monomorphized to [`RawInflater`].
+fn walk_deflate_blocks<R, F, I>(
     source: &R,
     cursor: &mut SourceCursor<'_, R>,
     deflate_start: u64,
@@ -633,8 +638,9 @@ fn walk_deflate_blocks<R, F>(
 where
     R: ReadAt + ?Sized,
     F: FnMut(&[u8]) -> Result<(), DecodeError>,
+    I: InflateBackend,
 {
-    let mut inflater = RawInflater::new()?;
+    let mut inflater = I::create()?;
     let mut output_mod32 = 0_u32;
     let mut uncompressed_size = 0_u64;
     let mut blocks = Vec::new();
@@ -643,22 +649,19 @@ where
     let mut block_bit_start = deflate_start.saturating_mul(8);
     let mut block_uncomp_start = 0_u64;
     let (mut block_type, mut block_is_final) = peek_block_header(source, block_bit_start)?;
-    // After a final block's `Z_BLOCK` boundary, the next inflate yields
-    // `Z_STREAM_END` without opening another block. Skip recording a phantom.
+    // After a final block's Block-flush boundary, the next inflate yields
+    // stream-end without opening another block. Skip recording a phantom.
     let mut expect_stream_end_only = false;
     let mut decoded = Vec::with_capacity(64 * 1024);
     let mut finished = false;
 
     while !finished {
-        let (input_pointer, input_length) = {
-            let input = cursor.available()?;
-            (input.as_ptr(), input.len().min(u32::MAX as usize))
-        };
-        // After a final block boundary, zlib may still need one more inflate
-        // (often with empty input) to report `Z_STREAM_END`. Gzip/zlib leave
+        let input = cursor.available()?;
+        // After a final block boundary, the backend may still need one more
+        // inflate (often with empty input) to report stream-end. Gzip/zlib leave
         // footer bytes so the cursor is rarely empty here; raw DEFLATE has no
         // trailer and hits the empty-input case at EOS.
-        if input_length == 0 && !expect_stream_end_only {
+        if input.is_empty() && !expect_stream_end_only {
             return Err(DecodeError::InvalidDeflate {
                 bit_offset: cursor.position().saturating_mul(8),
                 reason: DeflateErrorKind::Truncated,
@@ -668,30 +671,12 @@ where
         if decoded.capacity() < 64 * 1024 {
             decoded.reserve_exact(64 * 1024 - decoded.capacity());
         }
+        // Analyze discards payload after the integrity/size callback; force empty
+        // so InflateBackend appends into a fresh buffer for this step.
+        decoded.clear();
 
-        inflater.stream.next_in = input_pointer;
-        inflater.stream.avail_in = input_length as u32;
-        inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-        inflater.stream.avail_out = decoded.capacity() as u32;
-        let input_before = inflater.stream.avail_in;
-        let output_before = inflater.stream.avail_out;
-
-        // SAFETY:
-        // - `inflater.stream` is initialized and uniquely borrowed.
-        // - `next_in`/`avail_in` describe the current immutable cursor page,
-        //   or a zero-length empty slice when finishing raw DEFLATE at EOS
-        //   (`avail_in == 0`; inflate does not dereference `next_in` then).
-        // - `next_out`/`avail_out` describe uniquely owned spare capacity.
-        // - `Z_BLOCK` stops at DEFLATE block boundaries and updates `data_type`.
-        let status = unsafe { z::inflate(&mut inflater.stream, z::Z_BLOCK) };
-
-        let consumed = usize::try_from(input_before - inflater.stream.avail_in)
-            .expect("zlib uInt fits usize");
-        let produced = usize::try_from(output_before - inflater.stream.avail_out)
-            .expect("zlib uInt fits usize");
-        cursor.advance(consumed);
-        // SAFETY: zlib initialized exactly `produced` bytes of spare capacity.
-        unsafe { decoded.set_len(produced) };
+        let step = inflater.inflate(input, &mut decoded, InflateFlush::Block)?;
+        cursor.advance(step.consumed);
 
         if !decoded.is_empty() {
             output_mod32 = output_mod32.wrapping_add(decoded.len() as u32);
@@ -702,17 +687,15 @@ where
             decoded.clear();
         }
 
-        let unused_bits = u64::try_from(inflater.stream.data_type & 0x3F)
-            .expect("the low six data_type bits are non-negative");
         let bit_pos = cursor
             .position()
             .saturating_mul(8)
-            .saturating_sub(unused_bits);
-        let at_block_end = inflater.stream.data_type & 0x80 != 0;
-        let last_block_flag = inflater.stream.data_type & 0x40 != 0;
+            .saturating_sub(u64::from(step.unused_bits));
+        let at_block_end = step.at_block_end;
+        let last_block_flag = step.last_block;
 
-        match status {
-            z::Z_STREAM_END => {
+        match step.status {
+            inflate_status::STREAM_END => {
                 let end_bit = bit_pos.div_ceil(8).saturating_mul(8);
                 let end_byte = end_bit / 8;
                 if cursor.position() != end_byte {
@@ -734,7 +717,7 @@ where
                 }
                 finished = true;
             }
-            z::Z_OK | z::Z_BUF_ERROR => {
+            inflate_status::OK | inflate_status::BUF_ERROR => {
                 if at_block_end && !expect_stream_end_only {
                     let end_bit = if last_block_flag {
                         bit_pos.div_ceil(8).saturating_mul(8)
@@ -764,10 +747,10 @@ where
                         block_type = next.0;
                         block_is_final = next.1;
                     }
-                } else if consumed == 0 && produced == 0 {
-                    // Includes the post-final-block wait for Z_STREAM_END: if
-                    // zlib makes no progress, treat as truncation/stall.
-                    let reason = if status == z::Z_BUF_ERROR {
+                } else if step.consumed == 0 && step.produced == 0 {
+                    // Includes the post-final-block wait for stream-end: if
+                    // the backend makes no progress, treat as truncation/stall.
+                    let reason = if step.status == inflate_status::BUF_ERROR {
                         DeflateErrorKind::Truncated
                     } else {
                         DeflateErrorKind::Stalled
@@ -778,13 +761,13 @@ where
                     });
                 }
             }
-            z::Z_NEED_DICT => {
+            inflate_status::NEED_DICT => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: deflate_start.saturating_mul(8),
                     reason: DeflateErrorKind::UnexpectedDictionary,
                 });
             }
-            z::Z_DATA_ERROR => {
+            inflate_status::DATA_ERROR => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: cursor.position().saturating_mul(8),
                     reason: DeflateErrorKind::InvalidData,
@@ -868,9 +851,7 @@ fn peek_bits<R: ReadAt + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ArchiveKind, DeflateBlockType, analyze_source, analyze_source_with_format,
-    };
+    use super::{ArchiveKind, DeflateBlockType, analyze_source, analyze_source_with_format};
     use crate::config::Format;
     use crate::{DecodeError, DeflateErrorKind, GzipErrorKind};
 
@@ -1231,8 +1212,7 @@ mod tests {
     #[test]
     fn raw_deflate_analyze_empty_source_errors() {
         let empty: &[u8] = &[];
-        let error =
-            analyze_source_with_format(empty, 64, true, Format::RawDeflate).unwrap_err();
+        let error = analyze_source_with_format(empty, 64, true, Format::RawDeflate).unwrap_err();
         assert!(matches!(
             error,
             DecodeError::InvalidDeflate {
@@ -1250,13 +1230,9 @@ mod tests {
         assert_eq!(analysis.members[0].uncompressed_size, 10);
         // Forced raw on gzip bytes should fail DEFLATE framing (gzip magic is
         // not a valid DEFLATE block stream starting at bit 0).
-        let raw_err = analyze_source_with_format(
-            compressed.as_slice(),
-            64,
-            true,
-            Format::RawDeflate,
-        )
-        .unwrap_err();
+        let raw_err =
+            analyze_source_with_format(compressed.as_slice(), 64, true, Format::RawDeflate)
+                .unwrap_err();
         assert!(
             matches!(raw_err, DecodeError::InvalidDeflate { .. }),
             "unexpected error forcing raw on gzip: {raw_err:?}"

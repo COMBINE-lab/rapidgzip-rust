@@ -12,6 +12,14 @@ documentation = "https://docs.rs/rapidgzip-core"
 keywords = ["gzip", "zlib", "deflate", "parallel", "bgzf"]
 categories = ["compression", "filesystem"]
 
+[features]
+default = []
+# Future optional ISA-L sequential inflater. Not enabled and no `isal-sys`
+# dependency is declared: many hosts lack autoreconf / system ISA-L, and
+# build would fail. When wired, sequential paths already go through
+# `inflate_backend::InflateBackend` (generic monomorphization; zlib-rs only today).
+# isal = ["dep:isal-sys"]
+
 [dependencies]
 crossbeam-deque.workspace = true
 libz-rs-sys.workspace = true

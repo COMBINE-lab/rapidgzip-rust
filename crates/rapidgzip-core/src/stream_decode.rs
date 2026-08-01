@@ -1,18 +1,20 @@
 //! Streaming decode for non-seekable [`std::io::Read`] inputs (stdin/pipes).
 //!
-//! Pulls compressed bytes on demand via a [`std::io::BufReader`]. Sequential
-//! paths (zlib, raw DEFLATE, single-thread gzip) never buffer the full archive.
-//! Multi-thread gzip spills the stream to a private temporary file, then runs
-//! the positional parallel [`crate::Decoder::decode`] path on that file.
+//! Pulls compressed bytes on demand via a [`std::io::BufReader`]. Single-thread
+//! paths (gzip, zlib, raw DEFLATE) never buffer the full archive. When
+//! `decoder_threads > 1`, the stream is spilled to a private temporary file and
+//! the positional [`crate::backend::decode_source`] path runs on that file
+//! (parallel gzip / multi-stream or marker zlib / marker raw DEFLATE when each
+//! format’s thread and size gates allow).
 
 use crate::backend::{DirectOutput, Output, RawInflater, decode_source};
 use crate::config::{Config, Format};
 use crate::crc32::Crc32;
 use crate::gzip::MemberHeader;
 use crate::index::IndexBuilder;
+use crate::inflate_backend::{InflateBackend, InflateFlush, status as inflate_status};
 use crate::zlib::{Adler32, ZlibHeader, is_zlib_cmf_flg};
 use crate::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ZlibErrorKind};
-use libz_rs_sys as z;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::atomic::AtomicBool;
 
@@ -55,20 +57,14 @@ impl<R: Read> StreamCursor<R> {
     /// Returns true when the underlying reader is at EOF with an empty buffer.
     fn at_end(&mut self) -> Result<bool, DecodeError> {
         let pos = self.position;
-        let buf = self
-            .reader
-            .fill_buf()
-            .map_err(|e| Self::map_io(pos, e))?;
+        let buf = self.reader.fill_buf().map_err(|e| Self::map_io(pos, e))?;
         Ok(buf.is_empty())
     }
 
     fn byte(&mut self, truncated_at: u64) -> Result<u8, DecodeError> {
         // Prefer buffer when non-empty so we don't fight inflate's residual input.
         let pos = self.position;
-        let buf = self
-            .reader
-            .fill_buf()
-            .map_err(|e| Self::map_io(pos, e))?;
+        let buf = self.reader.fill_buf().map_err(|e| Self::map_io(pos, e))?;
         if let Some(&b) = buf.first() {
             self.reader.consume(1);
             self.position = self.position.saturating_add(1);
@@ -78,19 +74,13 @@ impl<R: Read> StreamCursor<R> {
         Err(Self::truncated(truncated_at))
     }
 
-    fn read_exact<const N: usize>(
-        &mut self,
-        truncated_at: u64,
-    ) -> Result<[u8; N], DecodeError> {
+    fn read_exact<const N: usize>(&mut self, truncated_at: u64) -> Result<[u8; N], DecodeError> {
         let mut result = [0_u8; N];
         // Drain any residual buffer first so multi-byte footers work after
         // inflate left partial trailer bytes in the BufReader.
         let pos = self.position;
         let take = {
-            let buf = self
-                .reader
-                .fill_buf()
-                .map_err(|e| Self::map_io(pos, e))?;
+            let buf = self.reader.fill_buf().map_err(|e| Self::map_io(pos, e))?;
             let take = buf.len().min(N);
             result[..take].copy_from_slice(&buf[..take]);
             take
@@ -117,19 +107,14 @@ impl<R: Read> StreamCursor<R> {
     /// Peeks up to `n` bytes without consuming. May return fewer at EOF.
     fn peek(&mut self, n: usize) -> Result<&[u8], DecodeError> {
         let pos = self.position;
-        let buf = self
-            .reader
-            .fill_buf()
-            .map_err(|e| Self::map_io(pos, e))?;
+        let buf = self.reader.fill_buf().map_err(|e| Self::map_io(pos, e))?;
         Ok(&buf[..buf.len().min(n)])
     }
 
     /// Provides a live input page for inflate. Caller must [`Self::consume`] after.
     fn input_page(&mut self) -> Result<&[u8], DecodeError> {
         let pos = self.position;
-        self.reader
-            .fill_buf()
-            .map_err(|e| Self::map_io(pos, e))
+        self.reader.fill_buf().map_err(|e| Self::map_io(pos, e))
     }
 
     fn consume(&mut self, count: usize) {
@@ -399,13 +384,16 @@ fn resolve_stream_format<R: Read>(
 }
 
 /// Shared inflate-loop helper: pulls from the stream cursor, writes to output,
-/// updates integrity state and the index builder. Returns on `Z_STREAM_END`.
+/// updates integrity state and the index builder. Returns on stream end.
+///
+/// Inflate goes through [`InflateBackend`] (monomorphized to [`RawInflater`]
+/// at the gzip/zlib/raw call sites).
 #[allow(clippy::too_many_arguments)]
-fn inflate_until_stream_end<R, O>(
+fn inflate_until_stream_end<R, O, I>(
     cursor: &mut StreamCursor<R>,
     config: &Config,
-    inflater: &mut RawInflater,
-    flush: i32,
+    inflater: &mut I,
+    flush: InflateFlush,
     index_builder: &mut IndexBuilder,
     total_output: &mut u64,
     member_output: &mut u32,
@@ -416,6 +404,7 @@ fn inflate_until_stream_end<R, O>(
 where
     R: Read,
     O: Output,
+    I: InflateBackend,
 {
     let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
 
@@ -427,36 +416,16 @@ where
             });
         }
 
-        let (input_pointer, input_length) = {
-            let input = cursor.input_page()?;
-            (input.as_ptr(), input.len().min(u32::MAX as usize))
-        };
         if decoded.capacity() < config.decoded_chunk_size {
             decoded.reserve_exact(config.decoded_chunk_size - decoded.capacity());
         }
+        // Sequential path always emits then clears; force empty so
+        // InflateBackend appends into a fresh buffer for this step.
+        decoded.clear();
 
-        inflater.stream.next_in = input_pointer;
-        inflater.stream.avail_in = input_length as u32;
-        inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-        inflater.stream.avail_out = decoded.capacity() as u32;
-        let input_before = inflater.stream.avail_in;
-        let output_before = inflater.stream.avail_out;
-
-        // SAFETY:
-        // - `inflater.stream` was initialized and is uniquely borrowed.
-        // - `next_in/avail_in` describe the current BufReader page, which is
-        //   not moved or mutated until this call returns.
-        // - `next_out/avail_out` describe uniquely owned spare capacity of
-        //   `decoded`; the backend reports how many bytes it initialized.
-        let status = unsafe { z::inflate(&mut inflater.stream, flush) };
-
-        let consumed = usize::try_from(input_before - inflater.stream.avail_in)
-            .expect("zlib uInt fits usize");
-        let produced = usize::try_from(output_before - inflater.stream.avail_out)
-            .expect("zlib uInt fits usize");
-        cursor.consume(consumed);
-        // SAFETY: `produced` bytes of spare capacity were initialized by inflate.
-        unsafe { decoded.set_len(produced) };
+        let input = cursor.input_page()?;
+        let step = inflater.inflate(input, &mut decoded, flush)?;
+        cursor.consume(step.consumed);
 
         if !decoded.is_empty() {
             let new_total = total_output.checked_add(decoded.len() as u64).ok_or(
@@ -476,43 +445,43 @@ where
             decoded = output.emit_reusable(decoded)?;
         }
 
+        // Bit-accurate offset: bytes consumed so far, less bits still in the
+        // inflater bit buffer. Only meaningful with Block flush; with NoFlush
+        // keep_index is false and this is unused for raw DEFLATE.
         if config.keep_index {
-            let unused_bits = u64::try_from(inflater.stream.data_type & 0x3F)
-                .expect("the low six data_type bits are non-negative");
             let bit_pos = cursor
                 .position()
                 .saturating_mul(8)
-                .saturating_sub(unused_bits);
-            let at_block_end = inflater.stream.data_type & 0x80 != 0;
-            if status == z::Z_STREAM_END || at_block_end {
+                .saturating_sub(u64::from(step.unused_bits));
+            if step.status == inflate_status::STREAM_END || step.at_block_end {
                 index_builder.maybe_checkpoint(bit_pos);
             }
         }
 
-        match status {
-            z::Z_STREAM_END => return Ok(()),
-            z::Z_OK => {
-                if consumed == 0 && produced == 0 {
+        match step.status {
+            inflate_status::STREAM_END => return Ok(()),
+            inflate_status::OK => {
+                if step.consumed == 0 && step.produced == 0 {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: cursor.position().saturating_mul(8),
                         reason: DeflateErrorKind::Stalled,
                     });
                 }
             }
-            z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {}
-            z::Z_BUF_ERROR => {
+            inflate_status::BUF_ERROR if step.consumed > 0 || step.produced > 0 => {}
+            inflate_status::BUF_ERROR => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: cursor.position().saturating_mul(8),
                     reason: DeflateErrorKind::Truncated,
                 });
             }
-            z::Z_NEED_DICT => {
+            inflate_status::NEED_DICT => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: deflate_start_bits,
                     reason: DeflateErrorKind::UnexpectedDictionary,
                 });
             }
-            z::Z_DATA_ERROR => {
+            inflate_status::DATA_ERROR => {
                 let _diagnostic = inflater.message();
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: cursor.position().saturating_mul(8),
@@ -542,10 +511,13 @@ where
     let mut total_output = 0_u64;
     let mut member_count = 0_u64;
     let flush = if config.keep_index {
-        z::Z_BLOCK
+        InflateFlush::Block
     } else {
-        z::Z_NO_FLUSH
+        InflateFlush::NoFlush
     };
+    // Reuse one raw-inflate stream across concatenated gzip members. Each member
+    // starts with an empty window; `reset` clears history.
+    let mut inflater = <RawInflater as InflateBackend>::create()?;
 
     while !cursor.at_end()? {
         let header = parse_member_header(cursor, member_count == 0)?;
@@ -554,7 +526,7 @@ where
         let _observed_bgzf_size = header.bgzf_block_size;
         index_builder.force_checkpoint(header.deflate_start.saturating_mul(8), true);
 
-        let mut inflater = RawInflater::new()?;
+        inflater.reset(header.deflate_start.saturating_mul(8))?;
         let mut crc = Crc32::new();
         let mut member_output = 0_u32;
 
@@ -629,10 +601,13 @@ where
     let mut total_output = 0_u64;
     let mut member_count = 0_u64;
     let flush = if config.keep_index {
-        z::Z_BLOCK
+        InflateFlush::Block
     } else {
-        z::Z_NO_FLUSH
+        InflateFlush::NoFlush
     };
+    // Reuse one raw-inflate stream across concatenated zlib members. Each member
+    // starts with an empty window; `reset` clears history.
+    let mut inflater = <RawInflater as InflateBackend>::create()?;
 
     while !cursor.at_end()? {
         let header = parse_zlib_header(cursor, member_count == 0)?;
@@ -640,7 +615,7 @@ where
         debug_assert_eq!(header.deflate_start, cursor.position());
         index_builder.force_checkpoint(header.deflate_start.saturating_mul(8), true);
 
-        let mut inflater = RawInflater::new()?;
+        inflater.reset(header.deflate_start.saturating_mul(8))?;
         let mut adler = Adler32::new();
         let mut member_output = 0_u32;
 
@@ -729,7 +704,7 @@ where
 
     let mut index_builder = new_index_builder(config);
     let mut total_output = 0_u64;
-    let mut inflater = RawInflater::new()?;
+    let mut inflater = <RawInflater as InflateBackend>::create()?;
     let mut member_output = 0_u32;
     let verify_external_crc = !config.raw_crc32_list.is_empty();
     let mut external_crc = Crc32::new();
@@ -738,7 +713,7 @@ where
         cursor,
         config,
         &mut inflater,
-        z::Z_NO_FLUSH,
+        InflateFlush::NoFlush,
         &mut index_builder,
         &mut total_output,
         &mut member_output,
@@ -772,16 +747,18 @@ where
 
 /// Decodes gzip, zlib, or raw DEFLATE by pulling from `reader` as needed.
 ///
-/// **Sequential** when `decoder_threads == 1` or the resolved format is zlib /
-/// raw DEFLATE: compressed-side memory is a small input page plus inflate state
-/// (not the full archive).
+/// **Sequential** when `decoder_threads == 1`: compressed-side memory is a small
+/// input page plus inflate state (not the full archive). Pure streaming; no
+/// temporary file.
 ///
-/// **Parallel gzip** when `decoder_threads > 1` and the format resolves to gzip
-/// (explicit [`Format::Gzip`] or [`Format::Auto`] after prefix peek): the full
-/// compressed stream is spilled to a private temporary file (secure temp-dir
-/// defaults; deleted on drop), then the positional parallel decode path runs
-/// on that file. Peak cost is roughly the compressed size on disk plus the
-/// usual parallel decoder working set.
+/// **Spill + positional backend** when `decoder_threads > 1`: the full compressed
+/// stream is copied to a private temporary file (secure temp-dir defaults;
+/// deleted on drop), then [`decode_source`] runs with the resolved format forced
+/// (so [`Format::Auto`] cannot re-route after a successful peek). That path uses
+/// the same parallel gates as file/`ReadAt` input: parallel gzip, multi-stream
+/// or marker zlib, and marker raw DEFLATE when threads/size allow.
+/// Peak cost is roughly the compressed size **on disk** plus the decoder working
+/// set (not a second full RAM copy of the archive).
 pub(crate) fn decode_read_stream<R, W>(
     reader: R,
     config: &Config,
@@ -793,28 +770,21 @@ where
 {
     let page = config.input_page_size.max(64);
     let mut cursor = StreamCursor::new(reader, page);
-    match resolve_stream_format(&mut cursor, config)? {
-        Format::Gzip if config.decoder_threads > 1 => {
-            let temp = spill_cursor_to_tempfile(cursor)?;
-            let cancelled = AtomicBool::new(false);
-            let mut sink = DirectOutput::new(output);
-            // Force gzip so Auto cannot re-route after a successful gzip peek.
-            let mut parallel_config = config.clone();
-            parallel_config.format = Format::Gzip;
-            decode_source(temp.as_file(), &parallel_config, &cancelled, &mut sink)
-        }
-        Format::Gzip => {
-            let mut sink = DirectOutput::new(output);
-            decode_gzip_stream(&mut cursor, config, &mut sink)
-        }
-        Format::Zlib => {
-            let mut sink = DirectOutput::new(output);
-            decode_zlib_stream(&mut cursor, config, &mut sink)
-        }
-        Format::RawDeflate => {
-            let mut sink = DirectOutput::new(output);
-            decode_raw_deflate_stream(&mut cursor, config, &mut sink)
-        }
+    let format = resolve_stream_format(&mut cursor, config)?;
+    if config.decoder_threads > 1 {
+        let temp = spill_cursor_to_tempfile(cursor)?;
+        let cancelled = AtomicBool::new(false);
+        let mut sink = DirectOutput::new(output);
+        // Force the peeked/forced concrete format so Auto cannot re-route.
+        let mut parallel_config = config.clone();
+        parallel_config.format = format;
+        return decode_source(temp.as_file(), &parallel_config, &cancelled, &mut sink);
+    }
+    let mut sink = DirectOutput::new(output);
+    match format {
+        Format::Gzip => decode_gzip_stream(&mut cursor, config, &mut sink),
+        Format::Zlib => decode_zlib_stream(&mut cursor, config, &mut sink),
+        Format::RawDeflate => decode_raw_deflate_stream(&mut cursor, config, &mut sink),
         Format::Auto => unreachable!("resolve_stream_format returns concrete formats only"),
     }
 }
@@ -833,7 +803,7 @@ fn spill_cursor_to_tempfile<R: Read>(
     );
     let mut temp = tempfile::Builder::new()
         .prefix("rapidgzip-")
-        .suffix(".gz")
+        .suffix(".bin")
         .tempfile()
         .map_err(|error| DecodeError::input_io(0, error))?;
     // BufReader::read drains its internal buffer first, then the underlying Read.
@@ -908,12 +878,8 @@ mod tests {
             raw_crc32_list: Vec::new(),
         };
         let mut decoded = Vec::new();
-        let report = decode_read_stream(
-            Cursor::new(compressed.as_slice()),
-            &config,
-            &mut decoded,
-        )
-        .unwrap();
+        let report =
+            decode_read_stream(Cursor::new(compressed.as_slice()), &config, &mut decoded).unwrap();
         assert_eq!(decoded, b"first\nsecond\n");
         assert_eq!(report.member_count, 3);
         assert_eq!(report.compressed_bytes, compressed.len() as u64);
@@ -970,5 +936,131 @@ mod tests {
         .unwrap();
         assert_eq!(decoded, b"byte-at-a-time");
         assert_eq!(report.member_count, 1);
+    }
+
+    fn adler32(bytes: &[u8]) -> u32 {
+        const BASE: u32 = 65521;
+        let mut s1 = 1_u32;
+        let mut s2 = 0_u32;
+        for &byte in bytes {
+            s1 = (s1 + u32::from(byte)) % BASE;
+            s2 = (s2 + s1) % BASE;
+        }
+        (s2 << 16) | s1
+    }
+
+    fn zlib_member(bytes: &[u8]) -> Vec<u8> {
+        let mut encoded = vec![0x78, 0x01];
+        encoded.extend_from_slice(&stored_deflate(bytes));
+        encoded.extend_from_slice(&adler32(bytes).to_be_bytes());
+        encoded
+    }
+
+    fn test_config(threads: usize, format: Format) -> Config {
+        Config {
+            decoder_threads: threads,
+            decoded_chunk_size: 64 * 1024,
+            input_page_size: 256,
+            compressed_chunk_size: 1024 * 1024,
+            in_flight_chunks: 4,
+            output_limit: None,
+            format,
+            crc32_enabled: true,
+            keep_index: false,
+            gather_line_offsets: false,
+            checkpoint_spacing: 4 * 1024 * 1024,
+            seek_cache_max_chunks: 0,
+            seek_cache_max_bytes: 0,
+            seek_readahead: false,
+            seek_prefetch_windows: 0,
+            compress_index_windows: true,
+            raw_crc32_list: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn multi_thread_zlib_spill_matches_sequential() {
+        // Multi-member zlib so stream-granularity parallel can activate after spill.
+        let mut compressed = zlib_member(b"first zlib stream\n");
+        compressed.extend(zlib_member(b""));
+        compressed.extend(zlib_member(b"second zlib stream\n"));
+        compressed.extend(zlib_member(b"third\n"));
+        let expected = b"first zlib stream\nsecond zlib stream\nthird\n";
+
+        let sequential = test_config(1, Format::Zlib);
+        let mut seq_out = Vec::new();
+        let seq_report = decode_read_stream(
+            Cursor::new(compressed.as_slice()),
+            &sequential,
+            &mut seq_out,
+        )
+        .unwrap();
+
+        let parallel = test_config(4, Format::Zlib);
+        let mut par_out = Vec::new();
+        let par_report =
+            decode_read_stream(Cursor::new(compressed.as_slice()), &parallel, &mut par_out)
+                .unwrap();
+
+        assert_eq!(par_out, seq_out);
+        assert_eq!(par_out, expected);
+        assert_eq!(par_report.member_count, seq_report.member_count);
+        assert_eq!(par_report.member_count, 4);
+        assert_eq!(par_report.compressed_bytes, seq_report.compressed_bytes);
+        assert_eq!(par_report.decompressed_bytes, seq_report.decompressed_bytes);
+    }
+
+    #[test]
+    fn multi_thread_raw_deflate_spill_matches_sequential() {
+        let payload = b"raw deflate spill payload for multi-thread decode_read";
+        let compressed = stored_deflate(payload);
+
+        let sequential = test_config(1, Format::RawDeflate);
+        let mut seq_out = Vec::new();
+        let seq_report = decode_read_stream(
+            Cursor::new(compressed.as_slice()),
+            &sequential,
+            &mut seq_out,
+        )
+        .unwrap();
+
+        let parallel = test_config(4, Format::RawDeflate);
+        let mut par_out = Vec::new();
+        let par_report =
+            decode_read_stream(Cursor::new(compressed.as_slice()), &parallel, &mut par_out)
+                .unwrap();
+
+        assert_eq!(par_out, seq_out);
+        assert_eq!(par_out, payload);
+        assert_eq!(par_report.member_count, 1);
+        assert_eq!(par_report.member_count, seq_report.member_count);
+        assert_eq!(par_report.compressed_bytes, seq_report.compressed_bytes);
+    }
+
+    #[test]
+    fn single_thread_zlib_and_raw_stream_without_spill_semantics() {
+        // Threads == 1 stays on pure streaming paths (Limited-style small pages).
+        let zlib = zlib_member(b"single-thread zlib");
+        let raw = stored_deflate(b"single-thread raw");
+
+        let mut zlib_out = Vec::new();
+        let zlib_report = decode_read_stream(
+            Cursor::new(zlib.as_slice()),
+            &test_config(1, Format::Zlib),
+            &mut zlib_out,
+        )
+        .unwrap();
+        assert_eq!(zlib_out, b"single-thread zlib");
+        assert_eq!(zlib_report.member_count, 1);
+
+        let mut raw_out = Vec::new();
+        let raw_report = decode_read_stream(
+            Cursor::new(raw.as_slice()),
+            &test_config(1, Format::RawDeflate),
+            &mut raw_out,
+        )
+        .unwrap();
+        assert_eq!(raw_out, b"single-thread raw");
+        assert_eq!(raw_report.member_count, 1);
     }
 }

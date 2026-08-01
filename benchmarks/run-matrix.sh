@@ -29,10 +29,12 @@
 #   SKIP_GZIPPY=1        Skip gzippy cells
 #
 # Fairness (default --mode verify):
-#   Rust:  -P N -t                 (CRC/ISIZE verify, discard payload)
-#   C++:   -P N -t --verify        when -t is accepted; else -P N --verify -c -f
-#          (C++ omits real decode when writing to /dev/null without -f/-l/--count)
+#   Rust:  -P N -t --chunk-size K  (CRC/ISIZE verify, discard payload)
+#   C++:   -P N -t --verify --chunk-size K when -t is accepted;
+#          else -d -P N --verify -c -f --chunk-size K
+#          (0.16+ requires -d for stdout decompress; -f forces real decode to /dev/null)
 #   gzippy: -d -c -p N             (footer verify; no separate --test honor for -p)
+# Failed timed runs are dropped (no row) so a CLI flag mismatch cannot invent thrpt.
 #
 # Output TSV columns:
 #   corpus tool threads run seconds user_seconds system_seconds max_rss_kib decoded_mib_per_second
@@ -51,6 +53,8 @@ cpp_isal_binary=${RAPIDGZIP_CPP_ISAL:-}
 cpp_zlib_ng_binary=${RAPIDGZIP_CPP_ZLIB_NG:-}
 gzippy_binary=${GZIPPY:-}
 decoded_bytes_env=${DECODED_BYTES:-}
+# Shared decoded-chunk budget (KiB) — both CLIs default to 4096; pin explicitly.
+chunk_size_kib=${CHUNK_SIZE_KIB:-4096}
 mode=verify
 tsv_path=
 json_path=
@@ -124,14 +128,54 @@ is_available() {
         && (command -v "$executable" > /dev/null 2>&1 || [[ -x "$executable" ]])
 }
 
+# Detect ISA-L symbols in a rapidgzip CLI (often a Python wrapper + .so).
+# Use grep -a on the file (not strings|grep -q): with pipefail, grep -q can
+# SIGPIPE strings and make a real match look like a miss.
+cpp_binary_has_isal() {
+    local bin=$1
+    local so dir
+    if [[ -f "$bin" ]] && grep -aqiE 'isal_|libisal' "$bin" 2>/dev/null; then
+        return 0
+    fi
+    # Python entrypoint next to site-packages rapidgzip*.so
+    dir=$(cd "$(dirname "$bin")" && pwd)
+    while IFS= read -r -d '' so; do
+        if grep -aqiE 'isal_|libisal' "$so" 2>/dev/null; then
+            return 0
+        fi
+    done < <(find "$dir/../lib" -name 'rapidgzip*.so' -print0 2>/dev/null || true)
+    return 1
+}
+
 # Auto-detect C++ rapidgzip when no explicit CPP env vars are set.
+# Prefer labeling PyPI/source builds with ISA-L as RAPIDGZIP_CPP_ISAL when
+# only one binary is available (fair headline competitor).
 if [[ -z "$cpp_isal_binary" && -z "$cpp_zlib_ng_binary" && -z "${RAPIDGZIP_CPP:-}" ]]; then
     if command -v rapidgzip > /dev/null 2>&1; then
-        cpp_zlib_ng_binary=$(command -v rapidgzip)
+        _auto=$(command -v rapidgzip)
+        if cpp_binary_has_isal "$_auto"; then
+            cpp_isal_binary=$_auto
+        else
+            cpp_zlib_ng_binary=$_auto
+        fi
+        unset _auto
     fi
 else
-    if [[ -z "$cpp_zlib_ng_binary" && -n "${RAPIDGZIP_CPP:-}" ]]; then
-        cpp_zlib_ng_binary=$RAPIDGZIP_CPP
+    # Explicit RAPIDGZIP_CPP: classify by ISA-L symbols when slots are free.
+    if [[ -n "${RAPIDGZIP_CPP:-}" ]]; then
+        if [[ -z "$cpp_isal_binary" && -z "$cpp_zlib_ng_binary" ]]; then
+            if cpp_binary_has_isal "${RAPIDGZIP_CPP}"; then
+                cpp_isal_binary=$RAPIDGZIP_CPP
+            else
+                cpp_zlib_ng_binary=$RAPIDGZIP_CPP
+            fi
+        fi
+    fi
+    # Reclassify a lone "zlib-ng" path that actually embeds ISA-L (common PyPI wheels).
+    if [[ -z "$cpp_isal_binary" && -n "$cpp_zlib_ng_binary" ]] \
+        && cpp_binary_has_isal "$cpp_zlib_ng_binary"; then
+        cpp_isal_binary=$cpp_zlib_ng_binary
+        cpp_zlib_ng_binary=
     fi
 fi
 
@@ -176,11 +220,13 @@ with_affinity() {
 
 # --- C++ flag probing (once, on first available sample) --------------------
 
-# C++ rapidgzip historically used in this repo as: -t --verify -P N
-# Upstream help lists --verify / --no-verify; -t may or may not exist.
-# When sinking to /dev/null without -f/-l/--count, C++ may skip real decode.
+# C++ rapidgzip 0.16 CLI quirks (fair harness must match real decode + CRC):
+#   - -t/--test verifies without writing payload (preferred verify mode).
+#   - stdout decompress needs -d/--decompress; -c alone is not an action.
+#   - Without -f, C++ may elide real decode when the sink is /dev/null.
+#   - Do not pass a literal "-" for stdin; use redirection only.
 cpp_verify_style=none   # t_verify | force_stdout | none
-cpp_stdout_style=force  # always use -c -f for fair sink
+cpp_stdout_style=force  # always -d -c -f for fair sink
 
 probe_cpp_flags() {
     local bin=$1
@@ -188,13 +234,13 @@ probe_cpp_flags() {
     if ! is_available "$bin"; then
         return 0
     fi
-    if with_affinity "$bin" -t --verify -P 1 "$sample" > /dev/null 2> /dev/null; then
+    if with_affinity "$bin" -t --verify -P 1 --chunk-size "$chunk_size_kib" "$sample" > /dev/null 2> /dev/null; then
         cpp_verify_style=t_verify
-    elif with_affinity "$bin" --verify -c -f -P 1 "$sample" > /dev/null 2> /dev/null; then
+    elif with_affinity "$bin" -d --verify -c -f -P 1 --chunk-size "$chunk_size_kib" "$sample" > /dev/null 2> /dev/null; then
         cpp_verify_style=force_stdout
-    elif with_affinity "$bin" -c -f -P 1 "$sample" > /dev/null 2> /dev/null; then
+    elif with_affinity "$bin" -d -c -f -P 1 --chunk-size "$chunk_size_kib" "$sample" > /dev/null 2> /dev/null; then
         cpp_verify_style=force_stdout
-        echo "warning: $bin accepts -c -f but not --verify; CRC verify may be off" >&2
+        echo "warning: $bin accepts -d -c -f but not --verify; CRC verify may be off" >&2
     else
         echo "warning: could not probe fair flags for $bin; C++ cells may be skipped" >&2
         cpp_verify_style=none
@@ -245,6 +291,13 @@ resolve_decoded_bytes() {
     printf ''
 }
 
+# /usr/bin/time format: use spaces (some builds do not expand \t in -f strings).
+# Output: user_seconds system_seconds max_rss_kib. Returns the child exit status.
+run_timed() {
+    # /usr/bin/time returns the child exit code when present.
+    with_affinity /usr/bin/time -q -o "$timing_file" -f '%U %S %M' "$@" > /dev/null 2> /dev/null
+}
+
 benchmark_one() {
     local corpus=$1
     local tool=$2
@@ -253,13 +306,24 @@ benchmark_one() {
     local decoded_bytes=$5
     shift 5
     local started=$EPOCHREALTIME
-    with_affinity /usr/bin/time -q -o "$timing_file" -f '%U\t%S\t%M' "$@" > /dev/null 2> /dev/null
+    local ec=0
+    set +e
+    run_timed "$@"
+    ec=$?
+    set -e
     local finished=$EPOCHREALTIME
+    if [[ $ec -ne 0 ]]; then
+        echo "warning: timed command failed (exit $ec) for $tool threads=$threads run=$run corpus=$corpus: $*" >&2
+        return 0
+    fi
     local elapsed
     elapsed=$(awk -v started="$started" -v finished="$finished" \
         'BEGIN { printf "%.6f", finished - started }')
-    local timing
-    timing=$(<"$timing_file")
+    local user_s sys_s rss_kib
+    read -r user_s sys_s rss_kib <"$timing_file" || true
+    user_s=${user_s:-}
+    sys_s=${sys_s:-}
+    rss_kib=${rss_kib:-}
     local throughput=
     if [[ -n "$decoded_bytes" ]]; then
         throughput=$(awk -v bytes="$decoded_bytes" -v seconds="$elapsed" \
@@ -268,11 +332,13 @@ benchmark_one() {
                 printf "%.3f", bytes / 1048576 / seconds
             }')
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$corpus" "$tool" "$threads" "$run" "$elapsed" "$timing" "$throughput"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$corpus" "$tool" "$threads" "$run" "$elapsed" "$user_s" "$sys_s" "$rss_kib" "$throughput"
 }
 
 # Build argv for C++ under current mode; print nothing and return 1 if unsupported.
+# Fairness: CRC on (--verify / -t), -P N, explicit --chunk-size, -d for stdout
+# actions, and -f so C++ cannot elide decode on /dev/null.
 cpp_cmd_prefix() {
     local bin=$1
     local threads=$2
@@ -280,11 +346,11 @@ cpp_cmd_prefix() {
         verify)
             case "$cpp_verify_style" in
                 t_verify)
-                    printf '%s\0' "$bin" -t --verify -P "$threads"
+                    printf '%s\0' "$bin" -t --verify -P "$threads" --chunk-size "$chunk_size_kib"
                     return 0
                     ;;
                 force_stdout)
-                    printf '%s\0' "$bin" --verify -c -f -P "$threads"
+                    printf '%s\0' "$bin" -d --verify -c -f -P "$threads" --chunk-size "$chunk_size_kib"
                     return 0
                     ;;
                 *)
@@ -293,7 +359,7 @@ cpp_cmd_prefix() {
             esac
             ;;
         stdout)
-            printf '%s\0' "$bin" --verify -c -f -P "$threads"
+            printf '%s\0' "$bin" -d --verify -c -f -P "$threads" --chunk-size "$chunk_size_kib"
             return 0
             ;;
     esac
@@ -355,8 +421,8 @@ for input in "${inputs[@]}"; do
         for _ in $(seq 1 "$warmups"); do
             if [[ "${SKIP_RUST:-0}" != 1 ]]; then
                 case "$mode" in
-                    verify) with_affinity "$rust_binary" -P "$threads" -t "$input" > /dev/null 2> /dev/null || true ;;
-                    stdout) with_affinity "$rust_binary" -P "$threads" -c "$input" > /dev/null 2> /dev/null || true ;;
+                    verify) with_affinity "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -t "$input" > /dev/null 2> /dev/null || true ;;
+                    stdout) with_affinity "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -c "$input" > /dev/null 2> /dev/null || true ;;
                 esac
             fi
             if [[ "${SKIP_CPP:-0}" != 1 ]]; then
@@ -377,11 +443,11 @@ for input in "${inputs[@]}"; do
                 case "$mode" in
                     verify)
                         benchmark_one "$corpus" rapidgzip-rust "$threads" "$run" "$decoded_bytes" \
-                            "$rust_binary" -P "$threads" -t "$input" >> "$raw_tsv"
+                            "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -t "$input" >> "$raw_tsv"
                         ;;
                     stdout)
                         benchmark_one "$corpus" rapidgzip-rust "$threads" "$run" "$decoded_bytes" \
-                            "$rust_binary" -P "$threads" -c "$input" >> "$raw_tsv"
+                            "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -c "$input" >> "$raw_tsv"
                         ;;
                 esac
             fi

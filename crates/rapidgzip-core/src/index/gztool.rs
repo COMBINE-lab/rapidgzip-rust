@@ -8,8 +8,7 @@
 
 use super::{
     Checkpoint, GzipIndex, INDEXED_GZIP_WINDOW_SIZE, IndexError, StoredWindow, WindowMap,
-    decode_bit_offset, encode_bit_offset, read_exact, zlib_compress_window,
-    zlib_decompress_window,
+    decode_bit_offset, encode_bit_offset, read_exact, zlib_compress_window, zlib_decompress_window,
 };
 use std::io::{Read, Write};
 
@@ -61,11 +60,9 @@ pub fn write_gztool_index(
 
         let compressed_window = match index.windows.get(checkpoint.compressed_offset_in_bits) {
             Some(window) if !window.is_empty() => {
-                let payload = window
-                    .payload_for_export(window_size)?
-                    .ok_or(IndexError::InvalidCheckpoint(
-                        "non-empty window produced no export payload",
-                    ))?;
+                let payload = window.payload_for_export(window_size)?.ok_or(
+                    IndexError::InvalidCheckpoint("non-empty window produced no export payload"),
+                )?;
                 Some(zlib_compress_window(&payload)?)
             }
             _ => None,
@@ -366,10 +363,7 @@ mod tests {
                     .iter()
                     .all(|&b| b == 0)
             );
-            assert_eq!(
-                &raw[INDEXED_GZIP_WINDOW_SIZE as usize - 16..],
-                &[0xAB; 16]
-            );
+            assert_eq!(&raw[INDEXED_GZIP_WINDOW_SIZE as usize - 16..], &[0xAB; 16]);
         }
     }
 

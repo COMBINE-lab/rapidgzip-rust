@@ -38,10 +38,7 @@ const BGZI_MAX_PAIRS: u64 = 1 << 28;
 /// bounds (that would mark every checkpoint as EOF).
 fn is_synthetic_eof(index: &GzipIndex, checkpoint: &Checkpoint) -> bool {
     let known_u = index.uncompressed_size_in_bytes;
-    if known_u != 0
-        && known_u != u64::MAX
-        && checkpoint.uncompressed_offset_in_bytes >= known_u
-    {
+    if known_u != 0 && known_u != u64::MAX && checkpoint.uncompressed_offset_in_bytes >= known_u {
         return true;
     }
     let known_c = index.compressed_size_in_bytes;
@@ -112,9 +109,8 @@ pub fn write_bgzi_index(index: &GzipIndex, writer: &mut impl Write) -> Result<()
         prev_u = uaddr;
     }
 
-    let n = u64::try_from(pairs.len()).map_err(|_| {
-        IndexError::InvalidCheckpoint("BGZI pair count does not fit in u64")
-    })?;
+    let n = u64::try_from(pairs.len())
+        .map_err(|_| IndexError::InvalidCheckpoint("BGZI pair count does not fit in u64"))?;
     if n > BGZI_MAX_PAIRS {
         return Err(IndexError::InvalidCheckpoint(
             "BGZI pair count exceeds maximum",
@@ -193,12 +189,9 @@ pub fn read_bgzi_index(
             ));
         }
 
-        let compressed_offset_in_bits =
-            caddr
-                .checked_mul(8)
-                .ok_or(IndexError::InvalidCheckpoint(
-                    "compressed byte offset overflows bit count",
-                ))?;
+        let compressed_offset_in_bits = caddr.checked_mul(8).ok_or(
+            IndexError::InvalidCheckpoint("compressed byte offset overflows bit count"),
+        )?;
 
         // Skip exact duplicates of the implicit origin (defensive).
         if compressed_offset_in_bits == 0 && uaddr == 0 {
@@ -318,7 +311,10 @@ mod tests {
         assert_eq!(restored.compressed_size_in_bytes, 280);
         assert_eq!(restored.uncompressed_size_in_bytes, u64::MAX);
         assert_eq!(restored.checkpoints[1].uncompressed_offset_in_bytes, 50_000);
-        assert_eq!(restored.checkpoints[2].uncompressed_offset_in_bytes, 100_000);
+        assert_eq!(
+            restored.checkpoints[2].uncompressed_offset_in_bytes,
+            100_000
+        );
         for cp in &restored.checkpoints {
             assert!(
                 restored
@@ -347,10 +343,9 @@ mod tests {
     fn bgzi_rejects_non_empty_window_export() {
         let mut index = sample_bgzf_style_index();
         // Mid-stream history at second checkpoint.
-        index.windows.insert(
-            100 * 8,
-            StoredWindow::from_raw(vec![1u8; 32]),
-        );
+        index
+            .windows
+            .insert(100 * 8, StoredWindow::from_raw(vec![1u8; 32]));
         let err = write_bgzi_index(&index, &mut Vec::new()).unwrap_err();
         assert!(matches!(err, IndexError::InvalidCheckpoint(_)));
     }
@@ -435,6 +430,9 @@ mod tests {
         let restored = read_bgzi_index(&mut Cursor::new(&bytes), Some(280)).unwrap();
         assert_eq!(restored.checkpoints.len(), 3);
         assert_eq!(restored.uncompressed_size_in_bytes, u64::MAX);
-        assert_eq!(restored.checkpoints[2].uncompressed_offset_in_bytes, 100_000);
+        assert_eq!(
+            restored.checkpoints[2].uncompressed_offset_in_bytes,
+            100_000
+        );
     }
 }

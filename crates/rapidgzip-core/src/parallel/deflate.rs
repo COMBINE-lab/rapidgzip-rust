@@ -299,7 +299,48 @@ impl History {
         self.length = (self.length + 1).min(WINDOW_SIZE);
     }
 
+    /// Bulk-append marker-free literals into the ring (clean path only).
     #[inline(always)]
+    fn push_clean_bytes(&mut self, bytes: &[u8]) {
+        debug_assert_eq!(self.marker_count, 0);
+        if bytes.is_empty() {
+            return;
+        }
+        // Fast path: the whole run fits before the ring wraps.
+        let space = WINDOW_SIZE - self.next;
+        if bytes.len() <= space {
+            for (offset, &byte) in bytes.iter().enumerate() {
+                self.symbols[self.next + offset] = u16::from(byte);
+            }
+            self.next = (self.next + bytes.len()) & (WINDOW_SIZE - 1);
+            self.length = (self.length + bytes.len()).min(WINDOW_SIZE);
+            return;
+        }
+        // General path: may wrap (DEFLATE matches are ≤258, so usually once).
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let space = WINDOW_SIZE - self.next;
+            let chunk = remaining.len().min(space);
+            for (offset, &byte) in remaining[..chunk].iter().enumerate() {
+                self.symbols[self.next + offset] = u16::from(byte);
+            }
+            self.next = (self.next + chunk) & (WINDOW_SIZE - 1);
+            remaining = &remaining[chunk..];
+        }
+        self.length = (self.length + bytes.len()).min(WINDOW_SIZE);
+    }
+
+    /// Bulk-append already-decoded symbols into the ring (marked path).
+    #[inline(always)]
+    fn push_symbols(&mut self, symbols: &[Symbol]) {
+        for &symbol in symbols {
+            self.push(symbol);
+        }
+    }
+
+    /// Single-symbol ring lookup retained for test oracles (bulk paths no longer
+    /// walk matches byte-by-byte).
+    #[cfg(test)]
     fn get_distance(&self, distance: usize) -> Result<Symbol, Error> {
         if distance == 0 || distance > self.length {
             return Err(Error::InvalidDistance);
@@ -308,11 +349,75 @@ impl History {
         Ok(Symbol::from_encoded(self.symbols[index]))
     }
 
-    #[inline(always)]
+    #[cfg(test)]
     fn get_distance_byte(&self, distance: usize) -> Result<u8, Error> {
         self.get_distance(distance)?
             .as_literal()
             .ok_or(Error::InvalidDistance)
+    }
+
+    /// Append `count` consecutive history bytes beginning `distance` behind the
+    /// write head. Used for the pre-clean portion of a clean-path match.
+    ///
+    /// `count` must not exceed `distance` (caller copies only the
+    /// non-overlapping first period segment from the ring).
+    fn append_bytes_at_distance(
+        &self,
+        distance: usize,
+        count: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        if distance == 0 || distance > self.length {
+            return Err(Error::InvalidDistance);
+        }
+        debug_assert!(count <= distance);
+        debug_assert_eq!(self.marker_count, 0);
+        if count == 0 {
+            return Ok(());
+        }
+        let start = self.next.wrapping_sub(distance) & (WINDOW_SIZE - 1);
+        out.reserve(count);
+        let first = count.min(WINDOW_SIZE - start);
+        for &encoded in &self.symbols[start..start + first] {
+            debug_assert!(encoded <= u8::MAX as u16);
+            out.push(encoded as u8);
+        }
+        if first < count {
+            for &encoded in &self.symbols[..count - first] {
+                debug_assert!(encoded <= u8::MAX as u16);
+                out.push(encoded as u8);
+            }
+        }
+        Ok(())
+    }
+
+    /// Append `count` consecutive history symbols beginning `distance` behind
+    /// the write head (marked path pre-output portion of a match).
+    fn append_symbols_at_distance(
+        &self,
+        distance: usize,
+        count: usize,
+        out: &mut Vec<Symbol>,
+    ) -> Result<(), Error> {
+        if distance == 0 || distance > self.length {
+            return Err(Error::InvalidDistance);
+        }
+        debug_assert!(count <= distance);
+        if count == 0 {
+            return Ok(());
+        }
+        let start = self.next.wrapping_sub(distance) & (WINDOW_SIZE - 1);
+        out.reserve(count);
+        let first = count.min(WINDOW_SIZE - start);
+        for &encoded in &self.symbols[start..start + first] {
+            out.push(Symbol::from_encoded(encoded));
+        }
+        if first < count {
+            for &encoded in &self.symbols[..count - first] {
+                out.push(Symbol::from_encoded(encoded));
+            }
+        }
+        Ok(())
     }
 
     fn literal_window(&self) -> Window {
@@ -577,24 +682,26 @@ fn decode_to_estimated_boundary_unknown(
     start_bit: usize,
     estimated_stop_bit: usize,
     maximum_output: usize,
+    marked: &mut Vec<Symbol>,
 ) -> Result<Chunk, Error> {
     if estimated_stop_bit <= start_bit {
         return Err(Error::BoundaryMismatch);
     }
     let mut reader = BitReader::at(bytes, start_bit)?;
-    let mut marked = Vec::new();
+    // Reuse capacity across failed structural candidates in the same task.
+    marked.clear();
 
     loop {
         let reached_stream_end = reader.read_bits(1)? != 0;
         match reader.read_bits(2)? {
-            0 => decode_stored_block_unknown(&mut reader, &mut marked, maximum_output)?,
+            0 => decode_stored_block_unknown(&mut reader, marked, maximum_output)?,
             1 => {
                 let (literal, distance) = fixed_trees();
                 decode_compressed_block_unknown(
                     &mut reader,
                     literal,
                     distance,
-                    &mut marked,
+                    marked,
                     maximum_output,
                 )?;
             }
@@ -604,7 +711,7 @@ fn decode_to_estimated_boundary_unknown(
                     &mut reader,
                     &literal,
                     &distance,
-                    &mut marked,
+                    marked,
                     maximum_output,
                 )?;
             }
@@ -616,7 +723,7 @@ fn decode_to_estimated_boundary_unknown(
             return Ok(Chunk {
                 start_bit,
                 end_bit: reader.position(),
-                output: DecodedBuffer::from_marked(marked).finish(),
+                output: DecodedBuffer::from_marked(std::mem::take(marked)).finish(),
                 reached_stream_end: true,
                 backend_continuation: None,
             });
@@ -625,16 +732,16 @@ fn decode_to_estimated_boundary_unknown(
             return Ok(Chunk {
                 start_bit,
                 end_bit: reader.position(),
-                output: DecodedBuffer::from_marked(marked).finish(),
+                output: DecodedBuffer::from_marked(std::mem::take(marked)).finish(),
                 reached_stream_end: false,
                 backend_continuation: None,
             });
         }
-        if let Some(window) = marker_free_window(&marked) {
+        if let Some(window) = marker_free_window(marked) {
             return Ok(Chunk {
                 start_bit,
                 end_bit: reader.position(),
-                output: DecodedBuffer::from_marked(marked).finish(),
+                output: DecodedBuffer::from_marked(std::mem::take(marked)).finish(),
                 reached_stream_end: false,
                 backend_continuation: Some(window),
             });
@@ -657,6 +764,12 @@ fn emit_marked(
     Ok(())
 }
 
+/// LZ77 match copy on the marked (Symbol) path with bulk copies.
+///
+/// Same overlap-aware strategy as [`copy_match_unknown`]: the first period is
+/// filled from history and/or `output.marked`, then geometric doubling via
+/// `extend_from_within` expands overlapping matches. History is bulk-updated
+/// once after the match is fully materialised in the output buffer.
 #[inline(always)]
 fn copy_match_marked(
     length: usize,
@@ -665,15 +778,103 @@ fn copy_match_marked(
     output: &mut DecodedBuffer,
     output_limit: usize,
 ) -> Result<(), Error> {
+    if distance == 0 || distance > WINDOW_SIZE || distance > history.length {
+        return Err(Error::InvalidDistance);
+    }
     if length > output_limit.saturating_sub(output.len()) {
         return Err(Error::OutputLimit);
     }
-    output.marked.reserve(length);
-    for _ in 0..length {
-        let copied = history.get_distance(distance)?;
-        history.push(copied);
-        output.marked.push(copied);
+    if length == 0 {
+        return Ok(());
     }
+
+    let marked = &mut output.marked;
+    marked.reserve(length);
+    let match_start = marked.len();
+    let mut copied = 0;
+
+    // Portion that still lives only in the ring (predecessor markers or
+    // pre-marked-buffer history), not yet present in `marked`.
+    if distance > match_start {
+        let from_history = (distance - match_start).min(length);
+        history.append_symbols_at_distance(distance, from_history, marked)?;
+        copied = from_history;
+    }
+
+    // Complete the first non-overlapping period from already-emitted output.
+    let first_period = distance.min(length);
+    if copied < first_period {
+        let count = first_period - copied;
+        let source = marked.len() - distance;
+        marked.extend_from_within(source..source + count);
+        copied += count;
+    }
+
+    // Geometric doubling preserves DEFLATE overlap semantics (e.g. d=1 RLE).
+    while copied < length {
+        let count = copied.min(length - copied);
+        marked.extend_from_within(match_start..match_start + count);
+        copied += count;
+    }
+
+    history.push_symbols(&marked[match_start..]);
+    Ok(())
+}
+
+/// LZ77 match copy on the marker-free clean path with bulk copies.
+///
+/// When the match source lies entirely in `output.clean` (`distance <=
+/// clean.len()`), this is pure `extend_from_within` plus geometric doubling —
+/// the same strategy as [`copy_match_unknown`]. When the match reaches into the
+/// 32 KiB history ring (clean is only the post-marker-drain suffix), the first
+/// period segment is bulk-copied from the ring, then the same doubling path
+/// takes over. History is updated once from the newly appended clean bytes.
+#[inline(always)]
+fn copy_match_clean(
+    length: usize,
+    distance: usize,
+    history: &mut History,
+    output: &mut DecodedBuffer,
+    output_limit: usize,
+) -> Result<(), Error> {
+    debug_assert!(!history.contains_markers());
+    if distance == 0 || distance > WINDOW_SIZE || distance > history.length {
+        return Err(Error::InvalidDistance);
+    }
+    if length > output_limit.saturating_sub(output.len()) {
+        return Err(Error::OutputLimit);
+    }
+    if length == 0 {
+        return Ok(());
+    }
+
+    let clean = &mut output.clean;
+    clean.reserve(length);
+    let match_start = clean.len();
+    let mut copied = 0;
+
+    // Clean only holds post-drain bytes; longer distances pull from the ring.
+    if distance > match_start {
+        let from_history = (distance - match_start).min(length);
+        history.append_bytes_at_distance(distance, from_history, clean)?;
+        copied = from_history;
+    }
+
+    let first_period = distance.min(length);
+    if copied < first_period {
+        let count = first_period - copied;
+        let source = clean.len() - distance;
+        clean.extend_from_within(source..source + count);
+        copied += count;
+    }
+
+    while copied < length {
+        let count = copied.min(length - copied);
+        clean.extend_from_within(match_start..match_start + count);
+        copied += count;
+    }
+
+    history.push_clean_bytes(&clean[match_start..]);
     Ok(())
 }
 
@@ -762,14 +963,7 @@ fn decode_compressed_block_clean(
                 }
                 let copy_distance = DISTANCE_BASE[distance_symbol]
                     + reader.read_bits(DISTANCE_EXTRA[distance_symbol])? as usize;
-                if length > output_limit.saturating_sub(output.len()) {
-                    return Err(Error::OutputLimit);
-                }
-                output.clean.reserve(length);
-                for _ in 0..length {
-                    let copied = history.get_distance_byte(copy_distance)?;
-                    emit_clean_unchecked(copied, history, output);
-                }
+                copy_match_clean(length, copy_distance, history, output, output_limit)?;
             }
             _ => return Err(Error::InvalidSymbol),
         }
@@ -829,16 +1023,30 @@ impl ChunkOutput {
         }
     }
 
+    /// Resolves marked symbols into bytes and returns emptied symbol capacity.
+    ///
+    /// The `Vec<Symbol>` is always cleared and returned (success or error) so
+    /// the resolving worker can recycle it into local scratch. Only call after
+    /// the worker has exclusive ownership of this [`ChunkOutput`] (stolen from
+    /// the resolve queue) — never while the buffer is still enqueued.
     pub(crate) fn resolve_parts(
         self,
         window: &Window,
-    ) -> Result<ResolvedParts, super::marker::MarkerError> {
-        Ok((self.marked.resolve(window)?, self.clean, self.backend_tail))
+    ) -> (
+        Result<ResolvedParts, super::marker::MarkerError>,
+        Vec<Symbol>,
+    ) {
+        let (marked, emptied_symbols) = self.marked.resolve_with_symbols(window);
+        (
+            marked.map(|bytes| (bytes, self.clean, self.backend_tail)),
+            emptied_symbols,
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn resolve(self, window: &Window) -> Result<Vec<u8>, super::marker::MarkerError> {
-        let (mut result, clean, backend_tail) = self.resolve_parts(window)?;
+        let (parts, _emptied_symbols) = self.resolve_parts(window);
+        let (mut result, clean, backend_tail) = parts?;
         result.extend_from_slice(&clean);
         result.extend_from_slice(&backend_tail);
         Ok(result)
@@ -877,6 +1085,17 @@ impl ChunkOutput {
             "a chunk can have only one backend continuation"
         );
         self.backend_tail = bytes;
+    }
+
+    /// Splits owned buffers out for worker-local capacity recycling.
+    ///
+    /// Successful chunks transfer ownership to the coordinator/resolve path; the
+    /// worker must not reuse those allocations until they are fully consumed.
+    /// This helper is only for failed attempts that already built a
+    /// [`ChunkOutput`] (for example a tail inflate that fails after a native
+    /// decode success).
+    pub(crate) fn into_recycle_parts(self) -> (Vec<Symbol>, Vec<u8>, Vec<u8>) {
+        (self.marked.into_symbols(), self.clean, self.backend_tail)
     }
 }
 
@@ -1106,6 +1325,7 @@ pub(crate) fn decode_to_estimated_boundary(
     estimated_stop_bit: usize,
     initial_history: InitialHistory<'_>,
     maximum_output: usize,
+    marked_scratch: &mut Vec<Symbol>,
 ) -> Result<Chunk, Error> {
     if matches!(initial_history, InitialHistory::Unknown) {
         return decode_to_estimated_boundary_unknown(
@@ -1113,6 +1333,7 @@ pub(crate) fn decode_to_estimated_boundary(
             start_bit,
             estimated_stop_bit,
             maximum_output,
+            marked_scratch,
         );
     }
     if estimated_stop_bit <= start_bit {
@@ -1190,10 +1411,65 @@ pub(crate) fn decode_to_estimated_boundary(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkOutput, InitialHistory, Symbol, WINDOW_SIZE, copy_match_unknown, decode_chunk,
+        ChunkOutput, DecodedBuffer, Error, History, InitialHistory, Symbol, WINDOW_SIZE,
+        copy_match_clean, copy_match_marked, copy_match_unknown, decode_chunk,
         find_dynamic_candidates,
     };
     use crate::parallel::{MarkerBuffer, Window};
+
+    /// Seed history with `history_only` (not in clean) followed by `clean`.
+    fn seed_clean_state(history_only: &[u8], clean: &[u8]) -> (History, DecodedBuffer) {
+        let mut history = History::empty();
+        for &byte in history_only {
+            history.push_clean(byte);
+        }
+        for &byte in clean {
+            history.push_clean(byte);
+        }
+        let output = DecodedBuffer {
+            marked: Vec::new(),
+            clean: clean.to_vec(),
+        };
+        (history, output)
+    }
+
+    /// Naive byte-by-byte oracle matching the old clean-path loop.
+    fn naive_copy_match_clean(
+        length: usize,
+        distance: usize,
+        history: &mut History,
+        output: &mut DecodedBuffer,
+        output_limit: usize,
+    ) -> Result<(), Error> {
+        if length > output_limit.saturating_sub(output.len()) {
+            return Err(Error::OutputLimit);
+        }
+        for _ in 0..length {
+            let copied = history.get_distance_byte(distance)?;
+            output.clean.push(copied);
+            history.push_clean(copied);
+        }
+        Ok(())
+    }
+
+    /// Naive marked-path oracle.
+    fn naive_copy_match_marked(
+        length: usize,
+        distance: usize,
+        history: &mut History,
+        output: &mut DecodedBuffer,
+        output_limit: usize,
+    ) -> Result<(), Error> {
+        if length > output_limit.saturating_sub(output.len()) {
+            return Err(Error::OutputLimit);
+        }
+        for _ in 0..length {
+            let copied = history.get_distance(distance)?;
+            history.push(copied);
+            output.marked.push(copied);
+        }
+        Ok(())
+    }
 
     fn hex(text: &str) -> Vec<u8> {
         text.as_bytes()
@@ -1287,6 +1563,212 @@ mod tests {
     }
 
     #[test]
+    fn bulk_clean_match_matches_naive_for_overlap_history_and_ring_wrap() {
+        // history_only lengths exercise: fully in clean, straddling history+clean,
+        // fully in history (empty clean), and distances near the 32 KiB ring edge.
+        let history_only_lens = [0, 1, 7, 31, 257, 4096, WINDOW_SIZE - 8, WINDOW_SIZE];
+        let clean_lens = [0, 1, 7, 31, 258, 1024, 4096];
+        let distances = [1, 2, 3, 7, 31, 100, 257, 4096, WINDOW_SIZE - 1, WINDOW_SIZE];
+        let lengths = [1, 2, 3, 7, 31, 100, 258];
+
+        for history_only_len in history_only_lens {
+            for clean_len in clean_lens {
+                let total = history_only_len + clean_len;
+                if total == 0 {
+                    continue;
+                }
+                // Cap combined seed so history ring semantics stay well-defined.
+                if total > WINDOW_SIZE {
+                    continue;
+                }
+                let history_only: Vec<u8> = (0..history_only_len)
+                    .map(|i| (i.wrapping_mul(13) + 1) as u8)
+                    .collect();
+                let clean: Vec<u8> = (0..clean_len)
+                    .map(|i| (i.wrapping_mul(17) + 3) as u8)
+                    .collect();
+
+                for distance in distances {
+                    if distance > total {
+                        continue;
+                    }
+                    for length in lengths {
+                        let (mut expected_hist, mut expected_out) =
+                            seed_clean_state(&history_only, &clean);
+                        let (mut actual_hist, mut actual_out) =
+                            seed_clean_state(&history_only, &clean);
+
+                        naive_copy_match_clean(
+                            length,
+                            distance,
+                            &mut expected_hist,
+                            &mut expected_out,
+                            usize::MAX,
+                        )
+                        .unwrap();
+                        copy_match_clean(
+                            length,
+                            distance,
+                            &mut actual_hist,
+                            &mut actual_out,
+                            usize::MAX,
+                        )
+                        .unwrap();
+
+                        assert_eq!(
+                            actual_out.clean, expected_out.clean,
+                            "hist_only={history_only_len} clean={clean_len} d={distance} l={length}"
+                        );
+                        // History write heads and contents must match.
+                        assert_eq!(actual_hist.next, expected_hist.next);
+                        assert_eq!(actual_hist.length, expected_hist.length);
+                        assert_eq!(actual_hist.symbols, expected_hist.symbols);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clean_match_distance_one_run_length_expansion() {
+        let (mut history, mut output) = seed_clean_state(&[], b"A");
+        copy_match_clean(100, 1, &mut history, &mut output, usize::MAX).unwrap();
+        assert_eq!(output.clean, vec![b'A'; 101]);
+        assert_eq!(history.length, 101);
+        assert_eq!(history.get_distance_byte(1).unwrap(), b'A');
+    }
+
+    #[test]
+    fn clean_match_rejects_invalid_distance_and_output_limit() {
+        let (mut history, mut output) = seed_clean_state(b"abcd", &[]);
+        assert_eq!(
+            copy_match_clean(3, 0, &mut history, &mut output, usize::MAX),
+            Err(Error::InvalidDistance)
+        );
+        assert_eq!(
+            copy_match_clean(3, 5, &mut history, &mut output, usize::MAX),
+            Err(Error::InvalidDistance)
+        );
+        assert_eq!(
+            copy_match_clean(3, 2, &mut history, &mut output, 2),
+            Err(Error::OutputLimit)
+        );
+    }
+
+    #[test]
+    fn clean_match_ring_wrap_source_segment() {
+        // Fill the ring so the write head is near zero and a long-distance match
+        // source wraps across the end of the symbols array.
+        let mut history = History::empty();
+        for i in 0..WINDOW_SIZE {
+            history.push_clean((i % 251) as u8);
+        }
+        // Advance so next is small but non-zero: push a few more.
+        for i in 0..17 {
+            history.push_clean((200 + i) as u8);
+        }
+        assert_eq!(history.next, 17);
+        assert_eq!(history.length, WINDOW_SIZE);
+
+        let mut output = DecodedBuffer {
+            marked: Vec::new(),
+            clean: Vec::new(),
+        };
+        let distance = WINDOW_SIZE; // entire window
+        let length = 40;
+        let mut expected_hist = History {
+            symbols: history.symbols,
+            length: history.length,
+            next: history.next,
+            marker_count: history.marker_count,
+        };
+        let mut expected_out = DecodedBuffer {
+            marked: Vec::new(),
+            clean: Vec::new(),
+        };
+        naive_copy_match_clean(
+            length,
+            distance,
+            &mut expected_hist,
+            &mut expected_out,
+            usize::MAX,
+        )
+        .unwrap();
+        copy_match_clean(length, distance, &mut history, &mut output, usize::MAX).unwrap();
+        assert_eq!(output.clean, expected_out.clean);
+        assert_eq!(history.symbols, expected_hist.symbols);
+        assert_eq!(history.next, expected_hist.next);
+    }
+
+    #[test]
+    fn bulk_marked_match_matches_naive_for_overlap_and_markers() {
+        let prefixes = [0, 1, 7, 31, 257, 1024];
+        let distances = [1, 2, 7, 31, 257, 1000, WINDOW_SIZE];
+        let lengths = [1, 2, 7, 31, 100, 258];
+
+        for prefix_len in prefixes {
+            for distance in distances {
+                // Unknown history is full of markers; only distances into that
+                // window or into the prefix are valid.
+                if distance > WINDOW_SIZE + prefix_len {
+                    continue;
+                }
+                for length in lengths {
+                    let mut expected_hist = History::unknown();
+                    let mut expected_out = DecodedBuffer {
+                        marked: (0..prefix_len).map(|i| Symbol::literal(i as u8)).collect(),
+                        clean: Vec::new(),
+                    };
+                    for &symbol in &expected_out.marked {
+                        expected_hist.push(symbol);
+                    }
+
+                    let mut actual_hist = History::unknown();
+                    let mut actual_out = DecodedBuffer {
+                        marked: (0..prefix_len).map(|i| Symbol::literal(i as u8)).collect(),
+                        clean: Vec::new(),
+                    };
+                    for &symbol in &actual_out.marked {
+                        actual_hist.push(symbol);
+                    }
+
+                    // Distance may still exceed available history only if prefix
+                    // is empty and we somehow broke the unknown window — skip
+                    // invalid combos the naive path would also reject.
+                    let naive = naive_copy_match_marked(
+                        length,
+                        distance,
+                        &mut expected_hist,
+                        &mut expected_out,
+                        usize::MAX,
+                    );
+                    let bulk = copy_match_marked(
+                        length,
+                        distance,
+                        &mut actual_hist,
+                        &mut actual_out,
+                        usize::MAX,
+                    );
+                    assert_eq!(
+                        bulk, naive,
+                        "prefix={prefix_len} d={distance} l={length} result"
+                    );
+                    if naive.is_ok() {
+                        assert_eq!(
+                            actual_out.marked, expected_out.marked,
+                            "prefix={prefix_len} d={distance} l={length}"
+                        );
+                        assert_eq!(actual_hist.next, expected_hist.next);
+                        assert_eq!(actual_hist.length, expected_hist.length);
+                        assert_eq!(actual_hist.marker_count, expected_hist.marker_count);
+                        assert_eq!(actual_hist.symbols, expected_hist.symbols);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn unresolved_suffix_produces_the_same_window_as_full_resolution() {
         let predecessor = Window::new(
             (0..WINDOW_SIZE)
@@ -1318,7 +1800,9 @@ mod tests {
             };
 
             let actual = make_output().window_after(&predecessor).unwrap();
-            let (mut resolved, clean, backend) = make_output().resolve_parts(&predecessor).unwrap();
+            let (parts, emptied_symbols) = make_output().resolve_parts(&predecessor);
+            let (mut resolved, clean, backend) = parts.unwrap();
+            assert!(emptied_symbols.is_empty());
             resolved.extend_from_slice(&clean);
             resolved.extend_from_slice(&backend);
             assert_eq!(actual, predecessor.advanced_by(&resolved));

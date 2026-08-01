@@ -2,7 +2,7 @@
 
 use clap::{ArgAction, Parser, ValueEnum};
 use rapidgzip_core::{
-    read_gzip_index, DecodeReport, Decoder, Format, GzipIndex, IndexedReader, ReadAt,
+    DecodeReport, Decoder, Format, GzipIndex, IndexedReader, ReadAt, read_gzip_index,
 };
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -80,7 +80,12 @@ struct Arguments {
     /// Write decompressed bytes to a newly created file.
     ///
     /// May be combined with `-c`/`--stdout` to tee (file + stdout).
-    #[arg(short = 'o', long = "output", value_name = "PATH", conflicts_with = "test")]
+    #[arg(
+        short = 'o',
+        long = "output",
+        value_name = "PATH",
+        conflicts_with = "test"
+    )]
     output: Option<PathBuf>,
 
     /// Verify the complete input without retaining output.
@@ -200,7 +205,7 @@ struct Arguments {
     ///
     /// When omitted and standard input is not a terminal, reads from stdin
     /// (gzip-compatible). Ordinary stdin decompress uses [`Decoder::decode_read`]
-    /// (sequential page stream, or multi-thread gzip spill-to-temp + parallel).
+    /// (sequential page stream, or multi-thread spill-to-temp + positional backend).
     /// Paths that need a known archive length / positional source
     /// (`--analyze`, `--import-index`, `--ranges`) spill stdin to a private
     /// temporary file (deleted on exit) rather than holding the full archive in RAM.
@@ -218,7 +223,10 @@ enum InputSource {
 
 /// Loaded compressed bytes ready for positional decode.
 enum CompressedInput {
-    File { path: PathBuf, file: File },
+    File {
+        path: PathBuf,
+        file: File,
+    },
     /// Stdin spilled to a private temporary file (unlinked on drop).
     TempFile(tempfile::NamedTempFile),
 }
@@ -339,7 +347,6 @@ const OSS_ATTRIBUTIONS_YAML: &str = concat!(
     "    licenses: [MIT, Apache-2.0]\n",
 );
 
-
 fn wants_payload(arguments: &Arguments) -> bool {
     arguments.stdout || arguments.output.is_some()
 }
@@ -450,11 +457,7 @@ fn output_destination(
 }
 
 /// Print `-v`/`--verbose` stats on stderr (no-op when quiet or not verbose).
-fn print_verbose_stats(
-    arguments: &Arguments,
-    report: &DecodeReport,
-    elapsed: std::time::Duration,
-) {
+fn print_verbose_stats(arguments: &Arguments, report: &DecodeReport, elapsed: std::time::Duration) {
     if arguments.quiet || !arguments.verbose {
         return;
     }
@@ -479,9 +482,7 @@ fn resolve_input_source(arguments: &Arguments) -> Result<InputSource, Box<dyn st
             if !io::stdin().is_terminal() {
                 Ok(InputSource::Stdin)
             } else {
-                Err(
-                    "missing input file; pass a path, or `-` / a pipe for standard input".into(),
-                )
+                Err("missing input file; pass a path, or `-` / a pipe for standard input".into())
             }
         }
     }
@@ -544,10 +545,10 @@ fn open_output_file(path: &Path, force: bool) -> Result<File, Box<dyn std::error
     }
 }
 
-/// Convert `--chunk-size` (KiB) to bytes for [`DecoderBuilder::decoded_chunk_size`].
+/// Convert `--chunk-size` (KiB) to bytes for [`rapidgzip_core::DecoderBuilder::decoded_chunk_size`].
 ///
 /// Rejects zero. Values that overflow `usize` when scaled are rejected here;
-/// values larger than `u32::MAX` bytes fail later in [`DecoderBuilder::build`].
+/// values larger than `u32::MAX` bytes fail later in [`rapidgzip_core::DecoderBuilder::build`].
 fn chunk_size_kib_to_bytes(kib: usize) -> Result<usize, Box<dyn std::error::Error>> {
     if kib == 0 {
         return Err("--chunk-size must be non-zero".into());
@@ -678,7 +679,7 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let stdout_is_tty = io::stdout().is_terminal();
 
     // Stream stdin decompress/test/count via decode_read (no full RAM buffer;
-    // multi-thread gzip may spill to a temp file inside the library).
+    // multi-thread may spill to a temp file inside the library).
     // Paths that need positional access or a known length spill stdin to a tempfile.
     if matches!(source, InputSource::Stdin)
         && !arguments.analyze
@@ -737,8 +738,7 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     //
     // When --count-lines is requested, prefer a verified decode that gathers
     // line counts rather than decode_with_index (which does not recount lines).
-    let use_index_decode =
-        imported_index.is_some() && !arguments.test && !arguments.count_lines;
+    let use_index_decode = imported_index.is_some() && !arguments.test && !arguments.count_lines;
 
     // Build a fresh index during decode only when exporting and no import was
     // supplied (imported indexes are re-exported after success instead).
@@ -748,11 +748,8 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         || (need_keep_index && matches!(arguments.index_format, IndexFormat::GztoolWithLines));
 
     let decoder = build_decoder(&arguments, need_keep_index, need_gather_lines)?;
-    let destination = output_destination(
-        &arguments,
-        input_file_for_output.as_deref(),
-        stdout_is_tty,
-    );
+    let destination =
+        output_destination(&arguments, input_file_for_output.as_deref(), stdout_is_tty);
 
     let started = Instant::now();
     let (report, retained_import) = if use_index_decode {
@@ -767,8 +764,7 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         // Retain import for export/count (decode_with_index does not clone it).
         (report, Some(index))
     } else {
-        let report =
-            decode_parallel(&decoder, input.as_read_at(), &destination, arguments.force)?;
+        let report = decode_parallel(&decoder, input.as_read_at(), &destination, arguments.force)?;
         (report, imported_index)
     };
     let elapsed = started.elapsed();
@@ -809,12 +805,7 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     if arguments.count_lines {
         let lines = report
             .line_count
-            .or_else(|| {
-                report
-                    .index
-                    .as_ref()
-                    .and_then(GzipIndex::total_line_count)
-            })
+            .or_else(|| report.index.as_ref().and_then(GzipIndex::total_line_count))
             .or_else(|| {
                 retained_import
                     .as_ref()
@@ -832,9 +823,9 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
 /// Streaming decode from stdin via [`Decoder::decode_read`].
 ///
 /// Used for ordinary decompress / `--test` / `--count` / `--count-lines` /
-/// `--export-index` without `--import-index` or `--ranges`. Single-thread /
-/// zlib / raw stay page-streaming; multi-thread gzip spills to a temp file
-/// inside the library then runs the parallel path.
+/// `--export-index` without `--import-index` or `--ranges`. Single-thread
+/// stays page-streaming; multi-thread spills to a temp file inside the library
+/// then runs the positional backend (parallel gzip / zlib when eligible).
 fn run_stdin_stream(
     arguments: Arguments,
     stdout_is_tty: bool,
@@ -877,12 +868,7 @@ fn run_stdin_stream(
     if arguments.count_lines {
         let lines = report
             .line_count
-            .or_else(|| {
-                report
-                    .index
-                    .as_ref()
-                    .and_then(GzipIndex::total_line_count)
-            })
+            .or_else(|| report.index.as_ref().and_then(GzipIndex::total_line_count))
             .ok_or("line count was not produced (gather_line_offsets did not run)")?;
         print_count(lines);
     }
@@ -1221,9 +1207,9 @@ fn parse_ranges(spec: &str) -> Result<ParsedRanges, Box<dyn std::error::Error>> 
 }
 
 fn parse_one_range(part: &str) -> Result<(ExtractRange, RangeUnit), Box<dyn std::error::Error>> {
-    let (length_str, offset_str) = part.split_once('@').ok_or_else(|| {
-        format!("invalid range '{part}': expected LENGTH@OFFSET")
-    })?;
+    let (length_str, offset_str) = part
+        .split_once('@')
+        .ok_or_else(|| format!("invalid range '{part}': expected LENGTH@OFFSET"))?;
 
     let length_is_line = size_uses_line_unit(length_str);
     let offset_is_line = size_uses_line_unit(offset_str);
@@ -1358,10 +1344,8 @@ mod tests {
     use std::io::Write;
 
     fn parse_args(args: &[&str]) -> Arguments {
-        Arguments::try_parse_from(
-            std::iter::once("rapidgzip-rust").chain(args.iter().copied()),
-        )
-        .expect("parse args")
+        Arguments::try_parse_from(std::iter::once("rapidgzip-rust").chain(args.iter().copied()))
+            .expect("parse args")
     }
 
     #[test]
@@ -1565,10 +1549,8 @@ mod tests {
 
     #[test]
     fn open_output_file_refuses_overwrite_without_force() {
-        let dir = std::env::temp_dir().join(format!(
-            "rapidgzip-rust-cli-force-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rapidgzip-rust-cli-force-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.bin");
@@ -1594,10 +1576,8 @@ mod tests {
 
     #[test]
     fn open_output_file_creates_when_missing() {
-        let dir = std::env::temp_dir().join(format!(
-            "rapidgzip-rust-cli-create-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rapidgzip-rust-cli-create-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("fresh.bin");
@@ -1652,8 +1632,20 @@ mod tests {
     fn parse_multiple_comma_separated() {
         let ranges = parse_ranges("5@0, 5@10").unwrap();
         assert_eq!(ranges.ranges.len(), 2);
-        assert_eq!(ranges.ranges[0], ExtractRange { offset: 0, length: Some(5) });
-        assert_eq!(ranges.ranges[1], ExtractRange { offset: 10, length: Some(5) });
+        assert_eq!(
+            ranges.ranges[0],
+            ExtractRange {
+                offset: 0,
+                length: Some(5)
+            }
+        );
+        assert_eq!(
+            ranges.ranges[1],
+            ExtractRange {
+                offset: 10,
+                length: Some(5)
+            }
+        );
     }
 
     #[test]
@@ -1734,7 +1726,7 @@ mod tests {
         );
     }
 
-#[test]
+    #[test]
     fn verify_flag_parses_and_conflicts_with_no_verify() {
         let args = parse_args(&["--verify", "reads.fastq.gz"]);
         assert!(args.verify);
@@ -1753,7 +1745,7 @@ mod tests {
         assert!(err.is_err(), "expected --verify/--no-verify conflict");
     }
 
-#[test]
+    #[test]
     fn oss_attributions_text_mentions_common_licenses() {
         let text = OSS_ATTRIBUTIONS;
         let has_marker = text.contains("BSD")
@@ -1765,10 +1757,12 @@ mod tests {
             text.contains("zlib-rs") || text.contains("Zlib"),
             "expected zlib-rs/Zlib mention"
         );
-        assert!(OSS_ATTRIBUTIONS_YAML.contains("BSD-3-Clause") || OSS_ATTRIBUTIONS_YAML.contains("MIT"));
+        assert!(
+            OSS_ATTRIBUTIONS_YAML.contains("BSD-3-Clause") || OSS_ATTRIBUTIONS_YAML.contains("MIT")
+        );
     }
 
-#[test]
+    #[test]
     fn oss_attributions_run_without_input() {
         // Prints to stdout; must succeed without an INPUT path.
         run(parse_args(&["--oss-attributions"])).unwrap();

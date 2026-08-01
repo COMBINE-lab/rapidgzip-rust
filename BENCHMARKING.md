@@ -36,25 +36,30 @@ Results land in `target/bench-results/<UTC-timestamp>/` (`matrix-verify.tsv`,
 | Rule | Detail |
 |------|--------|
 | Same thread budgets | `THREAD_CELLS` / `--threads` applied to every tool |
-| CRC verify on | Rust `-t` (or default verify on `-c`); C++ `-t --verify` when accepted, else `--verify -c -f` |
+| CRC verify on | Rust `-t` (or default verify on `-c`); C++ `-t --verify` when accepted, else `-d --verify -c -f` |
+| Matched chunk size | Both get `--chunk-size ${CHUNK_SIZE_KIB:-4096}` (KiB) |
 | Same sink | Discard payload (`-t` / sink, or `-c` with stdout discarded by the harness) |
 | Warmups + median | Default 2 warmups + 9 measured runs for release; CI uses fewer. Report **median** wall time, MiB/s, peak RSS |
-| Affinity | Optional `TASKSET=0-43` or `TASKSET="taskset -c 0-43"` wraps every timed process |
-| Auto-detect | If `RAPIDGZIP_CPP*` unset, use `rapidgzip` on `PATH` |
+| Corpus size | Non-CI default **32 MiB** uncompressed (`CORPUS_BYTES`); avoid sub-4 MiB cells for headlines |
+| Affinity | Non-CI auto-sets `TASKSET=0-(nproc-1)` when unset; wraps every timed process |
+| Fail closed | Timed commands that exit non-zero drop the row (no invented thrpt from flag mismatches) |
+| Auto-detect | If `RAPIDGZIP_CPP*` unset: `target/bench-venv/bin/rapidgzip`, else `PATH`. ISA-L symbols → `rapidgzip-cpp-isal` |
 | Throughput | `DECODED_BYTES` or auto via `rapidgzip-rust --count` |
 
-**Intentionally not equalized:** inflate backend. C++ may use ISA-L and/or
-zlib-ng; Rust uses zlib-rs. That is an implementation difference, not a
-methodology bug — report **both** C++ builds when available
-(`RAPIDGZIP_CPP_ISAL` and `RAPIDGZIP_CPP_ZLIB_NG`) and do not claim ISA-L
-parity from a zlib-ng-only binary.
+**Intentionally not equalized:** inflate backend. C++ manylinux wheels embed
+ISA-L; Rust uses zlib-rs. That is an implementation difference, not a
+methodology bug — report the backend label honestly and do not claim ISA-L
+parity from a zlib-ng-only binary. PyPI entrypoints are Python wrappers
+(baseline RSS includes the interpreter).
 
 ### Installing C++ rapidgzip for comparison
 
 ```bash
-python3 -m pip install --user rapidgzip
-# or build from https://github.com/mxmlnkn/rapidgzip
-export RAPIDGZIP_CPP=$(command -v rapidgzip)
+# Preferred fair competitor: 0.16.x with ISA-L in the wheel
+uv venv target/bench-venv
+uv pip install --python target/bench-venv/bin/python 'rapidgzip==0.16.0'
+export PATH="$PWD/target/bench-venv/bin:$PATH"
+# or: python3 -m pip install --user 'rapidgzip==0.16.0'
 # Optional separate builds:
 #   RAPIDGZIP_CPP_ISAL=/path/to/rapidgzip-with-isal
 #   RAPIDGZIP_CPP_ZLIB_NG=/path/to/rapidgzip-zlib-ng-only
@@ -65,16 +70,17 @@ Non-CI `run-fair.sh` errors with the install hint above.
 
 ### Mode matrix (`benchmarks/parity-compare.sh`)
 
-| Mode | Rust | C++ rapidgzip |
+| Mode | Rust | C++ rapidgzip (0.16+) |
 |------|------|----------------|
-| `verify` | `-P N -t` | `-P N -t --verify` (fallback: `--verify -c -f`) |
-| `stdout` | `-P N -c` (stdout discarded) | `-P N --verify -c -f` |
-| `index` | export GZIDX; `-P N -c --import-index` | export; `--import-index --verify -c -f` |
-| `stdin` | `rust -P N -c - < file` | `rapidgzip -P N -c -f - < file` (sequential) |
+| `verify` | `-P N --chunk-size K -t` | `-P N -t --verify --chunk-size K` (fallback: `-d --verify -c -f`) |
+| `stdout` | `-P N --chunk-size K -c` (stdout discarded) | `-d -P N --verify -c -f --chunk-size K` |
+| `index` | export GZIDX; `-P N -c --import-index` | export; `-d --import-index --verify -c -f` |
+| `stdin` | `rust -P N -c - < file` | `rapidgzip -d -P N -c -f < file` (no literal `-` arg) |
 
-C++ may skip real decode when writing to `/dev/null` without `-f` / `-l` /
-`--count`; the harness always forces a real decode for sink modes. Rust
-`--test` with `--import-index` does **not** use the index decode path (it
+C++ 0.16 requires `-d`/`--decompress` for stdout actions (`-c` alone is not
+an action). C++ may skip real decode when writing to `/dev/null` without `-f`
+/ `-l` / `--count`; the harness always forces a real decode for sink modes.
+Rust `--test` with `--import-index` does **not** use the index decode path (it
 re-verifies via the parallel pipeline); index mode therefore uses `-c
 --import-index` on Rust. Stdin is sequential on both tools — not a
 parallel-scaling cell.

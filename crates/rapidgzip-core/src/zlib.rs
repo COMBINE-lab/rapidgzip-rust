@@ -82,11 +82,7 @@ pub(crate) fn looks_like_zlib<R: ReadAt + ?Sized>(
     Ok(is_zlib_cmf_flg(bytes[0], bytes[1]))
 }
 
-fn map_truncated(
-    start: u64,
-    first_member: bool,
-    error: DecodeError,
-) -> DecodeError {
+fn map_truncated(start: u64, first_member: bool, error: DecodeError) -> DecodeError {
     match error {
         DecodeError::InvalidGzip {
             reason: crate::GzipErrorKind::Truncated,

@@ -112,7 +112,9 @@ fn parallel_index_decode_matches_plain_decode() {
 
 #[test]
 fn threads_one_and_four_produce_identical_output() {
-    let payload: Vec<u8> = (0..60_000u32).map(|i| (i.wrapping_mul(17) % 256) as u8).collect();
+    let payload: Vec<u8> = (0..60_000u32)
+        .map(|i| (i.wrapping_mul(17) % 256) as u8)
+        .collect();
     let compressed = member(&payload);
     let (_, index) = build_index(&compressed, 8_192);
 
@@ -269,11 +271,9 @@ fn export_import_round_trip_then_parallel_decode() {
 
     let mut exported = Vec::new();
     index.export_indexed_gzip(&mut exported).unwrap();
-    let restored = GzipIndex::import_indexed_gzip(
-        &mut Cursor::new(&exported),
-        Some(compressed.len() as u64),
-    )
-    .unwrap();
+    let restored =
+        GzipIndex::import_indexed_gzip(&mut Cursor::new(&exported), Some(compressed.len() as u64))
+            .unwrap();
 
     let (decoded, _) = decode_with_index_bytes(&compressed, &restored, 4);
     assert_eq!(decoded, payload);

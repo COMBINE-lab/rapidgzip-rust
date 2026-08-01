@@ -125,10 +125,7 @@ impl StoredWindow {
         let data = bytes.into();
         // Only compress windows that fit the DEFLATE history size so on-demand
         // inflate stays within the fixed 32 KiB output bound.
-        if !compress
-            || data.is_empty()
-            || data.len() > INDEXED_GZIP_WINDOW_SIZE as usize
-        {
+        if !compress || data.is_empty() || data.len() > INDEXED_GZIP_WINDOW_SIZE as usize {
             return Self::from_raw(data);
         }
         match zlib_compress_window(&data) {
@@ -235,14 +232,8 @@ pub(crate) fn zlib_compress_window(data: &[u8]) -> Result<Vec<u8>, IndexError> {
     // - `dest` is a live exclusive allocation of length `dest_len`.
     // - `data` is a live immutable slice for the call duration.
     // - `compress_z` only writes up to `*dest_len` and reports the used length.
-    let status = unsafe {
-        z::compress_z(
-            dest.as_mut_ptr(),
-            &mut dest_len,
-            data.as_ptr(),
-            data.len(),
-        )
-    };
+    let status =
+        unsafe { z::compress_z(dest.as_mut_ptr(), &mut dest_len, data.as_ptr(), data.len()) };
     if status != z::Z_OK {
         return Err(IndexError::InvalidCheckpoint(
             "failed to zlib-compress index window",
@@ -328,7 +319,9 @@ impl WindowMap {
 
     /// Iterates over `(compressed_offset_in_bits, window)` in offset order.
     pub fn iter(&self) -> impl Iterator<Item = (u64, &StoredWindow)> {
-        self.windows.iter().map(|(&offset, window)| (offset, window))
+        self.windows
+            .iter()
+            .map(|(&offset, window)| (offset, window))
     }
 }
 
@@ -393,7 +386,9 @@ impl GzipIndex {
         if !self.has_line_offsets {
             return None;
         }
-        self.checkpoints.last().map(|checkpoint| checkpoint.line_offset)
+        self.checkpoints
+            .last()
+            .map(|checkpoint| checkpoint.line_offset)
     }
 
     /// Largest checkpoint with `uncompressed_offset_in_bytes <= target`.
@@ -402,9 +397,9 @@ impl GzipIndex {
     /// `uncompressed_offset`.
     #[must_use]
     pub fn checkpoint_at_or_before(&self, uncompressed_offset: u64) -> Option<&Checkpoint> {
-        let index = self
-            .checkpoints
-            .partition_point(|checkpoint| checkpoint.uncompressed_offset_in_bytes <= uncompressed_offset);
+        let index = self.checkpoints.partition_point(|checkpoint| {
+            checkpoint.uncompressed_offset_in_bytes <= uncompressed_offset
+        });
         index.checked_sub(1).map(|i| &self.checkpoints[i])
     }
 
@@ -461,12 +456,9 @@ impl GzipIndex {
             prev_uncompressed = checkpoint.uncompressed_offset_in_bytes;
 
             if self.compressed_size_in_bytes != u64::MAX {
-                let max_bits = self
-                    .compressed_size_in_bytes
-                    .checked_mul(8)
-                    .ok_or(IndexError::InvalidCheckpoint(
-                        "compressed size overflows bit count",
-                    ))?;
+                let max_bits = self.compressed_size_in_bytes.checked_mul(8).ok_or(
+                    IndexError::InvalidCheckpoint("compressed size overflows bit count"),
+                )?;
                 if checkpoint.compressed_offset_in_bits > max_bits {
                     return Err(IndexError::InvalidCheckpoint(
                         "checkpoint compressed offset exceeds archive size",
@@ -688,9 +680,11 @@ pub fn decode_bit_offset(byte_offset: u64, bits_field: u8) -> Result<u64, IndexE
             "denormal compressed offset: bit field >= 8",
         ));
     }
-    let bit_offset = byte_offset.checked_mul(8).ok_or(IndexError::InvalidCheckpoint(
-        "compressed byte offset overflows bit count",
-    ))?;
+    let bit_offset = byte_offset
+        .checked_mul(8)
+        .ok_or(IndexError::InvalidCheckpoint(
+            "compressed byte offset overflows bit count",
+        ))?;
     if bits_field == 0 {
         return Ok(bit_offset);
     }
@@ -708,7 +702,10 @@ pub fn decode_bit_offset(byte_offset: u64, bits_field: u8) -> Result<u64, IndexE
 /// windows are exported as exactly that many bytes (leading-zero padded or
 /// trailing-truncated as needed). Empty or missing windows set `data_flag = 0`
 /// and emit no payload.
-pub fn write_indexed_gzip_index(index: &GzipIndex, writer: &mut impl Write) -> Result<(), IndexError> {
+pub fn write_indexed_gzip_index(
+    index: &GzipIndex,
+    writer: &mut impl Write,
+) -> Result<(), IndexError> {
     let window_size = INDEXED_GZIP_WINDOW_SIZE as usize;
 
     writer
@@ -724,9 +721,8 @@ pub fn write_indexed_gzip_index(index: &GzipIndex, writer: &mut impl Write) -> R
     write_u32_le(writer, INDEXED_GZIP_WINDOW_SIZE)?;
     write_u32_le(
         writer,
-        u32::try_from(index.checkpoints.len()).map_err(|_| {
-            IndexError::InvalidCheckpoint("checkpoint count does not fit in u32")
-        })?,
+        u32::try_from(index.checkpoints.len())
+            .map_err(|_| IndexError::InvalidCheckpoint("checkpoint count does not fit in u32"))?,
     )?;
 
     for checkpoint in &index.checkpoints {
@@ -1033,9 +1029,7 @@ impl IndexBuilder {
         if self.gather_lines {
             self.line_cursor = self.line_cursor.saturating_add(count_newlines(bytes));
         }
-        self.uncompressed_cursor = self
-            .uncompressed_cursor
-            .saturating_add(bytes.len() as u64);
+        self.uncompressed_cursor = self.uncompressed_cursor.saturating_add(bytes.len() as u64);
         if self.gather_lines {
             self.line_samples
                 .insert(self.uncompressed_cursor, self.line_cursor);
@@ -1086,11 +1080,7 @@ impl IndexBuilder {
     /// Used for member boundaries and other forced points. When
     /// `empty_window` is true the stored window is empty (history resets);
     /// otherwise the rolling window is copied.
-    pub(crate) fn force_checkpoint(
-        &mut self,
-        compressed_offset_in_bits: u64,
-        empty_window: bool,
-    ) {
+    pub(crate) fn force_checkpoint(&mut self, compressed_offset_in_bits: u64, empty_window: bool) {
         if !self.enabled {
             return;
         }
@@ -1099,11 +1089,7 @@ impl IndexBuilder {
         } else {
             WindowSource::Rolling
         };
-        self.insert(
-            compressed_offset_in_bits,
-            self.uncompressed_cursor,
-            window,
-        );
+        self.insert(compressed_offset_in_bits, self.uncompressed_cursor, window);
     }
 
     /// Records a checkpoint at explicit offsets, subject to spacing unless
@@ -1125,8 +1111,7 @@ impl IndexBuilder {
         }
         if !force
             && !self.index.checkpoints.is_empty()
-            && uncompressed_offset_in_bytes
-                .saturating_sub(self.last_checkpoint_uncompressed)
+            && uncompressed_offset_in_bytes.saturating_sub(self.last_checkpoint_uncompressed)
                 < self.spacing
         {
             return;
@@ -1214,9 +1199,7 @@ impl IndexBuilder {
             uncompressed_offset_in_bytes,
             line_offset,
         });
-        self.index
-            .windows
-            .insert(compressed_offset_in_bits, stored);
+        self.index.windows.insert(compressed_offset_in_bits, stored);
         self.last_checkpoint_uncompressed = uncompressed_offset_in_bytes;
     }
 
@@ -1250,12 +1233,7 @@ impl IndexBuilder {
                 .iter()
                 .map(|checkpoint| self.line_offset_for(checkpoint.uncompressed_offset_in_bytes))
                 .collect();
-            for (checkpoint, line_offset) in self
-                .index
-                .checkpoints
-                .iter_mut()
-                .zip(line_offsets)
-            {
+            for (checkpoint, line_offset) in self.index.checkpoints.iter_mut().zip(line_offsets) {
                 checkpoint.line_offset = line_offset;
             }
             self.index.has_line_offsets = true;
@@ -1444,7 +1422,8 @@ mod tests {
 
         let mut bytes = Vec::new();
         write_indexed_gzip_index(&index, &mut bytes).expect("export");
-        let restored = read_indexed_gzip_index(&mut Cursor::new(&bytes), Some(1024)).expect("import");
+        let restored =
+            read_indexed_gzip_index(&mut Cursor::new(&bytes), Some(1024)).expect("import");
 
         assert_eq!(restored.checkpoints.len(), 3);
         for (i, &bits) in offsets.iter().enumerate() {
@@ -1463,13 +1442,12 @@ mod tests {
             let window = restored.windows.get(bits).expect("window");
             assert_eq!(window.len(), INDEXED_GZIP_WINDOW_SIZE as usize);
             let raw = window.decompressed().unwrap();
-            assert!(raw[..INDEXED_GZIP_WINDOW_SIZE as usize - 16]
-                .iter()
-                .all(|&b| b == 0));
-            assert_eq!(
-                &raw[INDEXED_GZIP_WINDOW_SIZE as usize - 16..],
-                &[0xAB; 16]
+            assert!(
+                raw[..INDEXED_GZIP_WINDOW_SIZE as usize - 16]
+                    .iter()
+                    .all(|&b| b == 0)
             );
+            assert_eq!(&raw[INDEXED_GZIP_WINDOW_SIZE as usize - 16..], &[0xAB; 16]);
         }
     }
 
@@ -1600,8 +1578,7 @@ mod tests {
         };
         let mut bytes = Vec::new();
         write_indexed_gzip_index(&index, &mut bytes).unwrap();
-        let err =
-            read_indexed_gzip_index(&mut Cursor::new(&bytes), Some(99)).unwrap_err();
+        let err = read_indexed_gzip_index(&mut Cursor::new(&bytes), Some(99)).unwrap_err();
         assert_eq!(
             err,
             IndexError::ArchiveSizeMismatch {
@@ -1736,7 +1713,13 @@ mod tests {
         assert_eq!(index.checkpoints.len(), 2);
         assert!(index.windows.get(0).unwrap().is_empty());
         assert_eq!(
-            index.windows.get(16).unwrap().decompressed().unwrap().as_ref(),
+            index
+                .windows
+                .get(16)
+                .unwrap()
+                .decompressed()
+                .unwrap()
+                .as_ref(),
             &vec![0x5A; window_size][..]
         );
     }

@@ -3,12 +3,12 @@
 #
 # Modes (each cell: warmups + RUNS, same threads, same sink policy):
 #
-#   | Mode              | Rust                         | C++ rapidgzip                          |
+#   | Mode              | Rust                         | C++ rapidgzip (0.16+)                  |
 #   |-------------------|------------------------------|----------------------------------------|
-#   | verify            | -P N -t                      | -P N -t --verify  (or --verify -c -f)  |
-#   | stdout            | -P N -c > /dev/null          | -P N --verify -c -f > /dev/null        |
-#   | index             | export index; import+decode  | export index; import+decode (if ok)    |
-#   | stdin             | cat f | rust -c - > /dev/null| cat f | rapidgzip -c -f > /dev/null    |
+#   | verify            | -P N -t                      | -P N -t --verify  (or -d --verify -c -f)|
+#   | stdout            | -P N -c > /dev/null          | -d -P N --verify -c -f > /dev/null     |
+#   | index             | export index; import+decode  | export; -d --import-index --verify -c -f|
+#   | stdin             | rust -c - < f > /dev/null    | rapidgzip -d -c -f < f  (no "-" arg)   |
 #
 # Usage:
 #   benchmarks/parity-compare.sh [OPTIONS] INPUT.gz [INPUT2.gz ...]
@@ -16,23 +16,28 @@
 #
 # Options:
 #   --modes "verify stdout index stdin"   Subset of modes (default: all available)
+#   --threads "1 4 8"                     Thread budgets (default: THREAD_CELLS or "1 4")
+#   --runs N / --warmups N                Overrides RUNS / WARMUPS
 #   --tsv PATH                            Write raw TSV (default: stdout)
 #   --json PATH                           Median summary JSON
 #   --corpus-dir DIR                      Expand *.gz/*.bgz from DIR
 #   -h, --help
 #
 # Environment: same as run-matrix.sh (RUNS, WARMUPS, THREAD_CELLS, RAPIDGZIP_*,
-# TASKSET, DECODED_BYTES). SKIP_CPP=1 skips C++. Index mode is skipped when C++
-# lacks --export-index/--import-index.
+# TASKSET, DECODED_BYTES, CHUNK_SIZE_KIB). SKIP_CPP=1 skips C++. Index mode is
+# skipped when C++ lacks --export-index/--import-index.
 #
 # Flag differences worth knowing:
 #   - Rust verifies CRC by default; --no-verify disables. C++ defaults may skip
 #     CRC unless --verify is passed (upstream documents --verify as optional).
+#   - C++ 0.16+ needs -d/--decompress for stdout actions; -c alone is not enough.
 #   - C++ may elide real decode when writing to /dev/null without -f / -l /
 #     --count; this harness always passes -f for stdout sinks.
-#   - C++ -t (test) is probed; if missing, verify mode uses --verify -c -f.
+#   - C++ -t (test) is probed; if missing, verify mode uses -d --verify -c -f.
+#   - C++ rejects a literal "-" stdin path; use redirection only (no dash arg).
 #   - Stdin is sequential on both tools (no parallel gzip without ReadAt/seek).
 #   - Index format defaults to indexed_gzip (GZIDX) on both when supported.
+#   - Failed timed runs drop the row (no invented thrpt from CLI flag errors).
 set -euo pipefail
 
 usage() {
@@ -47,6 +52,7 @@ rust_binary=${RAPIDGZIP_RUST:-target/release/rapidgzip-rust}
 cpp_isal_binary=${RAPIDGZIP_CPP_ISAL:-}
 cpp_zlib_ng_binary=${RAPIDGZIP_CPP_ZLIB_NG:-}
 decoded_bytes_env=${DECODED_BYTES:-}
+chunk_size_kib=${CHUNK_SIZE_KIB:-4096}
 modes_str="verify stdout index stdin"
 tsv_path=
 json_path=
@@ -57,6 +63,9 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage ;;
         --modes) modes_str=$2; shift 2 ;;
+        --threads) thread_cells=$2; shift 2 ;;
+        --runs) runs=$2; shift 2 ;;
+        --warmups) warmups=$2; shift 2 ;;
         --tsv) tsv_path=$2; shift 2 ;;
         --json) json_path=$2; shift 2 ;;
         --corpus-dir) corpus_dir=$2; shift 2 ;;
@@ -86,13 +95,46 @@ is_available() {
         && (command -v "$executable" > /dev/null 2>&1 || [[ -x "$executable" ]])
 }
 
+# grep -a on the file (not strings|grep -q): pipefail + SIGPIPE can hide matches.
+cpp_binary_has_isal() {
+    local bin=$1 so dir
+    if [[ -f "$bin" ]] && grep -aqiE 'isal_|libisal' "$bin" 2>/dev/null; then
+        return 0
+    fi
+    dir=$(cd "$(dirname "$bin")" && pwd)
+    while IFS= read -r -d '' so; do
+        if grep -aqiE 'isal_|libisal' "$so" 2>/dev/null; then
+            return 0
+        fi
+    done < <(find "$dir/../lib" -name 'rapidgzip*.so' -print0 2>/dev/null || true)
+    return 1
+}
+
 if [[ -z "$cpp_isal_binary" && -z "$cpp_zlib_ng_binary" && -z "${RAPIDGZIP_CPP:-}" ]]; then
     if command -v rapidgzip > /dev/null 2>&1; then
-        cpp_zlib_ng_binary=$(command -v rapidgzip)
+        _auto=$(command -v rapidgzip)
+        if cpp_binary_has_isal "$_auto"; then
+            cpp_isal_binary=$_auto
+        else
+            cpp_zlib_ng_binary=$_auto
+        fi
+        unset _auto
     fi
 else
-    if [[ -z "$cpp_zlib_ng_binary" && -n "${RAPIDGZIP_CPP:-}" ]]; then
-        cpp_zlib_ng_binary=$RAPIDGZIP_CPP
+    if [[ -n "${RAPIDGZIP_CPP:-}" ]]; then
+        if [[ -z "$cpp_isal_binary" && -z "$cpp_zlib_ng_binary" ]]; then
+            if cpp_binary_has_isal "${RAPIDGZIP_CPP}"; then
+                cpp_isal_binary=$RAPIDGZIP_CPP
+            else
+                cpp_zlib_ng_binary=$RAPIDGZIP_CPP
+            fi
+        fi
+    fi
+    # Reclassify a lone "zlib-ng" path that actually embeds ISA-L (common PyPI wheels).
+    if [[ -z "$cpp_isal_binary" && -n "$cpp_zlib_ng_binary" ]] \
+        && cpp_binary_has_isal "$cpp_zlib_ng_binary"; then
+        cpp_isal_binary=$cpp_zlib_ng_binary
+        cpp_zlib_ng_binary=
     fi
 fi
 
@@ -140,16 +182,18 @@ fi
 
 if [[ ${#cpp_bins[@]} -gt 0 ]]; then
     probe_bin=${cpp_bins[0]}
-    if with_affinity "$probe_bin" -t --verify -P 1 "$first_sample" > /dev/null 2> /dev/null; then
+    if with_affinity "$probe_bin" -t --verify -P 1 --chunk-size "$chunk_size_kib" "$first_sample" > /dev/null 2> /dev/null; then
         cpp_has_t_verify=1
     fi
-    if with_affinity "$probe_bin" --verify -c -f -P 1 "$first_sample" > /dev/null 2> /dev/null; then
+    # 0.16+ requires -d for stdout decompress; older builds may accept without it.
+    if with_affinity "$probe_bin" -d --verify -c -f -P 1 --chunk-size "$chunk_size_kib" "$first_sample" > /dev/null 2> /dev/null \
+        || with_affinity "$probe_bin" --verify -c -f -P 1 --chunk-size "$chunk_size_kib" "$first_sample" > /dev/null 2> /dev/null; then
         cpp_has_force_stdout=1
     fi
     idx_probe=$(mktemp "${TMPDIR:-/tmp}/rgz-idx.XXXXXX")
-    if with_affinity "$probe_bin" --export-index "$idx_probe" -P 1 -c -f "$first_sample" > /dev/null 2> /dev/null \
+    if with_affinity "$probe_bin" --export-index "$idx_probe" -P 1 -d -c -f "$first_sample" > /dev/null 2> /dev/null \
         && [[ -s "$idx_probe" ]] \
-        && with_affinity "$probe_bin" --import-index "$idx_probe" -P 1 -c -f "$first_sample" > /dev/null 2> /dev/null; then
+        && with_affinity "$probe_bin" -d --import-index "$idx_probe" --verify -c -f -P 1 "$first_sample" > /dev/null 2> /dev/null; then
         cpp_has_index=1
     fi
     rm -f "$idx_probe"
@@ -160,8 +204,10 @@ cpp_label() {
     local bin=$1
     if [[ -n "$cpp_isal_binary" && "$bin" == "$cpp_isal_binary" ]]; then
         echo rapidgzip-cpp-isal
-    elif [[ -n "${RAPIDGZIP_CPP_ZLIB_NG:-}" || -n "${RAPIDGZIP_CPP:-}" ]]; then
+    elif [[ -n "$cpp_zlib_ng_binary" && "$bin" == "$cpp_zlib_ng_binary" ]]; then
         echo rapidgzip-cpp-zlib-ng
+    elif cpp_binary_has_isal "$bin"; then
+        echo rapidgzip-cpp-isal
     else
         echo rapidgzip-cpp
     fi
@@ -191,19 +237,29 @@ benchmark_one() {
     local corpus=$1 mode=$2 tool=$3 threads=$4 run=$5 decoded_bytes=$6
     shift 6
     local started=$EPOCHREALTIME
-    with_affinity /usr/bin/time -q -o "$timing_file" -f '%U\t%S\t%M' "$@" > /dev/null 2> /dev/null
+    local ec=0
+    # Spaces not \t: some /usr/bin/time builds leave \t literal.
+    set +e
+    with_affinity /usr/bin/time -q -o "$timing_file" -f '%U %S %M' "$@" > /dev/null 2> /dev/null
+    ec=$?
+    set -e
     local finished=$EPOCHREALTIME
+    if [[ $ec -ne 0 ]]; then
+        echo "warning: timed command failed (exit $ec) for $tool mode=$mode threads=$threads run=$run corpus=$corpus: $*" >&2
+        return 0
+    fi
     local elapsed
     elapsed=$(awk -v s="$started" -v f="$finished" 'BEGIN { printf "%.6f", f - s }')
-    local timing
-    timing=$(<"$timing_file")
+    local user_s sys_s rss_kib
+    read -r user_s sys_s rss_kib <"$timing_file" || true
     local throughput=
     if [[ -n "$decoded_bytes" ]]; then
         throughput=$(awk -v b="$decoded_bytes" -v s="$elapsed" \
             'BEGIN { if (s<=0) exit; printf "%.3f", b/1048576/s }')
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$corpus" "$mode" "$tool" "$threads" "$run" "$elapsed" "$timing" "$throughput"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$corpus" "$mode" "$tool" "$threads" "$run" "$elapsed" \
+        "${user_s:-}" "${sys_s:-}" "${rss_kib:-}" "$throughput"
 }
 
 printf 'corpus\tmode\ttool\tthreads\trun\tseconds\tuser_seconds\tsystem_seconds\tmax_rss_kib\tdecoded_mib_per_second\n' > "$raw_tsv"
@@ -223,26 +279,26 @@ for input in "${inputs[@]}"; do
         # ---- verify ----
         if mode_enabled verify; then
             for _ in $(seq 1 "$warmups"); do
-                with_affinity "$rust_binary" -P "$threads" -t "$input" > /dev/null 2> /dev/null || true
+                with_affinity "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -t "$input" > /dev/null 2> /dev/null || true
                 for bin in "${cpp_bins[@]+"${cpp_bins[@]}"}"; do
                     if [[ $cpp_has_t_verify -eq 1 ]]; then
-                        with_affinity "$bin" -t --verify -P "$threads" "$input" > /dev/null 2> /dev/null || true
+                        with_affinity "$bin" -t --verify -P "$threads" --chunk-size "$chunk_size_kib" "$input" > /dev/null 2> /dev/null || true
                     elif [[ $cpp_has_force_stdout -eq 1 ]]; then
-                        with_affinity "$bin" --verify -c -f -P "$threads" "$input" > /dev/null 2> /dev/null || true
+                        with_affinity "$bin" -d --verify -c -f -P "$threads" --chunk-size "$chunk_size_kib" "$input" > /dev/null 2> /dev/null || true
                     fi
                 done
             done
             for run in $(seq 1 "$runs"); do
                 benchmark_one "$corpus" verify rapidgzip-rust "$threads" "$run" "$decoded_bytes" \
-                    "$rust_binary" -P "$threads" -t "$input" >> "$raw_tsv"
+                    "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -t "$input" >> "$raw_tsv"
                 for bin in "${cpp_bins[@]+"${cpp_bins[@]}"}"; do
                     label=$(cpp_label "$bin")
                     if [[ $cpp_has_t_verify -eq 1 ]]; then
                         benchmark_one "$corpus" verify "$label" "$threads" "$run" "$decoded_bytes" \
-                            "$bin" -t --verify -P "$threads" "$input" >> "$raw_tsv"
+                            "$bin" -t --verify -P "$threads" --chunk-size "$chunk_size_kib" "$input" >> "$raw_tsv"
                     elif [[ $cpp_has_force_stdout -eq 1 ]]; then
                         benchmark_one "$corpus" verify "$label" "$threads" "$run" "$decoded_bytes" \
-                            "$bin" --verify -c -f -P "$threads" "$input" >> "$raw_tsv"
+                            "$bin" -d --verify -c -f -P "$threads" --chunk-size "$chunk_size_kib" "$input" >> "$raw_tsv"
                     fi
                 done
             done
@@ -251,18 +307,18 @@ for input in "${inputs[@]}"; do
         # ---- stdout sink ----
         if mode_enabled stdout; then
             for _ in $(seq 1 "$warmups"); do
-                with_affinity "$rust_binary" -P "$threads" -c "$input" > /dev/null 2> /dev/null || true
+                with_affinity "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -c "$input" > /dev/null 2> /dev/null || true
                 for bin in "${cpp_bins[@]+"${cpp_bins[@]}"}"; do
-                    with_affinity "$bin" --verify -c -f -P "$threads" "$input" > /dev/null 2> /dev/null || true
+                    with_affinity "$bin" -d --verify -c -f -P "$threads" --chunk-size "$chunk_size_kib" "$input" > /dev/null 2> /dev/null || true
                 done
             done
             for run in $(seq 1 "$runs"); do
                 benchmark_one "$corpus" stdout rapidgzip-rust "$threads" "$run" "$decoded_bytes" \
-                    "$rust_binary" -P "$threads" -c "$input" >> "$raw_tsv"
+                    "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -c "$input" >> "$raw_tsv"
                 for bin in "${cpp_bins[@]+"${cpp_bins[@]}"}"; do
                     label=$(cpp_label "$bin")
                     benchmark_one "$corpus" stdout "$label" "$threads" "$run" "$decoded_bytes" \
-                        "$bin" --verify -c -f -P "$threads" "$input" >> "$raw_tsv"
+                        "$bin" -d --verify -c -f -P "$threads" --chunk-size "$chunk_size_kib" "$input" >> "$raw_tsv"
                 done
             done
         fi
@@ -270,7 +326,7 @@ for input in "${inputs[@]}"; do
         # ---- prebuilt index ----
         # Export once, then import+decompress to sink. Rust: -c --import-index
         # (not -t: --test forces the verified parallel path and skips index decode).
-        # C++: --import-index --verify -c -f. Index files are tool-native.
+        # C++: -d --import-index --verify -c -f (0.16 needs -d for stdout action).
         if mode_enabled index; then
             rust_idx="$work_dir/${corpus}.rust.gzidx"
             if [[ ! -s "$rust_idx" ]]; then
@@ -281,7 +337,7 @@ for input in "${inputs[@]}"; do
                 if [[ $cpp_has_index -eq 1 ]]; then
                     cpp_idx="$work_dir/${corpus}.$(cpp_label "$bin").gzidx"
                     if [[ ! -s "$cpp_idx" ]]; then
-                        with_affinity "$bin" --export-index "$cpp_idx" -P 1 -c -f "$input" \
+                        with_affinity "$bin" --export-index "$cpp_idx" -P 1 -d -c -f "$input" \
                             > /dev/null 2> /dev/null || true
                     fi
                 fi
@@ -311,12 +367,12 @@ for input in "${inputs[@]}"; do
                     continue
                 fi
                 for _ in $(seq 1 "$warmups"); do
-                    with_affinity "$bin" --import-index "$cpp_idx" --verify -c -f -P "$threads" "$input" \
+                    with_affinity "$bin" -d --import-index "$cpp_idx" --verify -c -f -P "$threads" "$input" \
                         > /dev/null 2> /dev/null || true
                 done
                 for run in $(seq 1 "$runs"); do
                     benchmark_one "$corpus" index "$label" "$threads" "$run" "$decoded_bytes" \
-                        "$bin" --import-index "$cpp_idx" --verify -c -f -P "$threads" "$input" >> "$raw_tsv"
+                        "$bin" -d --import-index "$cpp_idx" --verify -c -f -P "$threads" "$input" >> "$raw_tsv"
                 done
             done
         fi
@@ -327,7 +383,8 @@ for input in "${inputs[@]}"; do
                 # shellcheck disable=SC2094
                 with_affinity "$rust_binary" -P "$threads" -c - < "$input" > /dev/null 2> /dev/null || true
                 for bin in "${cpp_bins[@]+"${cpp_bins[@]}"}"; do
-                    with_affinity "$bin" -P "$threads" -c -f - < "$input" > /dev/null 2> /dev/null || true
+                    # C++ 0.16 rejects a literal "-" path; redirect only + -d.
+                    with_affinity "$bin" -d -P "$threads" -c -f < "$input" > /dev/null 2> /dev/null || true
                 done
             done
             for run in $(seq 1 "$runs"); do
@@ -339,7 +396,7 @@ for input in "${inputs[@]}"; do
                 for bin in "${cpp_bins[@]+"${cpp_bins[@]}"}"; do
                     label=$(cpp_label "$bin")
                     benchmark_one "$corpus" stdin "$label" "$threads" "$run" "$decoded_bytes" \
-                        "$bin" -P "$threads" -c -f - < "$input" >> "$raw_tsv"
+                        "$bin" -d -P "$threads" -c -f < "$input" >> "$raw_tsv"
                 done
             done
         fi

@@ -14,11 +14,11 @@
 use crate::backend::{Output, RawInflater};
 use crate::config::Config;
 use crate::gzip::{SourceCursor, parse_member_header};
-use crate::index::{GzipIndex, IndexError, StoredWindow, INDEXED_GZIP_WINDOW_SIZE};
+use crate::index::{GzipIndex, INDEXED_GZIP_WINDOW_SIZE, IndexError, StoredWindow};
+use crate::inflate_backend::{InflateBackend, InflateFlush, status as inflate_status};
 use crate::parallel::Window;
 use crate::{DecodeError, DecodeReport, DeflateErrorKind, ReadAt};
 use crossbeam_deque::{Injector, Steal};
-use libz_rs_sys as z;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -56,13 +56,8 @@ struct SegmentOutput {
 
 /// Validates `index` against `source` using the same rules as
 /// [`crate::IndexedReader::new`].
-fn validate_index<R: ReadAt + ?Sized>(
-    source: &R,
-    index: &GzipIndex,
-) -> Result<(), DecodeError> {
-    index
-        .validate()
-        .map_err(DecodeError::InvalidIndex)?;
+fn validate_index<R: ReadAt + ?Sized>(source: &R, index: &GzipIndex) -> Result<(), DecodeError> {
+    index.validate().map_err(DecodeError::InvalidIndex)?;
     if index.checkpoints.is_empty() {
         return Err(DecodeError::InvalidIndex(IndexError::InvalidCheckpoint(
             "index has no checkpoints",
@@ -310,11 +305,6 @@ fn inflate_segment<R: ReadAt + ?Sized>(
             });
         }
 
-        let (input_pointer, input_length) = {
-            let input = cursor.available()?;
-            (input.as_ptr(), input.len().min(u32::MAX as usize))
-        };
-
         let room = match exact {
             Some(n) => n - filled,
             None => {
@@ -331,29 +321,15 @@ fn inflate_segment<R: ReadAt + ?Sized>(
         }
 
         let dest = &mut out[filled..filled + room];
-        inflater.stream.next_in = input_pointer;
-        inflater.stream.avail_in = input_length as u32;
-        inflater.stream.next_out = dest.as_mut_ptr();
-        inflater.stream.avail_out = dest.len() as u32;
-        let input_before = inflater.stream.avail_in;
-        let output_before = inflater.stream.avail_out;
-
-        // SAFETY:
-        // - `inflater.stream` was initialized (optionally primed + dictionary).
-        // - `next_in/avail_in` describe the current immutable cursor page.
-        // - `next_out/avail_out` describe the remaining caller-owned `out` slice.
-        let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
-
-        let consumed = usize::try_from(input_before - inflater.stream.avail_in)
-            .expect("zlib uInt fits usize");
-        let produced = usize::try_from(output_before - inflater.stream.avail_out)
-            .expect("zlib uInt fits usize");
-        cursor.advance(consumed);
+        let input = cursor.available()?;
+        let step =
+            InflateBackend::inflate_into_slice(&mut inflater, input, dest, InflateFlush::NoFlush)?;
+        cursor.advance(step.consumed);
         compressed_byte = cursor.position();
-        filled += produced;
+        filled += step.produced;
 
-        match status {
-            z::Z_STREAM_END => {
+        match step.status {
+            inflate_status::STREAM_END => {
                 members_ended = members_ended.saturating_add(1);
                 // Skip gzip footer (CRC32 + ISIZE); do not verify on this path.
                 if cursor.position() + 8 > cursor.length() {
@@ -384,27 +360,33 @@ fn inflate_segment<R: ReadAt + ?Sized>(
                 // Next gzip member: parse header and start raw inflate with empty window.
                 let header = parse_member_header(&mut cursor, false)?;
                 debug_assert_eq!(header.deflate_start, cursor.position());
-                inflater = RawInflater::new()?;
+                inflater = <RawInflater as InflateBackend>::create()?;
                 let empty = Window::empty();
-                inflater.set_dictionary(&empty, header.deflate_start.saturating_mul(8))?;
+                InflateBackend::set_dictionary(
+                    &mut inflater,
+                    &empty,
+                    header.deflate_start.saturating_mul(8),
+                )?;
                 compressed_byte = cursor.position();
             }
-            z::Z_OK | z::Z_BUF_ERROR if consumed != 0 || produced != 0 => {
+            inflate_status::OK | inflate_status::BUF_ERROR
+                if step.consumed != 0 || step.produced != 0 =>
+            {
                 // Progress made; continue until the target is satisfied.
             }
-            z::Z_DATA_ERROR => {
+            inflate_status::DATA_ERROR => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: compressed_byte.saturating_mul(8),
                     reason: DeflateErrorKind::InvalidData,
                 });
             }
-            z::Z_NEED_DICT => {
+            inflate_status::NEED_DICT => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: compressed_byte.saturating_mul(8),
                     reason: DeflateErrorKind::UnexpectedDictionary,
                 });
             }
-            z::Z_OK | z::Z_BUF_ERROR => {
+            inflate_status::OK | inflate_status::BUF_ERROR => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: compressed_byte.saturating_mul(8),
                     reason: DeflateErrorKind::Stalled,
@@ -457,9 +439,11 @@ fn report_from_totals(
 }
 
 fn check_output_limit(config: &Config, total: u64, add: u64) -> Result<u64, DecodeError> {
-    let next = total.checked_add(add).ok_or(DecodeError::OutputLimitExceeded {
-        limit: config.output_limit.unwrap_or(u64::MAX),
-    })?;
+    let next = total
+        .checked_add(add)
+        .ok_or(DecodeError::OutputLimitExceeded {
+            limit: config.output_limit.unwrap_or(u64::MAX),
+        })?;
     if config.output_limit.is_some_and(|limit| next > limit) {
         return Err(DecodeError::OutputLimitExceeded {
             limit: config.output_limit.expect("checked as some"),
@@ -570,7 +554,8 @@ where
                                     return;
                                 }
                                 let (lock, signal) = &*work_signal;
-                                let guard = lock.lock().expect("indexed decode work mutex poisoned");
+                                let guard =
+                                    lock.lock().expect("indexed decode work mutex poisoned");
                                 let _ = signal
                                     .wait_timeout_while(guard, Duration::from_millis(1), |_| {
                                         available_tasks.load(Ordering::Acquire) == 0
@@ -698,12 +683,11 @@ where
         return Ok(report_from_totals(config, source_len, index, 0, 0));
     }
 
-    let (total_output, member_count) =
-        if config.decoder_threads == 1 || segments.len() <= 1 {
-            decode_segments_serial(source, config, cancelled, output, &segments)?
-        } else {
-            decode_segments_parallel(source, config, cancelled, output, &segments)?
-        };
+    let (total_output, member_count) = if config.decoder_threads == 1 || segments.len() <= 1 {
+        decode_segments_serial(source, config, cancelled, output, &segments)?
+    } else {
+        decode_segments_parallel(source, config, cancelled, output, &segments)?
+    };
 
     // Prefer the index size when known (matches CLI indexed path).
     let decompressed_bytes = if index.uncompressed_size_in_bytes != u64::MAX {

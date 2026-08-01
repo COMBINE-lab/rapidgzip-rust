@@ -208,7 +208,9 @@ fn multi_member_seek_into_second() {
     assert_eq!(&mid, &m2[3..8]);
 
     // Cross into third member via sequential read.
-    reader.seek(SeekFrom::Start((m1.len() + m2.len() - 2) as u64)).unwrap();
+    reader
+        .seek(SeekFrom::Start((m1.len() + m2.len() - 2) as u64))
+        .unwrap();
     let mut cross = [0u8; 6];
     reader.read_exact(&mut cross).unwrap();
     assert_eq!(
@@ -513,7 +515,9 @@ fn seek_current_and_end() {
     assert_eq!(&b, b"67");
 
     assert_eq!(
-        reader.seek(SeekFrom::End(-(payload.len() as i64 - 1))).unwrap(),
+        reader
+            .seek(SeekFrom::End(-(payload.len() as i64 - 1)))
+            .unwrap(),
         1
     );
     reader.read_exact(&mut b).unwrap();
@@ -573,10 +577,11 @@ fn io_error_source_is_decode_error() {
         Err(e) => e,
     };
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    assert!(err
-        .get_ref()
-        .and_then(|e| e.downcast_ref::<DecodeError>())
-        .is_some());
+    assert!(
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<DecodeError>())
+            .is_some()
+    );
 }
 
 #[test]
@@ -605,9 +610,7 @@ fn random_seeks_match_full_decode() {
     // Deterministic pseudo-random offsets.
     let mut state = 0xC0FFEE_u64;
     for _ in 0..40 {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
         let start = (state % (payload.len() as u64 - 32)) as usize;
         let len = 1 + ((state >> 17) as usize % 32);
         reader.seek(SeekFrom::Start(start as u64)).unwrap();
@@ -845,9 +848,7 @@ fn random_seeks_with_prefetch_match_full_decode() {
 
     let mut state = 0xBEEF_u64;
     for _ in 0..50 {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
         let start = (state % (payload.len() as u64 - 32)) as usize;
         let len = 1 + ((state >> 17) as usize % 32);
         reader.seek(SeekFrom::Start(start as u64)).unwrap();
@@ -921,8 +922,7 @@ fn bgzi_round_trip_seek_bgzf() {
     let mut exported = Vec::new();
     index.export_bgzi(&mut exported).unwrap();
     let restored =
-        GzipIndex::import_bgzi(&mut Cursor::new(&exported), Some(compressed.len() as u64))
-            .unwrap();
+        GzipIndex::import_bgzi(&mut Cursor::new(&exported), Some(compressed.len() as u64)).unwrap();
     assert!(!restored.has_line_offsets);
     for cp in &restored.checkpoints {
         assert!(

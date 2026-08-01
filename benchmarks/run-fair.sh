@@ -61,16 +61,24 @@ if [[ $ci -eq 1 ]]; then
     modes=${modes:-"verify stdout"}
     export CORPUS_BYTES=${CORPUS_BYTES:-$((2 * 1024 * 1024))}
 else
-    threads=${threads:-"1 4 16"}
-    runs=${runs:-5}
+    # Fair local defaults: large enough corpora that startup does not dominate,
+    # and a thread ladder that includes oversubscribe on multi-core hosts.
+    threads=${threads:-"1 4 16 44"}
+    runs=${runs:-9}
     warmups=${warmups:-2}
     modes=${modes:-"verify stdout index stdin"}
-    export CORPUS_BYTES=${CORPUS_BYTES:-$((8 * 1024 * 1024))}
+    export CORPUS_BYTES=${CORPUS_BYTES:-$((32 * 1024 * 1024))}
+    export CHUNK_SIZE_KIB=${CHUNK_SIZE_KIB:-4096}
+    # Pin affinity across all CPUs when the caller did not set TASKSET.
+    if [[ -z "${TASKSET:-}" ]] && command -v nproc > /dev/null 2>&1; then
+        export TASKSET="0-$(($(nproc) - 1))"
+    fi
 fi
 
 export RUNS=$runs
 export WARMUPS=$warmups
 export THREAD_CELLS=$threads
+export CHUNK_SIZE_KIB=${CHUNK_SIZE_KIB:-4096}
 
 rust_binary=${RAPIDGZIP_RUST:-target/release/rapidgzip-rust}
 export RAPIDGZIP_RUST=$rust_binary
@@ -87,6 +95,8 @@ if [[ ! -x "$rust_binary" ]]; then
 fi
 
 # --- resolve C++ rapidgzip -------------------------------------------------
+# Prefer an explicit env var, then a local bench venv (0.16 + ISA-L wheel),
+# then PATH. Harness scripts auto-label ISA-L via symbol scan of the .so.
 
 cpp_found=0
 if [[ -n "${RAPIDGZIP_CPP_ISAL:-}" && -x "${RAPIDGZIP_CPP_ISAL}" ]] \
@@ -101,6 +111,12 @@ if [[ -n "${RAPIDGZIP_CPP:-}" && -x "${RAPIDGZIP_CPP}" ]] \
     || command -v "${RAPIDGZIP_CPP:-}" > /dev/null 2>&1; then
     cpp_found=1
 fi
+# Project-local fair competitor: uv/pip venv with rapidgzip 0.16.x.
+if [[ $cpp_found -eq 0 && -x "$root/target/bench-venv/bin/rapidgzip" ]]; then
+    export PATH="$root/target/bench-venv/bin:$PATH"
+    export RAPIDGZIP_CPP=$root/target/bench-venv/bin/rapidgzip
+    cpp_found=1
+fi
 if [[ $cpp_found -eq 0 ]] && command -v rapidgzip > /dev/null 2>&1; then
     export RAPIDGZIP_CPP=$(command -v rapidgzip)
     cpp_found=1
@@ -109,15 +125,19 @@ fi
 if [[ $cpp_found -eq 0 ]]; then
     if [[ $ci -eq 1 ]]; then
         echo "note: C++ rapidgzip not found; CI mode continues with Rust-only cells"
-        echo "      install: pip install rapidgzip   # or build from https://github.com/mxmlnkn/rapidgzip"
+        echo "      install: uv venv target/bench-venv && uv pip install --python target/bench-venv/bin/python 'rapidgzip==0.16.0'"
         export SKIP_CPP=1
     else
         cat >&2 <<'EOF'
 error: C++ rapidgzip not found on PATH and RAPIDGZIP_CPP* unset.
 
-Install options:
-  python3 -m pip install --user rapidgzip
-  # or build from source: https://github.com/mxmlnkn/rapidgzip
+Fair competitor install (0.16.x wheel embeds ISA-L on manylinux):
+  uv venv target/bench-venv
+  uv pip install --python target/bench-venv/bin/python 'rapidgzip==0.16.0'
+  export PATH="$PWD/target/bench-venv/bin:$PATH"
+
+Or: python3 -m pip install --user 'rapidgzip==0.16.0'
+Or build from source: https://github.com/mxmlnkn/rapidgzip
 
 Then either ensure `rapidgzip` is on PATH or set:
   RAPIDGZIP_CPP=/path/to/rapidgzip
@@ -130,6 +150,11 @@ EOF
     fi
 else
     echo "==> C++ rapidgzip: ${RAPIDGZIP_CPP_ISAL:-}${RAPIDGZIP_CPP_ZLIB_NG:-}${RAPIDGZIP_CPP:-rapidgzip (PATH)}"
+    if command -v "${RAPIDGZIP_CPP:-rapidgzip}" > /dev/null 2>&1 || [[ -x "${RAPIDGZIP_CPP:-}" ]]; then
+        _cpp_bin=${RAPIDGZIP_CPP_ISAL:-${RAPIDGZIP_CPP_ZLIB_NG:-${RAPIDGZIP_CPP:-rapidgzip}}}
+        echo "==> C++ version: $("$_cpp_bin" --version 2>/dev/null | head -1 || true)"
+        unset _cpp_bin
+    fi
 fi
 
 # --- corpora ---------------------------------------------------------------

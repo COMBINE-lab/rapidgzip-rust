@@ -1,11 +1,16 @@
-//! Parallel, verified gzip (sequential zlib and raw DEFLATE) decompression.
+//! Parallel, verified gzip, zlib, and raw DEFLATE decompression (small or
+//! low-thread single-stream paths stay sequential).
 //!
 //! `rapidgzip-core` decodes single-member gzip, concatenated gzip, BGZF,
-//! zlib-wrapped DEFLATE (RFC 1950, sequential), and raw DEFLATE (RFC 1951,
-//! sequential, explicit [`Format::RawDeflate`]). It follows rapidgzip's
-//! marker/window algorithm for parallel decoding of ordinary gzip DEFLATE
-//! streams and uses zlib-rs as its inflate backend. Encoding is outside this
-//! crate's scope.
+//! zlib-wrapped DEFLATE (RFC 1950; stream-granularity parallel for concatenated
+//! multi-stream inputs, estimated marker path for long single streams when
+//! `decoder_threads >= 4`), and raw DEFLATE (RFC 1951, explicit
+//! [`Format::RawDeflate`]; same estimated marker path when threads and size
+//! allow). It follows rapidgzip's marker/window algorithm for parallel decoding
+//! of ordinary DEFLATE streams and uses zlib-rs as its sequential inflate
+//! backend (via a crate-private `InflateBackend` trait so a future optional
+//! ISA-L-style backend can plug in without public API churn). Encoding is
+//! outside this crate's scope.
 //!
 //! Random-access **index** support: the in-memory [`GzipIndex`] model and
 //! indexed_gzip (`GZIDX`) / [gztool](https://github.com/circulosmeos/gztool) /
@@ -27,8 +32,11 @@
 //! - [`Decoder::decode`] is the lower-overhead push interface. It writes on the
 //!   calling thread, so the supplied [`std::io::Write`] need not be [`Send`].
 //! - [`Decoder::decode_read`] accepts a non-positional [`std::io::Read`]
-//!   (stdin, sockets, pipes) and streams sequentially without buffering the
-//!   full compressed archive. Use file/`ReadAt` paths for parallel gzip.
+//!   (stdin, sockets, pipes). Single-thread paths stream page-at-a-time without
+//!   buffering the full archive; multi-thread paths spill to a private temp file
+//!   then run the positional backend (parallel gzip / multi-stream or marker
+//!   zlib / raw DEFLATE when eligible). Prefer file/`ReadAt` when you already
+//!   have positional input.
 //! - [`Decoder::reader`] and [`Decoder::open`] return an owned [`DecoderReader`]
 //!   implementing [`std::io::Read`] + [`Send`]. This is suitable for parsers
 //!   that take `Box<dyn Read + Send>`, including `paraseq`.
@@ -89,10 +97,10 @@
 //! files on Unix and Windows, in-memory byte storage, [`std::sync::Arc`], and
 //! [`Box`]. The source length and contents must remain stable during decoding.
 //!
-//! Non-seekable streams are supported via [`Decoder::decode_read`], which
-//! buffers the compressed input fully before decoding. Prefer a file or other
-//! [`ReadAt`] source when possible so the compressed data is not held twice
-//! in memory.
+//! Non-seekable streams are supported via [`Decoder::decode_read`]: single-thread
+//! paths stream without a full-archive buffer; multi-thread paths spill to a
+//! private temporary file (disk) rather than holding the archive only in RAM.
+//! Prefer a file or other [`ReadAt`] source when possible to avoid the spill.
 //!
 //! [`DecoderBuilder::decoder_threads`] sets a maximum worker budget. A format
 //! path or the empirical controller may activate fewer workers when the input
@@ -102,12 +110,14 @@
 
 mod analyze;
 mod backend;
+mod buffer_pool;
 mod config;
 mod crc32;
 mod error;
 mod gzip;
 mod index;
 mod indexed_decode;
+mod inflate_backend;
 mod read_at;
 mod reader;
 mod seek;

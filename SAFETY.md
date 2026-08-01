@@ -10,23 +10,55 @@ There is no unsafe public API and no manual `Send` or `Sync` implementation.
 
 ## zlib-rs ABI adapter
 
-`backend.rs` contains a private RAII wrapper around `libz-rs-sys`.
+`backend.rs` contains a private RAII wrapper (`RawInflater`) around
+`libz-rs-sys`. Paths that reach inflate through the crate-private
+`InflateBackend` trait in `inflate_backend.rs` (monomorphized to `RawInflater`;
+no `dyn`; no extra unsafe beyond the same zlib-rs contracts):
+
+- sequential positional gzip/zlib/raw and streaming `stream_decode`;
+- structure analysis (`analyze`) with `InflateFlush::Block`;
+- parallel BGZF workers (`create`/`reset`/trait `inflate` with `Finish`);
+- multi-stream zlib index/decode workers (`create`/`reset`/`inflate` /
+  `inflate_capped`);
+- independent-member workers (`create`/`reset`/`inflate_capped` for the
+  per-member decoded budget);
+- estimated-path residual continue (`inflate_from_block`) and `inflate_tail`
+  (`inflate_capped` with `NoFlush` / `Block`);
+- seek / `indexed_decode` (`inflate_into_slice` into fixed caller `out`
+  slices; member restarts use trait `create`/`set_dictionary`).
+
+**Direct `z::inflate` lives only in** `inflate_backend.rs` (the
+`RawInflater` implementor of `inflate_capped` / `inflate_into_slice`).
+**Lifecycle ABI** (`inflateInit2_`, `inflateReset`, `inflatePrime`,
+`inflateSetDictionary`, `inflateEnd`) lives only in `RawInflater` inherent
+methods in `backend.rs`. Call sites in sequential, stream, analyze, BGZF,
+independent-member, multi-stream zlib, estimated residual, seek, and
+indexed_decode paths use the trait surface only. **No real ISA-L (or other
+second) backend is linked** — only the zlib-rs implementor exists.
 
 - `inflateInit2_` receives a live, uniquely borrowed `z_stream`, the matching
   Rust structure size, zlib-rs's static version string, and raw-window value
   `-15`.
 - Every `inflate` call sets `next_in/avail_in` to a live immutable page and
-  `next_out/avail_out` to either a live unique `Vec<u8>` allocation or its spare
-  capacity. Neither allocation moves during the call. Consumed and produced
-  lengths come only from the backend's reduced `avail_*` fields. When spare
-  capacity is used, `Vec::set_len` exposes exactly the byte count zlib-rs
-  reported initialized and never more than the proven capacity.
+  `next_out/avail_out` to either a live unique `Vec<u8>` allocation, its spare
+  capacity, or a fixed caller-owned output slice. Neither allocation moves
+  during the call. Consumed and produced lengths come only from the backend's
+  reduced `avail_*` fields. When spare capacity is used, `Vec::set_len`
+  exposes exactly the byte count zlib-rs reported initialized and never more
+  than the proven capacity. The `InflateBackend::inflate` /
+  `inflate_capped` path always writes into spare capacity (optionally further
+  capped by `max_produce`) and extends length by the reported produced count
+  only. `inflate_into_slice` writes into a fixed slice (does not re-length
+  the destination); `produced` is the `avail_out` reduction.
 - `inflatePrime` supplies at most seven unread low-order bits from one source
   byte before the first inflate call.
 - `inflateSetDictionary` receives an immutable slice no larger than 32 KiB.
 - `inflateReset` receives the same uniquely owned initialized stream between
-  completed BGZF blocks or independent ordinary gzip members. It preserves the
-  raw-window mode and is never called concurrently with `inflate`.
+  completed BGZF blocks, independent ordinary gzip members, sequential
+  multi-member gzip/zlib paths (and multi-stream zlib indexing), and parallel
+  multi-stream zlib workers. It preserves the raw-window mode, clears inflate
+  history so the next member starts with an empty window, and is never called
+  concurrently with `inflate`.
 - `inflateEnd` runs exactly once for each successfully initialized stream.
 - `crc32_z` receives a live immutable byte slice and uses its exact length.
 - `compress_z` / `uncompress_z` (index window zlib helpers in
@@ -35,17 +67,18 @@ There is no unsafe public API and no manual `Send` or `Sync` implementation.
   `compressBound_z` or 32 KiB and a live immutable source slice; only the
   backend-reported length is retained after success.
 
-The BGZF fast path reserves the footer-declared output size plus one byte,
-passes only that spare capacity to zlib-rs, checks `Z_STREAM_END`, exact input
-consumption, and exact output size, then calls `Vec::set_len` with the backend's
-reported initialized byte count. The extra byte distinguishes an exact-size
-decode from an output-buffer exhaustion condition, including empty EOF blocks.
+The BGZF fast path reserves the footer-declared output size plus one byte and
+inflates via `InflateBackend::inflate` with `InflateFlush::Finish` (which
+extends length by the backend-reported produced count only). It checks
+`Z_STREAM_END`, exact input consumption, and exact output size. The extra
+spare byte distinguishes an exact-size decode from an output-buffer
+exhaustion condition, including empty EOF blocks.
 
-The dense ordinary-member path supplies live immutable input chunks and only
-the spare capacity remaining beneath its per-member output bound. It exposes
-exactly the initialized byte count reported by zlib-rs, verifies that the
-stream reached `Z_STREAM_END`, and authenticates CRC32 and ISIZE before the
-coordinator can emit the buffer.
+The dense ordinary-member path supplies live immutable input chunks and
+hard-caps newly produced bytes via `InflateBackend::inflate_capped` beneath
+its per-member output bound. It exposes exactly the initialized byte count
+reported by zlib-rs, verifies that the stream reached `Z_STREAM_END`, and
+authenticates CRC32 and ISIZE before the coordinator can emit the buffer.
 
 ## SIMD gzip-header scan
 

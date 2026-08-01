@@ -1,13 +1,15 @@
+use crate::buffer_pool::ByteBufferFreeList;
 use crate::config::{Config, Format};
 use crate::crc32::Crc32;
 use crate::gzip::{MemberHeader, SourceCursor, parse_member_header};
 use crate::index::IndexBuilder;
-use crate::parallel::Window;
+use crate::inflate_backend::{InflateBackend, InflateFlush, status as inflate_status};
 use crate::parallel::adaptive::AdaptiveConcurrency;
 use crate::parallel::deflate::{
     ChunkOutput, Error as NativeError, InitialHistory, ResolvedParts, decode_to_estimated_boundary,
     find_next_structural_candidate,
 };
+use crate::parallel::{Symbol, Window};
 use crate::zlib::{Adler32, looks_like_zlib, parse_zlib_header};
 use crate::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ReadAt, ZlibErrorKind};
 use crossbeam_deque::{Injector, Steal};
@@ -21,6 +23,42 @@ use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Minimum `decoder_threads` before entering the generic rapidgzip
+/// estimated/marker pipeline ([`decode_rapidgzip_estimated`]).
+///
+/// Throughput measurements on ordinary single-member gzip show that low
+/// marker concurrency loses to sequential zlib-rs: the native marker path
+/// pays fixed ranking/window overhead that only amortizes at higher thread
+/// budgets. Prefer sequential zlib-rs below this threshold. BGZF, stored-block,
+/// and independent multi-member paths still enter at `decoder_threads > 1` —
+/// those scale well at 2 threads.
+///
+/// Re-measure (2026-07-31, i7-8750H, `target/bench-profile/single-member.gz`
+/// ~70 MiB compressed / 128 MiB decoded, release CLI `-t -q`, 5 runs, median
+/// wall thrpt on compressed bytes; threshold temporarily set to 2 so P≥2
+/// takes the marker path):
+///   P=1 sequential 110 MiB/s; P=2 marker 83; P=3 marker 92; P=4 marker 82.
+/// P=3 / P=1 ≈ 0.84× (not a ≥1.05× win). Fair `large-single.gz` similarly:
+/// P=3 ≈ 0.91× P=1. Keep gate at 4.
+const MIN_MARKER_PARALLEL_THREADS: usize = 4;
+
+/// Idle park when a worker finds empty work queues (stored path, independent
+/// members, estimated workers, BGZF). 1 ms parks added measurable wake latency;
+/// ~100 µs keeps cancellation/work responsiveness without busy-spinning.
+const WORKER_IDLE_PARK: Duration = Duration::from_micros(100);
+
+/// Park when a result channel is full (stored / independent / BGZF senders).
+/// Matches the intent of the native-path 25 µs full-channel parks: short enough
+/// to hand off quickly, long enough to avoid pegging a core on a full buffer.
+const RESULT_CHANNEL_FULL_PARK: Duration = Duration::from_micros(100);
+
+/// Already-tuned full-channel park for native estimated/resolve result senders.
+const NATIVE_RESULT_CHANNEL_FULL_PARK: Duration = Duration::from_micros(25);
+
+/// Coordinator `recv_timeout` while reordering worker results. Polls
+/// cancellation promptly without the former 10 ms worst-case lag.
+const COORDINATOR_RECV_TIMEOUT: Duration = Duration::from_millis(2);
 
 pub(crate) trait Output {
     fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError>;
@@ -122,7 +160,12 @@ impl RawInflater {
     }
 
     /// Installs remaining bits from a mid-byte compressed start (LSB-first).
-    pub(crate) fn prime(&mut self, bits: u8, value: u8, bit_offset: u64) -> Result<(), DecodeError> {
+    pub(crate) fn prime(
+        &mut self,
+        bits: u8,
+        value: u8,
+        bit_offset: u64,
+    ) -> Result<(), DecodeError> {
         // SAFETY: the stream is initialized and uniquely borrowed. zlib accepts
         // at most 16 low-order bits before the first inflate call; this wrapper
         // supplies at most the seven unread bits from one source byte.
@@ -177,6 +220,10 @@ impl RawInflater {
     /// seek and `decode_with_index` paths pass `true`. Parallel marker fallback
     /// must pass `false` so mid-stream `1f 8b` bytes are never misread as
     /// headers. Non-empty windows never skip a header.
+    ///
+    /// Inflate setup (create / mid-byte prime / dictionary) goes through
+    /// [`InflateBackend::prepare_at_bit_offset`] so alternate backends share
+    /// the same resume contract.
     pub(crate) fn prepare_at_bit_offset<R: ReadAt + ?Sized>(
         start_bit: u64,
         window: &Window,
@@ -196,10 +243,7 @@ impl RawInflater {
         {
             // Peek for gzip magic; always restore the cursor so a miss leaves
             // the offset as a raw DEFLATE bit position.
-            let is_gzip_magic = matches!(
-                cursor.read_exact::<2>(byte_offset),
-                Ok([0x1f, 0x8b])
-            );
+            let is_gzip_magic = matches!(cursor.read_exact::<2>(byte_offset), Ok([0x1f, 0x8b]));
             cursor.seek(byte_offset)?;
             if is_gzip_magic {
                 let header = parse_member_header(&mut cursor, false)?;
@@ -209,14 +253,14 @@ impl RawInflater {
             }
         }
 
-        let mut inflater = Self::new()?;
         let skipped_bits = (effective_bit % 8) as u8;
-        if skipped_bits != 0 {
-            let byte = cursor.read_exact::<1>(byte_offset)?[0];
-            let remaining_bits = 8 - skipped_bits;
-            inflater.prime(remaining_bits, byte >> skipped_bits, effective_bit)?;
-        }
-        inflater.set_dictionary(window, effective_bit)?;
+        let first_byte = if skipped_bits != 0 {
+            cursor.read_exact::<1>(byte_offset)?[0]
+        } else {
+            0
+        };
+        let inflater =
+            <Self as InflateBackend>::prepare_at_bit_offset(first_byte, effective_bit, window)?;
         Ok((inflater, cursor.position()))
     }
 }
@@ -242,10 +286,8 @@ where
     O: Output,
 {
     match resolve_format(source, config)? {
-        Format::Zlib => return decode_zlib_sequential(source, config, cancelled, output),
-        Format::RawDeflate => {
-            return decode_raw_deflate_sequential(source, config, cancelled, output);
-        }
+        Format::Zlib => return decode_zlib(source, config, cancelled, output),
+        Format::RawDeflate => return decode_raw_deflate(source, config, cancelled, output),
         Format::Gzip => {}
         Format::Auto => unreachable!("resolve_format returns Gzip, Zlib, or RawDeflate only"),
     }
@@ -268,8 +310,12 @@ where
         if let Some(index) = index_independent_members(source, config)? {
             return decode_independent_members(source, config, cancelled, output, &index);
         }
-        let grid_size = adjusted_compressed_chunk_size(source, config)?;
-        return decode_rapidgzip_estimated(source, config, cancelled, output, grid_size);
+        // Expensive marker/estimated path: only when enough threads to beat
+        // sequential zlib-rs (see MIN_MARKER_PARALLEL_THREADS).
+        if config.decoder_threads >= MIN_MARKER_PARALLEL_THREADS {
+            let grid_size = adjusted_compressed_chunk_size(source, config)?;
+            return decode_rapidgzip_estimated(source, config, cancelled, output, grid_size);
+        }
     }
     decode_source_sequential(source, config, cancelled, output)
 }
@@ -277,10 +323,7 @@ where
 /// Resolves [`Format::Auto`] into gzip or zlib; forced formats are returned as-is.
 ///
 /// Auto never selects raw DEFLATE (no magic bytes).
-fn resolve_format<R: ReadAt + ?Sized>(
-    source: &R,
-    config: &Config,
-) -> Result<Format, DecodeError> {
+fn resolve_format<R: ReadAt + ?Sized>(source: &R, config: &Config) -> Result<Format, DecodeError> {
     match config.format {
         Format::Gzip => Ok(Format::Gzip),
         Format::Zlib => Ok(Format::Zlib),
@@ -295,11 +338,53 @@ fn resolve_format<R: ReadAt + ?Sized>(
     }
 }
 
+/// Raw DEFLATE (RFC 1951) entry: single-stream marker parallel when threads and
+/// size allow, else sequential. No gzip/zlib wrapper; optional external CRC via
+/// `raw_crc32_list`. `keep_index` is rejected at config build time.
+fn decode_raw_deflate<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    debug_assert!(
+        !config.keep_index,
+        "keep_index for raw DEFLATE is rejected by DecoderBuilder::build"
+    );
+    if config.decoder_threads >= MIN_MARKER_PARALLEL_THREADS
+        && raw_payload_large_enough_for_marker(source, config)?
+    {
+        let compressed_chunk_size = adjusted_compressed_chunk_size(source, config)?;
+        return decode_raw_deflate_estimated(
+            source,
+            config,
+            cancelled,
+            output,
+            compressed_chunk_size,
+        );
+    }
+    decode_raw_deflate_sequential(source, config, cancelled, output)
+}
+
+/// Compressed length gate for raw DEFLATE marker parallel (no wrapper bytes).
+fn raw_payload_large_enough_for_marker<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+) -> Result<bool, DecodeError> {
+    payload_large_enough_for_marker(source, config, 0)
+}
+
 /// Sequential raw DEFLATE (RFC 1951) decode: no wrapper, no integrity trailer.
 ///
-/// Single stream from compressed offset 0 to `Z_STREAM_END`. Leftover input
-/// after end-of-stream is an error. There is no parallel marker path and no
-/// random-access index (`keep_index` is rejected at config build time).
+/// Single stream from compressed offset 0 to stream end. Leftover input after
+/// end-of-stream is an error. No random-access index (`keep_index` is rejected
+/// at config build time).
+///
+/// Inflate goes through [`InflateBackend`] monomorphized to [`RawInflater`].
 fn decode_raw_deflate_sequential<R, O>(
     source: &R,
     config: &Config,
@@ -309,6 +394,21 @@ fn decode_raw_deflate_sequential<R, O>(
 where
     R: ReadAt + ?Sized,
     O: Output,
+{
+    decode_raw_deflate_sequential_with::<R, O, RawInflater>(source, config, cancelled, output)
+}
+
+/// Generic sequential raw DEFLATE path over [`InflateBackend`].
+fn decode_raw_deflate_sequential_with<R, O, I>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+    I: InflateBackend,
 {
     debug_assert!(
         !config.keep_index,
@@ -325,7 +425,7 @@ where
 
     let mut index_builder = new_index_builder(config);
     let mut total_output = 0_u64;
-    let mut inflater = RawInflater::new()?;
+    let mut inflater = I::create()?;
     let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
     let verify_external_crc = !config.raw_crc32_list.is_empty();
     let mut external_crc = Crc32::new();
@@ -341,32 +441,16 @@ where
             });
         }
 
-        let (input_pointer, input_length) = {
-            let input = cursor.available()?;
-            (input.as_ptr(), input.len().min(u32::MAX as usize))
-        };
         if decoded.capacity() < config.decoded_chunk_size {
             decoded.reserve_exact(config.decoded_chunk_size - decoded.capacity());
         }
+        // Sequential path always emits then clears; force empty so
+        // InflateBackend appends into a fresh buffer for this step.
+        decoded.clear();
 
-        inflater.stream.next_in = input_pointer;
-        inflater.stream.avail_in = input_length as u32;
-        inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-        inflater.stream.avail_out = decoded.capacity() as u32;
-        let input_before = inflater.stream.avail_in;
-        let output_before = inflater.stream.avail_out;
-
-        // SAFETY: live page input, uniquely owned spare output capacity, and
-        // an initialized raw-inflate stream (same contract as sequential gzip).
-        let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
-
-        let consumed = usize::try_from(input_before - inflater.stream.avail_in)
-            .expect("zlib uInt fits usize");
-        let produced = usize::try_from(output_before - inflater.stream.avail_out)
-            .expect("zlib uInt fits usize");
-        cursor.advance(consumed);
-        // SAFETY: `produced` bytes of spare capacity were initialized by inflate.
-        unsafe { decoded.set_len(produced) };
+        let input = cursor.available()?;
+        let step = inflater.inflate(input, &mut decoded, InflateFlush::NoFlush)?;
+        cursor.advance(step.consumed);
 
         if !decoded.is_empty() {
             let new_total = total_output.checked_add(decoded.len() as u64).ok_or(
@@ -387,30 +471,30 @@ where
             decoded = output.emit_reusable(decoded)?;
         }
 
-        match status {
-            z::Z_STREAM_END => break,
-            z::Z_OK => {
-                if consumed == 0 && produced == 0 {
+        match step.status {
+            inflate_status::STREAM_END => break,
+            inflate_status::OK => {
+                if step.consumed == 0 && step.produced == 0 {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: cursor.position().saturating_mul(8),
                         reason: DeflateErrorKind::Stalled,
                     });
                 }
             }
-            z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {}
-            z::Z_BUF_ERROR => {
+            inflate_status::BUF_ERROR if step.consumed > 0 || step.produced > 0 => {}
+            inflate_status::BUF_ERROR => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: cursor.position().saturating_mul(8),
                     reason: DeflateErrorKind::Truncated,
                 });
             }
-            z::Z_NEED_DICT => {
+            inflate_status::NEED_DICT => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: 0,
                     reason: DeflateErrorKind::UnexpectedDictionary,
                 });
             }
-            z::Z_DATA_ERROR => {
+            inflate_status::DATA_ERROR => {
                 let _diagnostic = inflater.message();
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: cursor.position().saturating_mul(8),
@@ -458,11 +542,104 @@ where
     ))
 }
 
+/// zlib (RFC 1950) entry: multi-stream parallel, single-stream marker parallel,
+/// or sequential.
+///
+/// Composition when `decoder_threads > 1`:
+/// 1. **Concatenated multi-stream** (≥2 CMF/FLG…Adler frames): two-pass
+///    discard-index then stream-granularity parallel zlib-rs. The discard index
+///    is skipped when the large-file single-stream marker path is preferred so a
+///    solitary long stream is not inflated twice.
+/// 2. **Single-stream DEFLATE-level parallel** when the thread budget and size
+///    gate allow (`decode_zlib_parallel_or_sequential`). Remaining concatenated
+///    streams after the first use multi-stream parallel (or sequential for a
+///    single tiny remainder if indexing is skipped).
+/// 3. **Sequential** otherwise.
+fn decode_zlib<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    if config.decoder_threads > 1 {
+        // Long solitary streams at threads ≥ 4: DEFLATE-level marker path.
+        // Do not run the multi-stream discard-index first — that would fully
+        // inflate once for boundary discovery before decoding again.
+        if prefer_zlib_single_stream_parallel(source, config)? {
+            return decode_zlib_parallel_or_sequential(source, config, cancelled, output);
+        }
+        // Multi-stream stream-granularity parallel only when a full discard
+        // index is cheap: small archives (or when we already know multi-stream
+        // tails). Large files at threads 2–3 stay sequential once so we never
+        // pay discard-inflate + re-decode on a single long stream.
+        if !zlib_payload_large_enough_for_marker(source, config)? {
+            if let Some(index) = index_zlib_streams(source, config, cancelled)? {
+                return decode_zlib_streams_parallel(source, config, cancelled, output, &index);
+            }
+        }
+    }
+    decode_zlib_sequential(source, config, cancelled, output)
+}
+
+/// Compressed length gate: at least two full grid cells plus optional wrapper.
+fn payload_large_enough_for_marker<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+    wrapper_bytes: u64,
+) -> Result<bool, DecodeError> {
+    let compressed_chunk_size = adjusted_compressed_chunk_size(source, config)?;
+    let length = source
+        .len()
+        .map_err(|error| DecodeError::input_io(0, error))?;
+    let min_parallel_bytes = (compressed_chunk_size as u64)
+        .saturating_mul(2)
+        .saturating_add(wrapper_bytes);
+    Ok(length >= min_parallel_bytes)
+}
+
+/// Compressed length gate shared by single-stream zlib marker parallel routing.
+fn zlib_payload_large_enough_for_marker<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+) -> Result<bool, DecodeError> {
+    // Header (2) + trailer (4) + at least two full grid cells of DEFLATE.
+    payload_large_enough_for_marker(source, config, 6)
+}
+
+/// True when the single-stream marker/estimated zlib path is expected to win
+/// (large payload + enough threads).
+fn prefer_zlib_single_stream_parallel<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+) -> Result<bool, DecodeError> {
+    if config.decoder_threads < MIN_MARKER_PARALLEL_THREADS {
+        return Ok(false);
+    }
+    zlib_payload_large_enough_for_marker(source, config)
+}
+
+/// Mutable continuation state for sequential zlib multi-stream decoding.
+///
+/// Groups cursor, index builder, and running totals so continuation after a
+/// parallel first stream (and the full-file sequential entry) share one arg.
+struct ZlibSequentialState<'a, R: ReadAt + ?Sized> {
+    cursor: SourceCursor<'a, R>,
+    index_builder: IndexBuilder,
+    member_count: u64,
+    total_output: u64,
+}
+
 /// Sequential zlib (RFC 1950) decode: CMF/FLG, raw DEFLATE, Adler-32 trailer.
 ///
-/// Concatenated zlib streams are accepted. There is no parallel marker path
-/// and no random-access index (checkpoints at stream starts only when
-/// `keep_index` is set). Adler-32 verification follows `crc32_enabled`.
+/// Concatenated zlib streams are accepted. Used for small streams, low thread
+/// budgets, multi-stream tails after a parallel first stream, and as the
+/// full-file fallback. Adler-32 verification follows `crc32_enabled`.
+/// Random-access indexes remain gzip/BGZF-oriented (checkpoints at stream
+/// starts only when `keep_index` is set).
 fn decode_zlib_sequential<R, O>(
     source: &R,
     config: &Config,
@@ -473,17 +650,71 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    let mut cursor = SourceCursor::new(source, config.input_page_size)?;
-    let mut index_builder = new_index_builder(config);
-    let mut total_output = 0_u64;
-    let mut member_count = 0_u64;
-    // Prefer Z_BLOCK only when collecting an index so intermediate block
-    // checkpoints are available; default path stays on Z_NO_FLUSH.
+    decode_zlib_sequential_from(
+        source,
+        config,
+        cancelled,
+        output,
+        ZlibSequentialState {
+            cursor: SourceCursor::new(source, config.input_page_size)?,
+            index_builder: new_index_builder(config),
+            member_count: 0,
+            total_output: 0,
+        },
+    )
+}
+
+/// Sequential zlib members starting at the cursor's current position.
+///
+/// Used as the full sequential entry and as the multi-stream continuation
+/// after a parallel first stream finishes.
+///
+/// Inflate goes through [`InflateBackend`] monomorphized to [`RawInflater`].
+fn decode_zlib_sequential_from<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    state: ZlibSequentialState<'_, R>,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    decode_zlib_sequential_from_with::<R, O, RawInflater>(source, config, cancelled, output, state)
+}
+
+/// Generic sequential zlib path over [`InflateBackend`].
+fn decode_zlib_sequential_from_with<R, O, I>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    state: ZlibSequentialState<'_, R>,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+    I: InflateBackend,
+{
+    let ZlibSequentialState {
+        mut cursor,
+        mut index_builder,
+        mut member_count,
+        mut total_output,
+    } = state;
+    // Prefer Block only when collecting an index so intermediate block
+    // checkpoints are available; default path stays on NoFlush.
     let flush = if config.keep_index {
-        z::Z_BLOCK
+        InflateFlush::Block
     } else {
-        z::Z_NO_FLUSH
+        InflateFlush::NoFlush
     };
+    let started_with_members = member_count;
+    // Reuse one raw-inflate stream across concatenated zlib members. Each
+    // member starts with an empty window; `reset` clears history.
+    let mut inflater = I::create()?;
+    let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
 
     while !cursor.at_end() {
         if cancelled.load(Ordering::Relaxed) {
@@ -496,9 +727,8 @@ where
         // Empty window at each zlib stream DEFLATE start.
         index_builder.force_checkpoint(header.deflate_start.saturating_mul(8), true);
 
-        let mut inflater = RawInflater::new()?;
+        inflater.reset(header.deflate_start.saturating_mul(8))?;
         let mut adler = Adler32::new();
-        let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
 
         loop {
             if cancelled.load(Ordering::Relaxed) {
@@ -511,32 +741,16 @@ where
                 });
             }
 
-            let (input_pointer, input_length) = {
-                let input = cursor.available()?;
-                (input.as_ptr(), input.len().min(u32::MAX as usize))
-            };
             if decoded.capacity() < config.decoded_chunk_size {
                 decoded.reserve_exact(config.decoded_chunk_size - decoded.capacity());
             }
+            // Sequential path always emits then clears; force empty so
+            // InflateBackend appends into a fresh buffer for this step.
+            decoded.clear();
 
-            inflater.stream.next_in = input_pointer;
-            inflater.stream.avail_in = input_length as u32;
-            inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-            inflater.stream.avail_out = decoded.capacity() as u32;
-            let input_before = inflater.stream.avail_in;
-            let output_before = inflater.stream.avail_out;
-
-            // SAFETY: same contract as the sequential gzip path — live page
-            // input, uniquely owned spare output capacity, initialized stream.
-            let status = unsafe { z::inflate(&mut inflater.stream, flush) };
-
-            let consumed = usize::try_from(input_before - inflater.stream.avail_in)
-                .expect("zlib uInt fits usize");
-            let produced = usize::try_from(output_before - inflater.stream.avail_out)
-                .expect("zlib uInt fits usize");
-            cursor.advance(consumed);
-            // SAFETY: `produced` bytes of spare capacity were initialized by inflate.
-            unsafe { decoded.set_len(produced) };
+            let input = cursor.available()?;
+            let step = inflater.inflate(input, &mut decoded, flush)?;
+            cursor.advance(step.consumed);
 
             if !decoded.is_empty() {
                 let new_total = total_output.checked_add(decoded.len() as u64).ok_or(
@@ -557,43 +771,43 @@ where
                 decoded = output.emit_reusable(decoded)?;
             }
 
+            // Bit-accurate offset: bytes consumed so far, less bits still in
+            // the inflater bit buffer. Only meaningful with Block flush;
+            // with NoFlush keep_index is false and this is unused.
             if config.keep_index {
-                let unused_bits = u64::try_from(inflater.stream.data_type & 0x3F)
-                    .expect("the low six data_type bits are non-negative");
                 let bit_pos = cursor
                     .position()
                     .saturating_mul(8)
-                    .saturating_sub(unused_bits);
-                let at_block_end = inflater.stream.data_type & 0x80 != 0;
-                if status == z::Z_STREAM_END || at_block_end {
+                    .saturating_sub(u64::from(step.unused_bits));
+                if step.status == inflate_status::STREAM_END || step.at_block_end {
                     index_builder.maybe_checkpoint(bit_pos);
                 }
             }
 
-            match status {
-                z::Z_STREAM_END => break,
-                z::Z_OK => {
-                    if consumed == 0 && produced == 0 {
+            match step.status {
+                inflate_status::STREAM_END => break,
+                inflate_status::OK => {
+                    if step.consumed == 0 && step.produced == 0 {
                         return Err(DecodeError::InvalidDeflate {
                             bit_offset: cursor.position().saturating_mul(8),
                             reason: DeflateErrorKind::Stalled,
                         });
                     }
                 }
-                z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {}
-                z::Z_BUF_ERROR => {
+                inflate_status::BUF_ERROR if step.consumed > 0 || step.produced > 0 => {}
+                inflate_status::BUF_ERROR => {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: cursor.position().saturating_mul(8),
                         reason: DeflateErrorKind::Truncated,
                     });
                 }
-                z::Z_NEED_DICT => {
+                inflate_status::NEED_DICT => {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: header.deflate_start.saturating_mul(8),
                         reason: DeflateErrorKind::UnexpectedDictionary,
                     });
                 }
-                z::Z_DATA_ERROR => {
+                inflate_status::DATA_ERROR => {
                     let _diagnostic = inflater.message();
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: cursor.position().saturating_mul(8),
@@ -639,7 +853,7 @@ where
         member_count += 1;
     }
 
-    if member_count == 0 {
+    if member_count == started_with_members && started_with_members == 0 {
         return Err(DecodeError::InvalidZlib {
             offset: 0,
             reason: ZlibErrorKind::BadHeader,
@@ -662,6 +876,605 @@ where
     Ok(finish_report(
         config,
         cursor.position(),
+        total_output,
+        member_count,
+        index_builder,
+    ))
+}
+
+/// One complete zlib stream (CMF/FLG … DEFLATE … Adler-32) in a concatenated
+/// multi-stream source.
+#[derive(Clone, Copy, Debug)]
+struct ZlibStreamRange {
+    /// Absolute byte offset of the CMF byte.
+    start: u64,
+    /// Absolute byte offset of the first DEFLATE byte (after CMF/FLG).
+    deflate_start: u64,
+    /// Absolute byte offset past the four-byte Adler-32 trailer.
+    end: u64,
+}
+
+/// Two-pass discovery: discard-inflate every zlib stream from the start of the
+/// source. Returns `Some` only when ≥2 complete streams are present so the
+/// caller can parallel re-decode; single-stream files return `None` (caller
+/// uses sequential or single-stream marker parallel without depending on this
+/// index for output).
+fn index_zlib_streams<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+) -> Result<Option<Vec<ZlibStreamRange>>, DecodeError> {
+    index_zlib_streams_from(source, config, cancelled, 0)
+}
+
+/// Discard-inflate zlib streams beginning at `start_offset`.
+///
+/// When `start_offset == 0`, returns `None` if fewer than two streams exist.
+/// When continuing after an already-emitted first stream (`start_offset > 0`),
+/// returns `Some` for one or more remaining streams (a single remainder is
+/// still useful for a uniform parallel worker path, but callers may also fall
+/// back to sequential for one stream).
+fn index_zlib_streams_from<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    start_offset: u64,
+) -> Result<Option<Vec<ZlibStreamRange>>, DecodeError> {
+    let mut cursor = SourceCursor::new(source, config.input_page_size)?;
+    if start_offset > 0 {
+        cursor.seek(start_offset)?;
+    }
+    if cursor.at_end() {
+        return Ok(None);
+    }
+
+    let mut ranges = Vec::new();
+    // Discard scratch: we only need STREAM_END / consumed input, not payload.
+    // Clear each step so InflateBackend writes into spare capacity only.
+    let discard_cap = config.decoded_chunk_size.clamp(8 * 1024, 64 * 1024);
+    let mut discard = Vec::with_capacity(discard_cap);
+    // Reuse one inflater across multi-stream zlib indexing (empty window per stream).
+    let mut inflater = <RawInflater as InflateBackend>::create()?;
+
+    while !cursor.at_end() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(DecodeError::Cancelled);
+        }
+
+        let first_member = ranges.is_empty() && start_offset == 0;
+        let header = parse_zlib_header(&mut cursor, first_member)?;
+        debug_assert_eq!(header.deflate_start, cursor.position());
+
+        InflateBackend::reset(&mut inflater, header.deflate_start.saturating_mul(8))?;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(DecodeError::Cancelled);
+            }
+            if cursor.at_end() {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: cursor.position().saturating_mul(8),
+                    reason: DeflateErrorKind::Truncated,
+                });
+            }
+
+            if discard.capacity() < discard_cap {
+                discard.reserve(discard_cap - discard.capacity());
+            }
+            discard.clear();
+            let input = cursor.available()?;
+            let step = inflater.inflate(input, &mut discard, InflateFlush::NoFlush)?;
+            cursor.advance(step.consumed);
+
+            match step.status {
+                inflate_status::STREAM_END => break,
+                inflate_status::OK => {
+                    if step.consumed == 0 && step.produced == 0 {
+                        return Err(DecodeError::InvalidDeflate {
+                            bit_offset: cursor.position().saturating_mul(8),
+                            reason: DeflateErrorKind::Stalled,
+                        });
+                    }
+                }
+                inflate_status::BUF_ERROR if step.consumed > 0 || step.produced > 0 => {}
+                inflate_status::BUF_ERROR => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: cursor.position().saturating_mul(8),
+                        reason: DeflateErrorKind::Truncated,
+                    });
+                }
+                inflate_status::NEED_DICT => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: header.deflate_start.saturating_mul(8),
+                        reason: DeflateErrorKind::UnexpectedDictionary,
+                    });
+                }
+                inflate_status::DATA_ERROR => {
+                    let _diagnostic = inflater.message();
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: cursor.position().saturating_mul(8),
+                        reason: DeflateErrorKind::InvalidData,
+                    });
+                }
+                other => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: cursor.position().saturating_mul(8),
+                        reason: DeflateErrorKind::BackendStatus(other),
+                    });
+                }
+            }
+        }
+
+        // Skip Adler-32 trailer (verified on the emit pass).
+        let footer_offset = cursor.position();
+        match cursor.read_exact::<4>(footer_offset) {
+            Ok(_) => {}
+            Err(DecodeError::InvalidGzip {
+                reason: GzipErrorKind::Truncated,
+                ..
+            }) => {
+                return Err(DecodeError::InvalidZlib {
+                    offset: footer_offset,
+                    reason: ZlibErrorKind::Truncated,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+
+        ranges.push(ZlibStreamRange {
+            start: header.start,
+            deflate_start: header.deflate_start,
+            end: cursor.position(),
+        });
+    }
+
+    if start_offset == 0 && ranges.len() < 2 {
+        return Ok(None);
+    }
+    if ranges.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ranges))
+}
+
+/// Decode one zlib stream range into `output`, verifying Adler-32 when enabled.
+///
+/// Inflate goes through [`InflateBackend`] monomorphized to [`RawInflater`].
+/// Each step reserves at least `output_step` spare and hard-caps produce via
+/// [`InflateBackend::inflate_capped`] so batch size matches the prior raw
+/// `avail_out` limit.
+///
+/// Returns the number of decompressed bytes appended.
+#[allow(clippy::too_many_arguments)]
+fn decode_zlib_stream_into<R: ReadAt + ?Sized>(
+    source: &R,
+    range: ZlibStreamRange,
+    member: u64,
+    config: &Config,
+    cancelled: &AtomicBool,
+    compressed: &mut Vec<u8>,
+    output: &mut Vec<u8>,
+    inflater: &mut RawInflater,
+) -> Result<usize, DecodeError> {
+    let output_start = output.len();
+    let mut input_offset = range.deflate_start;
+    // Compressed payload ends at the Adler trailer.
+    let payload_end = range.end.saturating_sub(4);
+    if payload_end < range.deflate_start || range.end < range.deflate_start.saturating_add(4) {
+        return Err(DecodeError::InvalidZlib {
+            offset: range.start,
+            reason: ZlibErrorKind::Truncated,
+        });
+    }
+
+    let input_step = config.input_page_size.clamp(32 * 1024, 64 * 1024);
+    let output_step = config.decoded_chunk_size.clamp(32 * 1024, 256 * 1024);
+    let mut adler = Adler32::new();
+    InflateBackend::reset(inflater, range.deflate_start.saturating_mul(8))?;
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(DecodeError::Cancelled);
+        }
+        if input_offset > payload_end {
+            return Err(DecodeError::InvalidDeflate {
+                bit_offset: input_offset.saturating_mul(8),
+                reason: DeflateErrorKind::InvalidData,
+            });
+        }
+
+        let remaining = payload_end.saturating_sub(input_offset);
+        let input_length = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(input_step);
+        if input_length > 0 {
+            read_range_reuse(source, input_offset, input_length, compressed)?;
+        } else {
+            compressed.clear();
+        }
+
+        let mut relative_input = 0_usize;
+        loop {
+            // Need more compressed input?
+            if relative_input >= compressed.len() && input_offset < payload_end {
+                break;
+            }
+
+            output.reserve(output_step);
+            let chunk_start = output.len();
+            let input = &compressed[relative_input..];
+            let step =
+                inflater.inflate_capped(input, output, InflateFlush::NoFlush, output_step)?;
+            relative_input += step.consumed;
+            input_offset = input_offset.saturating_add(step.consumed as u64);
+
+            if config.crc32_enabled && step.produced > 0 {
+                adler.update(&output[chunk_start..]);
+            }
+
+            match step.status {
+                inflate_status::STREAM_END => {
+                    // Adler-32 is four big-endian bytes at payload_end.
+                    read_range_reuse(source, payload_end, 4, compressed)?;
+                    let expected_adler =
+                        u32::from_be_bytes(compressed[0..4].try_into().expect("four bytes"));
+                    if config.crc32_enabled {
+                        let actual_adler = adler.finish();
+                        if expected_adler != actual_adler {
+                            return Err(DecodeError::ChecksumMismatch {
+                                member,
+                                expected: expected_adler,
+                                actual: actual_adler,
+                            });
+                        }
+                    }
+                    // Defensive: stream end should land at the trailer.
+                    if input_offset != payload_end {
+                        // Backend may not have consumed every spare byte of the
+                        // last page if we over-read; accept any offset ≤ payload_end
+                        // only when inflate reported stream end (canonical).
+                        // Overshoot past the trailer is corrupt.
+                        if input_offset > payload_end {
+                            return Err(DecodeError::InvalidDeflate {
+                                bit_offset: input_offset.saturating_mul(8),
+                                reason: DeflateErrorKind::InvalidData,
+                            });
+                        }
+                    }
+                    return Ok(output.len() - output_start);
+                }
+                inflate_status::OK => {
+                    if step.consumed == 0 && step.produced == 0 {
+                        if input_offset >= payload_end {
+                            return Err(DecodeError::InvalidDeflate {
+                                bit_offset: input_offset.saturating_mul(8),
+                                reason: DeflateErrorKind::Truncated,
+                            });
+                        }
+                        // Need more input from the next page.
+                        break;
+                    }
+                }
+                inflate_status::BUF_ERROR if step.consumed > 0 || step.produced > 0 => {}
+                inflate_status::BUF_ERROR => {
+                    if input_offset >= payload_end {
+                        return Err(DecodeError::InvalidDeflate {
+                            bit_offset: input_offset.saturating_mul(8),
+                            reason: DeflateErrorKind::Truncated,
+                        });
+                    }
+                    break;
+                }
+                inflate_status::NEED_DICT => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: range.deflate_start.saturating_mul(8),
+                        reason: DeflateErrorKind::UnexpectedDictionary,
+                    });
+                }
+                inflate_status::DATA_ERROR => {
+                    let _diagnostic = InflateBackend::message(inflater);
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: input_offset.saturating_mul(8),
+                        reason: DeflateErrorKind::InvalidData,
+                    });
+                }
+                other => {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: input_offset.saturating_mul(8),
+                        reason: DeflateErrorKind::BackendStatus(other),
+                    });
+                }
+            }
+
+            // Need a larger output buffer with the same input (avail_out was 0),
+            // or more compressed input from the next page.
+            if relative_input < compressed.len() {
+                continue;
+            }
+            if input_offset < payload_end {
+                break;
+            }
+            // All compressed bytes fed; keep calling inflate with empty input so
+            // a final pending output chunk can surface STREAM_END.
+            if step.produced == 0 {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: input_offset.saturating_mul(8),
+                    reason: DeflateErrorKind::Truncated,
+                });
+            }
+        }
+    }
+}
+
+struct ZlibMultiResult {
+    index: usize,
+    result: Result<ZlibMultiDecoded, DecodeError>,
+}
+
+struct ZlibMultiDecoded {
+    bytes: Vec<u8>,
+    /// Uncompressed size of each stream in this task, emission order.
+    stream_sizes: Vec<usize>,
+}
+
+fn send_zlib_multi_result(
+    sender: &mpsc::SyncSender<ZlibMultiResult>,
+    stopped: &AtomicBool,
+    mut result: ZlibMultiResult,
+) {
+    loop {
+        if stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        match sender.try_send(result) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(returned)) => {
+                result = returned;
+                thread::park_timeout(RESULT_CHANNEL_FULL_PARK);
+            }
+        }
+    }
+}
+
+/// Parallel decode of independent concatenated zlib streams (stream granularity).
+///
+/// `ranges` must contain at least one stream. Member numbers for checksum
+/// errors start at 0.
+fn decode_zlib_streams_parallel<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    ranges: &[ZlibStreamRange],
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    decode_zlib_streams_parallel_from(
+        source,
+        config,
+        cancelled,
+        output,
+        ranges,
+        0,
+        0,
+        new_index_builder(config),
+    )
+}
+
+/// Parallel decode of zlib streams with pre-existing member/output accounting
+/// (used after a single-stream marker path finishes the first frame).
+#[allow(clippy::too_many_arguments)]
+fn decode_zlib_streams_parallel_from<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    ranges: &[ZlibStreamRange],
+    member_base: u64,
+    mut total_output: u64,
+    mut index_builder: IndexBuilder,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    debug_assert!(!ranges.is_empty());
+    // One stream per task keeps member error indices trivial and matches the
+    // independent-stream model; many tiny streams still scale via the worker pool.
+    let task_count = ranges.len();
+    let worker_count = config.decoder_threads.min(task_count).max(1);
+    let task_queue = Arc::new(Injector::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let available_tasks = Arc::new(AtomicUsize::new(0));
+    let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
+    let pending_limit = config.in_flight_chunks.max(worker_count).max(1);
+    let task_window = pending_limit.min(task_count);
+    for index in 0..task_window {
+        task_queue.push(index);
+    }
+    available_tasks.store(task_window, Ordering::Release);
+    let (sender, receiver) = mpsc::sync_channel::<ZlibMultiResult>(pending_limit);
+    let mut next_to_schedule = task_window;
+    let mut next_to_emit = 0_usize;
+    let mut running = task_window;
+    let mut reordered = BTreeMap::new();
+    let mut member_count = member_base;
+
+    let scoped_result = thread::scope(|scope| -> Result<(), DecodeError> {
+        let _stop_on_exit = StopGuard(&stopped);
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&task_queue);
+            let worker_stopped = Arc::clone(&stopped);
+            let available_tasks = Arc::clone(&available_tasks);
+            let work_signal = Arc::clone(&work_signal);
+            let sender = sender.clone();
+            scope.spawn(move || {
+                // Compressed page + inflater reused across streams; decoded
+                // scratch keeps capacity after failed tasks (success transfers
+                // ownership to the coordinator).
+                let mut compressed = Vec::new();
+                let mut decoded_scratch = Vec::new();
+                let mut inflater = None;
+
+                while !worker_stopped.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed)
+                {
+                    let index = loop {
+                        match queue.steal() {
+                            Steal::Success(index) => {
+                                available_tasks.fetch_sub(1, Ordering::AcqRel);
+                                break index;
+                            }
+                            Steal::Retry => std::hint::spin_loop(),
+                            Steal::Empty => {
+                                if worker_stopped.load(Ordering::Relaxed)
+                                    || cancelled.load(Ordering::Relaxed)
+                                {
+                                    return;
+                                }
+                                let (lock, signal) = &*work_signal;
+                                let guard = lock.lock().expect("zlib multi work mutex poisoned");
+                                let _ = signal
+                                    .wait_timeout_while(guard, WORKER_IDLE_PARK, |_| {
+                                        available_tasks.load(Ordering::Acquire) == 0
+                                            && !worker_stopped.load(Ordering::Relaxed)
+                                            && !cancelled.load(Ordering::Relaxed)
+                                    })
+                                    .expect("zlib multi work mutex poisoned");
+                            }
+                        }
+                    };
+
+                    let range = ranges[index];
+                    let member = member_base.saturating_add(index as u64);
+                    decoded_scratch.clear();
+                    let result = (|| {
+                        if inflater.is_none() {
+                            inflater = Some(<RawInflater as InflateBackend>::create()?);
+                        }
+                        let inflater = inflater
+                            .as_mut()
+                            .expect("inflater initialized immediately above");
+                        let produced = decode_zlib_stream_into(
+                            source,
+                            range,
+                            member,
+                            config,
+                            cancelled,
+                            &mut compressed,
+                            &mut decoded_scratch,
+                            inflater,
+                        )?;
+                        Ok(ZlibMultiDecoded {
+                            bytes: std::mem::take(&mut decoded_scratch),
+                            stream_sizes: vec![produced],
+                        })
+                    })();
+                    send_zlib_multi_result(
+                        &sender,
+                        &worker_stopped,
+                        ZlibMultiResult { index, result },
+                    );
+                }
+            });
+        }
+        drop(sender);
+
+        while next_to_emit < task_count {
+            if cancelled.load(Ordering::Relaxed) {
+                stopped.store(true, Ordering::Relaxed);
+                return Err(DecodeError::Cancelled);
+            }
+            let result = match receiver.recv_timeout(COORDINATOR_RECV_TIMEOUT) {
+                Ok(result) => {
+                    running = running.saturating_sub(1);
+                    result
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    stopped.store(true, Ordering::Relaxed);
+                    return Err(DecodeError::WorkerPanicked);
+                }
+            };
+            reordered.insert(result.index, result.result);
+
+            while let Some(result) = reordered.remove(&next_to_emit) {
+                let decoded = match result {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        stopped.store(true, Ordering::Relaxed);
+                        return Err(error);
+                    }
+                };
+                let next_total = total_output.checked_add(decoded.bytes.len() as u64).ok_or(
+                    DecodeError::OutputLimitExceeded {
+                        limit: config.output_limit.unwrap_or(u64::MAX),
+                    },
+                )?;
+                if config.output_limit.is_some_and(|limit| next_total > limit) {
+                    stopped.store(true, Ordering::Relaxed);
+                    return Err(DecodeError::OutputLimitExceeded {
+                        limit: config.output_limit.expect("checked as some"),
+                    });
+                }
+
+                // Empty history at each independent zlib stream DEFLATE start.
+                if index_builder.tracks_output() {
+                    let range = ranges[next_to_emit];
+                    if index_builder.enabled() {
+                        index_builder.force_checkpoint(range.deflate_start.saturating_mul(8), true);
+                    }
+                    let mut offset = 0_usize;
+                    for &size in &decoded.stream_sizes {
+                        index_builder.push_output(&decoded.bytes[offset..offset + size]);
+                        offset += size;
+                    }
+                }
+                total_output = next_total;
+                member_count = member_count.saturating_add(1);
+                if !decoded.bytes.is_empty() {
+                    output.emit(decoded.bytes)?;
+                }
+                next_to_emit += 1;
+            }
+
+            while running < worker_count
+                && next_to_schedule < task_count
+                && reordered.len() < pending_limit
+            {
+                let (lock, signal) = &*work_signal;
+                let _guard = lock.lock().expect("zlib multi work mutex poisoned");
+                task_queue.push(next_to_schedule);
+                available_tasks.fetch_add(1, Ordering::Release);
+                next_to_schedule += 1;
+                running += 1;
+                signal.notify_one();
+            }
+        }
+        stopped.store(true, Ordering::Relaxed);
+        Ok(())
+    });
+    stopped.store(true, Ordering::Relaxed);
+    scoped_result?;
+
+    let compressed_bytes = ranges.last().map_or(0, |range| range.end);
+    let final_length = source
+        .len()
+        .map_err(|error| DecodeError::input_io(compressed_bytes, error))?;
+    // Last stream must end at EOF (full-file multi path and first-stream + tail path).
+    if final_length != compressed_bytes {
+        return Err(DecodeError::input_io(
+            compressed_bytes,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed source length changed during decoding",
+            ),
+        ));
+    }
+
+    Ok(finish_report(
+        config,
+        compressed_bytes,
         total_output,
         member_count,
         index_builder,
@@ -867,7 +1680,7 @@ fn send_stored_result(
             Ok(()) | Err(TrySendError::Disconnected(_)) => return,
             Err(TrySendError::Full(returned)) => {
                 result = returned;
-                thread::park_timeout(Duration::from_millis(1));
+                thread::park_timeout(RESULT_CHANNEL_FULL_PARK);
             }
         }
     }
@@ -920,7 +1733,7 @@ where
                                 {
                                     return;
                                 }
-                                thread::park_timeout(Duration::from_millis(1));
+                                thread::park_timeout(WORKER_IDLE_PARK);
                             }
                         }
                     };
@@ -952,7 +1765,7 @@ where
                 stopped.store(true, Ordering::Relaxed);
                 return Err(DecodeError::Cancelled);
             }
-            let result = match receiver.recv_timeout(Duration::from_millis(10)) {
+            let result = match receiver.recv_timeout(COORDINATOR_RECV_TIMEOUT) {
                 Ok(result) => result,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
@@ -1072,8 +1885,39 @@ where
 /// When `keep_index` is enabled, the sequential inflate loop uses `Z_BLOCK` so
 /// intermediate checkpoints can be recorded at DEFLATE block boundaries with
 /// bit-accurate compressed offsets and a rolling 32 KiB predecessor window.
+///
+/// Inflate goes through [`InflateBackend`] monomorphized to [`RawInflater`]
+/// (zlib-rs only today; future ISA-L can swap the type parameter).
 #[allow(clippy::too_many_arguments)]
 fn decode_members_sequential<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    start_offset: u64,
+    total_output: u64,
+    member_count: u64,
+    index_builder: &mut IndexBuilder,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    decode_members_sequential_with::<R, O, RawInflater>(
+        source,
+        config,
+        cancelled,
+        output,
+        start_offset,
+        total_output,
+        member_count,
+        index_builder,
+    )
+}
+
+/// Generic sequential multi-member gzip path over [`InflateBackend`].
+#[allow(clippy::too_many_arguments)]
+fn decode_members_sequential_with<R, O, I>(
     source: &R,
     config: &Config,
     cancelled: &AtomicBool,
@@ -1086,16 +1930,21 @@ fn decode_members_sequential<R, O>(
 where
     R: ReadAt + ?Sized,
     O: Output,
+    I: InflateBackend,
 {
     let mut cursor = SourceCursor::new(source, config.input_page_size)?;
     cursor.seek(start_offset)?;
-    // Prefer Z_BLOCK only when collecting an index so the default path stays
-    // unchanged (Z_NO_FLUSH). Z_BLOCK exposes block ends via data_type.
+    // Prefer Block only when collecting an index so the default path stays
+    // on NoFlush. Block exposes DEFLATE block ends for checkpoint offsets.
     let flush = if config.keep_index {
-        z::Z_BLOCK
+        InflateFlush::Block
     } else {
-        z::Z_NO_FLUSH
+        InflateFlush::NoFlush
     };
+    // Reuse one raw-inflate stream across concatenated gzip members. Each member
+    // starts with an empty window; `reset` clears history.
+    let mut inflater = I::create()?;
+    let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
 
     while !cursor.at_end() {
         if cancelled.load(Ordering::Relaxed) {
@@ -1108,10 +1957,9 @@ where
         let _observed_bgzf_size = header.bgzf_block_size;
         // Empty window at each member DEFLATE start (history resets).
         index_builder.force_checkpoint(header.deflate_start.saturating_mul(8), true);
-        let mut inflater = RawInflater::new()?;
+        inflater.reset(header.deflate_start.saturating_mul(8))?;
         let mut crc = Crc32::new();
         let mut member_output = 0_u32;
-        let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
 
         loop {
             if cancelled.load(Ordering::Relaxed) {
@@ -1124,42 +1972,16 @@ where
                 });
             }
 
-            let (input_pointer, input_length) = {
-                let input = cursor.available()?;
-                (input.as_ptr(), input.len().min(u32::MAX as usize))
-            };
             if decoded.capacity() < config.decoded_chunk_size {
                 decoded.reserve_exact(config.decoded_chunk_size - decoded.capacity());
             }
+            // Sequential path always emits then clears; force empty so
+            // InflateBackend appends into a fresh buffer for this step.
+            decoded.clear();
 
-            inflater.stream.next_in = input_pointer;
-            inflater.stream.avail_in = input_length as u32;
-            inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-            inflater.stream.avail_out = decoded.capacity() as u32;
-            let input_before = inflater.stream.avail_in;
-            let output_before = inflater.stream.avail_out;
-
-            // SAFETY:
-            // - `inflater.stream` was initialized and is uniquely borrowed.
-            // - `next_in/avail_in` describe the current immutable cursor page,
-            //   which is not moved or mutated until this call returns.
-            // - `next_out/avail_out` describe the uniquely owned spare
-            //   capacity of `decoded`. The backend reports how many bytes it
-            //   initialized before that length is exposed below.
-            // - When `keep_index`, flush is Z_BLOCK so data_type reports block
-            //   boundaries and buffered bit counts for checkpoint offsets.
-            let status = unsafe { z::inflate(&mut inflater.stream, flush) };
-
-            let consumed = usize::try_from(input_before - inflater.stream.avail_in)
-                .expect("zlib uInt fits usize");
-            let produced = usize::try_from(output_before - inflater.stream.avail_out)
-                .expect("zlib uInt fits usize");
-            cursor.advance(consumed);
-            // SAFETY: `output_before` was exactly `decoded.capacity()` and
-            // zlib-rs can only reduce `avail_out` after initializing those
-            // output bytes. Therefore `produced <= capacity`, and precisely
-            // the first `produced` bytes are initialized.
-            unsafe { decoded.set_len(produced) };
+            let input = cursor.available()?;
+            let step = inflater.inflate(input, &mut decoded, flush)?;
+            cursor.advance(step.consumed);
 
             if !decoded.is_empty() {
                 let new_total = total_output.checked_add(decoded.len() as u64).ok_or(
@@ -1182,45 +2004,42 @@ where
             }
 
             // Bit-accurate offset: bytes consumed so far, less bits still in
-            // zlib's bit buffer (low six data_type bits). Only meaningful with
-            // Z_BLOCK; with Z_NO_FLUSH keep_index is false and this is unused.
+            // the inflater bit buffer. Only meaningful with Block flush;
+            // with NoFlush keep_index is false and this is unused.
             if config.keep_index {
-                let unused_bits = u64::try_from(inflater.stream.data_type & 0x3F)
-                    .expect("the low six data_type bits are non-negative");
                 let bit_pos = cursor
                     .position()
                     .saturating_mul(8)
-                    .saturating_sub(unused_bits);
-                let at_block_end = inflater.stream.data_type & 0x80 != 0;
-                if status == z::Z_STREAM_END || at_block_end {
+                    .saturating_sub(u64::from(step.unused_bits));
+                if step.status == inflate_status::STREAM_END || step.at_block_end {
                     index_builder.maybe_checkpoint(bit_pos);
                 }
             }
 
-            match status {
-                z::Z_STREAM_END => break,
-                z::Z_OK => {
-                    if consumed == 0 && produced == 0 {
+            match step.status {
+                inflate_status::STREAM_END => break,
+                inflate_status::OK => {
+                    if step.consumed == 0 && step.produced == 0 {
                         return Err(DecodeError::InvalidDeflate {
                             bit_offset: cursor.position().saturating_mul(8),
                             reason: DeflateErrorKind::Stalled,
                         });
                     }
                 }
-                z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {}
-                z::Z_BUF_ERROR => {
+                inflate_status::BUF_ERROR if step.consumed > 0 || step.produced > 0 => {}
+                inflate_status::BUF_ERROR => {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: cursor.position().saturating_mul(8),
                         reason: DeflateErrorKind::Truncated,
                     });
                 }
-                z::Z_NEED_DICT => {
+                inflate_status::NEED_DICT => {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: header.deflate_start.saturating_mul(8),
                         reason: DeflateErrorKind::UnexpectedDictionary,
                     });
                 }
-                z::Z_DATA_ERROR => {
+                inflate_status::DATA_ERROR => {
                     let _diagnostic = inflater.message();
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: cursor.position().saturating_mul(8),
@@ -1282,8 +2101,7 @@ where
     }
 
     // Take ownership of the builder for finish without cloning checkpoints.
-    let index_builder =
-        std::mem::replace(index_builder, IndexBuilder::new(false, false, 1, false));
+    let index_builder = std::mem::replace(index_builder, IndexBuilder::new(false, false, 1, false));
     Ok(finish_report(
         config,
         cursor.position(),
@@ -1630,6 +2448,11 @@ fn index_independent_members<R: ReadAt + ?Sized>(
     }))
 }
 
+/// Inflate one dense independent gzip member, appending to `decoded`.
+///
+/// Fully driven through [`InflateBackend`] (`reset` + [`InflateBackend::inflate_capped`])
+/// so the per-member decoded budget is enforced without raw `stream.*` field use
+/// at this call site.
 #[allow(clippy::too_many_arguments)]
 fn inflate_independent_member_into<R: ReadAt + ?Sized>(
     source: &R,
@@ -1647,7 +2470,7 @@ fn inflate_independent_member_into<R: ReadAt + ?Sized>(
     let maximum_member_output = config.decoded_chunk_size.max(16 * 1024 * 1024);
     let output_step = config.decoded_chunk_size.clamp(32 * 1024, 256 * 1024);
     let input_step = config.input_page_size.clamp(32 * 1024, 64 * 1024);
-    inflater.reset(header.deflate_start.saturating_mul(8))?;
+    InflateBackend::reset(inflater, header.deflate_start.saturating_mul(8))?;
 
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -1672,43 +2495,21 @@ fn inflate_independent_member_into<R: ReadAt + ?Sized>(
                     limit: maximum_member_output as u64,
                 });
             }
-            let wanted_output = output_step.min(maximum_member_output - member_output);
+            let remaining_budget = maximum_member_output - member_output;
+            let wanted_output = output_step.min(remaining_budget);
             decoded.reserve(wanted_output);
-            let output_start = decoded.len();
-            let spare_output = decoded.capacity() - output_start;
-            let input = &compressed[relative_input..];
-            let input_length = input.len().min(u32::MAX as usize);
-            let output_length = spare_output
-                .min(maximum_member_output - member_output)
-                .min(u32::MAX as usize);
-            inflater.stream.next_in = input.as_ptr();
-            inflater.stream.avail_in = input_length as u32;
-            inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-            inflater.stream.avail_out = output_length as u32;
-            let input_before = inflater.stream.avail_in;
-            let output_before = inflater.stream.avail_out;
+            let step = InflateBackend::inflate_capped(
+                inflater,
+                &compressed[relative_input..],
+                decoded,
+                InflateFlush::NoFlush,
+                remaining_budget,
+            )?;
+            relative_input += step.consumed;
+            input_offset = input_offset.saturating_add(step.consumed as u64);
 
-            // SAFETY:
-            // - the reset inflater is uniquely borrowed for this call;
-            // - `next_in` covers an immutable slice that remains live and
-            //   unmoved until `inflate` returns;
-            // - `next_out` covers only uniquely owned spare `Vec` capacity;
-            // - the initialized byte count is derived from zlib's reduction
-            //   of `avail_out` before extending the vector length below.
-            let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
-            let consumed = usize::try_from(input_before - inflater.stream.avail_in)
-                .expect("zlib uInt fits usize");
-            let produced = usize::try_from(output_before - inflater.stream.avail_out)
-                .expect("zlib uInt fits usize");
-            relative_input += consumed;
-            input_offset = input_offset.saturating_add(consumed as u64);
-            // SAFETY: zlib initialized exactly `produced` bytes in the spare
-            // capacity supplied above, and cannot report more than that
-            // capacity through `avail_out`.
-            unsafe { decoded.set_len(output_start + produced) };
-
-            match status {
-                z::Z_STREAM_END => {
+            match step.status {
+                inflate_status::STREAM_END => {
                     let member_output = &decoded[member_output_start..];
                     let footer_offset = input_offset;
                     read_range_reuse(source, footer_offset, 8, compressed)?;
@@ -1738,29 +2539,29 @@ fn inflate_independent_member_into<R: ReadAt + ?Sized>(
                     }
                     return Ok(footer_offset.saturating_add(8));
                 }
-                z::Z_OK => {
-                    if consumed == 0 && produced == 0 {
+                inflate_status::OK => {
+                    if step.consumed == 0 && step.produced == 0 {
                         return Err(DecodeError::InvalidDeflate {
                             bit_offset: input_offset.saturating_mul(8),
                             reason: DeflateErrorKind::Stalled,
                         });
                     }
                 }
-                z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {}
-                z::Z_BUF_ERROR => {
+                inflate_status::BUF_ERROR if step.consumed > 0 || step.produced > 0 => {}
+                inflate_status::BUF_ERROR => {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: input_offset.saturating_mul(8),
                         reason: DeflateErrorKind::Truncated,
                     });
                 }
-                z::Z_NEED_DICT => {
+                inflate_status::NEED_DICT => {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: header.deflate_start.saturating_mul(8),
                         reason: DeflateErrorKind::UnexpectedDictionary,
                     });
                 }
-                z::Z_DATA_ERROR => {
-                    let _diagnostic = inflater.message();
+                inflate_status::DATA_ERROR => {
+                    let _diagnostic = InflateBackend::message(inflater);
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: input_offset.saturating_mul(8),
                         reason: DeflateErrorKind::InvalidData,
@@ -1836,7 +2637,7 @@ fn send_independent_result(
             Err(TrySendError::Disconnected(_)) => return false,
             Err(TrySendError::Full(returned)) => {
                 result = returned;
-                thread::park_timeout(Duration::from_millis(1));
+                thread::park_timeout(RESULT_CHANNEL_FULL_PARK);
             }
         }
     }
@@ -1918,8 +2719,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
             Ok(end) => {
                 let member_size = run.decoded.bytes.len() - member_output_start;
                 run.decoded.end = end;
-                run.decoded
-                    .push_member(member_size, header.deflate_start);
+                run.decoded.push_member(member_size, header.deflate_start);
                 if (member_size > maximum_collatable_member_size
                     || run.decoded.bytes.len() >= target_result_size)
                     && !send_finished_independent_run(&mut active, sender, stopped)
@@ -2023,7 +2823,7 @@ where
                         let (lock, signal) = &*scan_signal;
                         let guard = lock.lock().expect("member scan mutex poisoned");
                         let _ = signal
-                            .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                            .wait_timeout_while(guard, WORKER_IDLE_PARK, |_| {
                                 let unresolved = unresolved_candidates.load(Ordering::Acquire);
                                 unresolved != 0
                                     && unresolved.saturating_add(candidate_count) > scan_ahead_limit
@@ -2096,7 +2896,7 @@ where
                                 let (lock, signal) = &*work_signal;
                                 let guard = lock.lock().expect("member work mutex poisoned");
                                 let _ = signal
-                                    .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                                    .wait_timeout_while(guard, WORKER_IDLE_PARK, |_| {
                                         available_tasks.load(Ordering::Acquire) == 0
                                             && !worker_stopped.load(Ordering::Relaxed)
                                             && !cancelled.load(Ordering::Relaxed)
@@ -2106,7 +2906,7 @@ where
                         }
                     };
                     if inflater.is_none() {
-                        match RawInflater::new() {
+                        match <RawInflater as InflateBackend>::create() {
                             Ok(new_inflater) => inflater = Some(new_inflater),
                             Err(error) => {
                                 let candidate_count = task.headers().len();
@@ -2154,7 +2954,7 @@ where
             if cancelled.load(Ordering::Relaxed) {
                 return Err(DecodeError::Cancelled);
             }
-            let result = match receiver.recv_timeout(Duration::from_millis(10)) {
+            let result = match receiver.recv_timeout(COORDINATOR_RECV_TIMEOUT) {
                 Ok(result) => {
                     pending_candidates.fetch_sub(result.candidate_count, Ordering::AcqRel);
                     result
@@ -2233,13 +3033,10 @@ where
                     }
                     // Empty-window checkpoint at each verified member's DEFLATE start.
                     index_builder.force_checkpoint(
-                        decoded
-                            .member_deflate_start(member_index)
-                            .saturating_mul(8),
+                        decoded.member_deflate_start(member_index).saturating_mul(8),
                         true,
                     );
-                    let member_bytes =
-                        &decoded.bytes[accepted_bytes..accepted_bytes + member_size];
+                    let member_bytes = &decoded.bytes[accepted_bytes..accepted_bytes + member_size];
                     index_builder.push_output(member_bytes);
                     total_output =
                         next_total.expect("the overflow case returned immediately above");
@@ -2345,6 +3142,7 @@ fn read_range_reuse<R: ReadAt + ?Sized>(
 
 struct MemberAccounting {
     crc: Crc32,
+    adler: Adler32,
     size: u32,
 }
 
@@ -2352,6 +3150,7 @@ impl MemberAccounting {
     const fn new() -> Self {
         Self {
             crc: Crc32::new(),
+            adler: Adler32::new(),
             size: 0,
         }
     }
@@ -2378,7 +3177,15 @@ fn emit_accounted<O: Output>(
     }
     *total_output = next_total;
     accounting.size = accounting.size.wrapping_add(decoded.len() as u32);
+    // Gzip paths use CRC32; zlib uses Adler-32. Updating both when integrity
+    // checks are on keeps the shared emit path format-agnostic. Parallel raw
+    // DEFLATE also needs CRC when an external `raw_crc32_list` is configured
+    // (even if `crc32_enabled` is false — that flag only gates on-stream
+    // trailers).
     if config.crc32_enabled {
+        accounting.crc.update(&decoded);
+        accounting.adler.update(&decoded);
+    } else if !config.raw_crc32_list.is_empty() {
         accounting.crc.update(&decoded);
     }
     if let Some(index_builder) = index_builder {
@@ -2406,6 +3213,8 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
+    // Mid-stream resume (prime + dictionary) via inherent ReadAt helper, which
+    // builds the stream through [`InflateBackend::prepare_at_bit_offset`].
     let (mut inflater, resume_byte) = RawInflater::prepare_at_bit_offset(
         start_bit,
         window,
@@ -2416,6 +3225,8 @@ where
     let mut cursor = SourceCursor::new(source, config.input_page_size)?;
     cursor.seek(resume_byte)?;
 
+    // Reuse one buffer; each step appends into spare capacity via InflateBackend.
+    let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Err(DecodeError::Cancelled);
@@ -2426,31 +3237,22 @@ where
                 reason: DeflateErrorKind::Truncated,
             });
         }
-        let (input_pointer, input_length) = {
-            let input = cursor.available()?;
-            (input.as_ptr(), input.len().min(u32::MAX as usize))
-        };
-        let mut decoded = vec![0_u8; config.decoded_chunk_size];
-        inflater.stream.next_in = input_pointer;
-        inflater.stream.avail_in = input_length as u32;
-        inflater.stream.next_out = decoded.as_mut_ptr();
-        inflater.stream.avail_out = decoded.len() as u32;
-        let input_before = inflater.stream.avail_in;
-        let output_before = inflater.stream.avail_out;
-
-        // SAFETY: identical pointer and lifetime argument to the main raw
-        // inflate loop above; this stream additionally has valid primed bits
-        // and a copied dictionary.
-        let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
-        let consumed =
-            usize::try_from(input_before - inflater.stream.avail_in).expect("zlib uInt fits usize");
-        let produced = usize::try_from(output_before - inflater.stream.avail_out)
-            .expect("zlib uInt fits usize");
-        cursor.advance(consumed);
-        decoded.truncate(produced);
+        decoded.clear();
+        decoded.reserve(config.decoded_chunk_size);
+        let input = cursor.available()?;
+        // Hard-cap produce to the configured chunk so step size matches the
+        // prior pre-sized `avail_out` limit even if capacity is larger.
+        let step = InflateBackend::inflate_capped(
+            &mut inflater,
+            input,
+            &mut decoded,
+            InflateFlush::NoFlush,
+            config.decoded_chunk_size,
+        )?;
+        cursor.advance(step.consumed);
         if !decoded.is_empty() {
             emit_accounted(
-                decoded,
+                std::mem::take(&mut decoded),
                 config,
                 output,
                 accounting,
@@ -2458,23 +3260,23 @@ where
                 Some(index_builder),
             )?;
         }
-        match status {
-            z::Z_STREAM_END => return Ok(cursor.position()),
-            z::Z_OK if consumed != 0 || produced != 0 => {}
-            z::Z_BUF_ERROR if consumed != 0 || produced != 0 => {}
-            z::Z_DATA_ERROR => {
+        match step.status {
+            inflate_status::STREAM_END => return Ok(cursor.position()),
+            inflate_status::OK if step.consumed != 0 || step.produced != 0 => {}
+            inflate_status::BUF_ERROR if step.consumed != 0 || step.produced != 0 => {}
+            inflate_status::DATA_ERROR => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: cursor.position().saturating_mul(8),
                     reason: DeflateErrorKind::InvalidData,
                 });
             }
-            z::Z_NEED_DICT => {
+            inflate_status::NEED_DICT => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: start_bit,
                     reason: DeflateErrorKind::UnexpectedDictionary,
                 });
             }
-            z::Z_OK | z::Z_BUF_ERROR => {
+            inflate_status::OK | inflate_status::BUF_ERROR => {
                 return Err(DecodeError::InvalidDeflate {
                     bit_offset: cursor.position().saturating_mul(8),
                     reason: DeflateErrorKind::Stalled,
@@ -2631,7 +3433,7 @@ fn send_native_result(
             Ok(()) | Err(TrySendError::Disconnected(_)) => return,
             Err(TrySendError::Full(returned)) => {
                 result = returned;
-                thread::park_timeout(Duration::from_micros(25));
+                thread::park_timeout(NATIVE_RESULT_CHANNEL_FULL_PARK);
             }
         }
     }
@@ -2650,7 +3452,7 @@ fn send_resolve_result(
             Ok(()) | Err(TrySendError::Disconnected(_)) => return,
             Err(TrySendError::Full(returned)) => {
                 result = returned;
-                thread::park_timeout(Duration::from_micros(25));
+                thread::park_timeout(NATIVE_RESULT_CHANNEL_FULL_PARK);
             }
         }
     }
@@ -2672,11 +3474,26 @@ fn spawn_estimated_worker<'scope, 'env: 'scope, R>(
     available_resolve_tasks: Arc<AtomicUsize>,
     work_signal: Arc<(Mutex<()>, Condvar)>,
     adaptive_workers: Arc<AdaptiveWorkers>,
+    output_free_list: Arc<ByteBufferFreeList>,
 ) where
     R: ReadAt + ?Sized + 'env,
 {
     scope.spawn(move || {
+        // Per-worker compressed page: `read_range_reuse` resizes in place so
+        // capacity survives across tasks. Stable adaptive ranks keep this
+        // buffer local instead of rotating threads through the active set.
         let mut compressed = Vec::new();
+        // Symbol/clean scratches recycle capacity across failed structural
+        // candidates within a task and, after successful resolve on this
+        // worker, the emptied `Vec<Symbol>` from `resolve_parts`. Successful
+        // `ChunkOutput` is owned by the resolve queue until a worker steals
+        // it; post-emit the coordinator recycles empty `Vec<u8>` capacity into
+        // `output_free_list` for the next task's clean/backend_tail scratch.
+        let mut marked_scratch = Vec::new();
+        let mut clean_scratch = Vec::new();
+        // zlib-rs tail inflater reused for exact-start and backend-continuation
+        // paths (same pattern as BGZF / independent-member workers).
+        let mut tail_inflater = None;
         loop {
             if stopped.load(Ordering::Relaxed) {
                 break;
@@ -2688,7 +3505,11 @@ fn spawn_estimated_worker<'scope, 'env: 'scope, R>(
             match resolve_queue.steal() {
                 Steal::Success(task) => {
                     available_resolve_tasks.fetch_sub(1, Ordering::AcqRel);
-                    let result = task.output.resolve_parts(&task.predecessor);
+                    // Resolve consumes `ChunkOutput` on this worker; recycle
+                    // emptied symbol capacity before publishing to the
+                    // coordinator (never while the buffer is still enqueued).
+                    let (result, emptied_symbols) = task.output.resolve_parts(&task.predecessor);
+                    prefer_capacity(&mut marked_scratch, emptied_symbols);
                     send_resolve_result(
                         &resolve_sender,
                         &stopped,
@@ -2708,9 +3529,24 @@ fn spawn_estimated_worker<'scope, 'env: 'scope, R>(
             match queue.steal() {
                 Steal::Success(index) => {
                     available_decode_tasks.fetch_sub(1, Ordering::AcqRel);
+                    // Prefer free-list capacity before growing for a new task.
+                    // Successful prior tasks leave clean_scratch empty (taken into
+                    // ChunkOutput); this recovers post-emit capacity without
+                    // aliasing any buffer still in the resolve/emit pipeline.
+                    // Skip when a failed-candidate recycle already left capacity.
+                    if clean_scratch.capacity() == 0 {
+                        output_free_list.try_steal_into(&mut clean_scratch);
+                    }
                     let generation = adaptive_workers.start_work();
-                    let result =
-                        run_estimated_task(source, &tasks[index], maximum_output, &mut compressed);
+                    let result = run_estimated_task(
+                        source,
+                        &tasks[index],
+                        maximum_output,
+                        &mut compressed,
+                        &mut marked_scratch,
+                        &mut clean_scratch,
+                        &mut tail_inflater,
+                    );
                     let decoded_bytes = result.as_ref().map_or(0, |chunk| chunk.output.len());
                     if adaptive_workers.observe_work(generation, decoded_bytes) {
                         work_signal.1.notify_all();
@@ -2727,7 +3563,7 @@ fn spawn_estimated_worker<'scope, 'env: 'scope, R>(
             let (lock, signal) = &*work_signal;
             let guard = lock.lock().expect("estimated work mutex poisoned");
             let _ = signal
-                .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                .wait_timeout_while(guard, WORKER_IDLE_PARK, |_| {
                     (available_decode_tasks.load(Ordering::Acquire) == 0
                         && available_resolve_tasks.load(Ordering::Acquire) == 0
                         || !adaptive_workers.worker_enabled(worker_index))
@@ -2744,6 +3580,23 @@ struct BackendTail {
     reached_stream_end: bool,
 }
 
+/// Prefer the larger allocation when recycling emptied or failed-attempt buffers.
+fn prefer_capacity<T>(dst: &mut Vec<T>, src: Vec<T>) {
+    if src.capacity() > dst.capacity() {
+        *dst = src;
+    }
+}
+
+// Shared free-list of empty `Vec<u8>` capacity returned after resolved emit:
+// `ByteBufferFreeList` lives in `buffer_pool` (shared with DecoderReader).
+// Estimated workers drain successful `clean` / `backend_tail` allocations into
+// `ChunkOutput`; those bytes stay live until resolve+emit. After a successful
+// emit the cleared capacity is pushed here so the next task can
+// `try_steal_into` instead of cold-allocating. Soft-capped at
+// `2 × worker_count`. Emptied `Vec<Symbol>` capacity is recycled worker-locally
+// after resolve (`prefer_capacity` into `marked_scratch`), not via this list.
+
+#[allow(clippy::too_many_arguments)]
 fn inflate_tail(
     bytes: &[u8],
     start_bit: usize,
@@ -2751,26 +3604,51 @@ fn inflate_tail(
     window: &Window,
     maximum_output: usize,
     exact_stop: bool,
+    inflater: &mut Option<RawInflater>,
+    output: &mut Vec<u8>,
 ) -> Result<BackendTail, NativeError> {
-    let mut inflater = RawInflater::new().map_err(|_| NativeError::InvalidSymbol)?;
+    // Estimated-path tail continue: mid-stream bit resume through
+    // [`InflateBackend`] (prime + dictionary). Same contract as
+    // [`InflateBackend::install_bit_resume`], but keeps distinct NativeError
+    // mappings (prime → InvalidSymbol, dictionary → InvalidDistance) and
+    // reuses one zlib stream across candidates.
+    if inflater.is_none() {
+        *inflater = Some(
+            <RawInflater as InflateBackend>::create().map_err(|_| NativeError::InvalidSymbol)?,
+        );
+    }
+    let inflater = inflater
+        .as_mut()
+        .expect("inflater initialized immediately above");
+    inflater
+        .reset(start_bit as u64)
+        .map_err(|_| NativeError::InvalidSymbol)?;
     let byte_offset = start_bit / 8;
     let skipped_bits = (start_bit % 8) as u8;
     let mut input_position = byte_offset;
     if skipped_bits != 0 {
-        let byte = *bytes.get(byte_offset).ok_or(NativeError::UnexpectedEof)?;
-        inflater
-            .prime(8 - skipped_bits, byte >> skipped_bits, start_bit as u64)
-            .map_err(|_| NativeError::InvalidSymbol)?;
+        let first_byte = *bytes.get(byte_offset).ok_or(NativeError::UnexpectedEof)?;
+        InflateBackend::prime(
+            inflater,
+            8 - skipped_bits,
+            first_byte >> skipped_bits,
+            start_bit as u64,
+        )
+        .map_err(|_| NativeError::InvalidSymbol)?;
         input_position += 1;
     }
-    inflater
-        .set_dictionary(window, start_bit as u64)
+    InflateBackend::set_dictionary(inflater, window, start_bit as u64)
         .map_err(|_| NativeError::InvalidDistance)?;
 
     // Typical 1 MiB compressed grid chunks expand to roughly 1--2 MiB. An
     // eager 2 MiB ceiling avoids repeated growth/copying without reserving the
-    // much larger adversarial-output allowance for every worker.
-    let mut output = Vec::with_capacity(maximum_output.min(2 * 1024 * 1024));
+    // much larger adversarial-output allowance for every worker. Capacity is
+    // retained across failed attempts via the caller's scratch vector.
+    output.clear();
+    let target_cap = maximum_output.min(2 * 1024 * 1024);
+    if output.capacity() < target_cap {
+        output.reserve(target_cap - output.capacity());
+    }
     loop {
         let input = bytes
             .get(input_position..)
@@ -2778,67 +3656,49 @@ fn inflate_tail(
         if input.is_empty() {
             return Err(NativeError::UnexpectedEof);
         }
-        let input_length = input.len().min(u32::MAX as usize);
         let remaining = maximum_output.saturating_sub(output.len());
+        // Grow spare in moderate steps; produce is hard-capped by `remaining`.
         let reserve = remaining.clamp(1, 256 * 1024);
         output.reserve(reserve);
-        let old_output_length = output.len();
-        let spare = output.spare_capacity_mut();
-        let output_length = spare.len().min(u32::MAX as usize);
-        inflater.stream.next_in = input.as_ptr();
-        inflater.stream.avail_in = input_length as u32;
-        inflater.stream.next_out = spare.as_mut_ptr().cast::<u8>();
-        inflater.stream.avail_out = output_length as u32;
-        let input_before = inflater.stream.avail_in;
-        let output_before = inflater.stream.avail_out;
 
-        // SAFETY: `inflater` owns an initialized stream. The input and output
-        // slices remain live and immovable for this call, and their lengths
-        // exactly match the `avail_*` fields.
-        let status = unsafe { z::inflate(&mut inflater.stream, z::Z_BLOCK) };
-        let consumed =
-            usize::try_from(input_before - inflater.stream.avail_in).expect("zlib uInt fits usize");
-        let produced = usize::try_from(output_before - inflater.stream.avail_out)
-            .expect("zlib uInt fits usize");
-        input_position += consumed;
-        if old_output_length
-            .checked_add(produced)
-            .is_none_or(|size| size > maximum_output)
-        {
+        // `InflateFlush::Block` surfaces DEFLATE block ends via
+        // `InflateStep::{unused_bits, at_block_end, last_block}` (zlib
+        // `data_type` bits under the hood for RawInflater).
+        let step =
+            InflateBackend::inflate_capped(inflater, input, output, InflateFlush::Block, remaining)
+                .map_err(|_| NativeError::InvalidSymbol)?;
+        input_position += step.consumed;
+
+        // Cap prevents writing past `maximum_output`. When `remaining == 0`,
+        // `inflate_capped` returns BUF_ERROR with zero progress without calling
+        // zlib — map that stall to OutputLimit (prior path reserved ≥1 spare
+        // and rejected any overshoot after the call).
+        if step.consumed == 0 && step.produced == 0 && remaining == 0 {
             return Err(NativeError::OutputLimit);
         }
-        // SAFETY: zlib reported exactly `produced` bytes written through
-        // `next_out`. The pointer covered the vector's spare capacity and the
-        // output-limit check also proves the new length cannot overflow.
-        unsafe {
-            output.set_len(old_output_length + produced);
-        }
 
-        // zlib exposes the number of bits currently buffered but not consumed
-        // in the low six data_type bits. Optimized inflaters may read several
-        // bytes ahead, so masking only the low three bits can place a gzip
-        // footer multiple bytes too late.
-        let unused_bits = usize::try_from(inflater.stream.data_type & 0x3F)
-            .expect("the low six data_type bits are non-negative");
+        // Unused bit-buffer bits (low six data_type bits). Optimized inflaters
+        // may read several bytes ahead, so using only three bits can place a
+        // gzip footer multiple bytes too late.
+        let unused_bits = usize::from(step.unused_bits);
         let position = input_position.saturating_mul(8).saturating_sub(unused_bits);
-        if status == z::Z_STREAM_END {
+        if step.status == inflate_status::STREAM_END {
             return Ok(BackendTail {
-                output,
+                output: std::mem::take(output),
                 end_bit: position.div_ceil(8).saturating_mul(8),
                 reached_stream_end: true,
             });
         }
-        if status != z::Z_OK && status != z::Z_BUF_ERROR {
+        if step.status != inflate_status::OK && step.status != inflate_status::BUF_ERROR {
             return Err(NativeError::InvalidSymbol);
         }
-        if inflater.stream.data_type & 0x80 != 0 {
-            // zlib's Z_BLOCK contract sets bit 6 after decoding an end-of-block
-            // code for a BFINAL block, even though this call can still return
-            // Z_OK rather than Z_STREAM_END. There is no following block to
-            // resume from; DEFLATE instead pads the stream to the next byte.
-            if inflater.stream.data_type & 0x40 != 0 {
+        if step.at_block_end {
+            // Block flush sets last_block after an end-of-block code for a
+            // BFINAL block even when status is still OK rather than STREAM_END.
+            // There is no following block; DEFLATE pads to the next byte.
+            if step.last_block {
                 return Ok(BackendTail {
-                    output,
+                    output: std::mem::take(output),
                     end_bit: position.div_ceil(8).saturating_mul(8),
                     reached_stream_end: true,
                 });
@@ -2846,14 +3706,14 @@ fn inflate_tail(
             match position.cmp(&stop_bit) {
                 std::cmp::Ordering::Equal => {
                     return Ok(BackendTail {
-                        output,
+                        output: std::mem::take(output),
                         end_bit: position,
                         reached_stream_end: false,
                     });
                 }
                 std::cmp::Ordering::Greater if !exact_stop => {
                     return Ok(BackendTail {
-                        output,
+                        output: std::mem::take(output),
                         end_bit: position,
                         reached_stream_end: false,
                     });
@@ -2862,17 +3722,21 @@ fn inflate_tail(
                 std::cmp::Ordering::Less => {}
             }
         }
-        if consumed == 0 && produced == 0 {
+        if step.consumed == 0 && step.produced == 0 {
             return Err(NativeError::UnexpectedEof);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_estimated_task<R: ReadAt + ?Sized>(
     source: &R,
     task: &EstimatedTask,
     maximum_output: usize,
     bytes: &mut Vec<u8>,
+    marked_scratch: &mut Vec<Symbol>,
+    clean_scratch: &mut Vec<u8>,
+    tail_inflater: &mut Option<RawInflater>,
 ) -> Result<crate::parallel::deflate::Chunk, NativeError> {
     let byte_start = task.search_start_bit / 8;
     let byte_end = task.read_end_bit.div_ceil(8);
@@ -2896,6 +3760,8 @@ fn run_estimated_task<R: ReadAt + ?Sized>(
             &Window::empty(),
             maximum_output,
             false,
+            tail_inflater,
+            clean_scratch,
         )?;
         let chunk = crate::parallel::deflate::Chunk {
             start_bit: usize::try_from(task.search_start_bit)
@@ -2922,14 +3788,36 @@ fn run_estimated_task<R: ReadAt + ?Sized>(
                 local_stop,
                 InitialHistory::Unknown,
                 maximum_output,
+                marked_scratch,
             )?;
             if let Some(window) = chunk.backend_continuation.take() {
                 let remaining = maximum_output.saturating_sub(chunk.output.len());
-                let tail =
-                    inflate_tail(bytes, chunk.end_bit, local_stop, &window, remaining, false)?;
-                chunk.output.append_clean(tail.output);
-                chunk.end_bit = tail.end_bit;
-                chunk.reached_stream_end = tail.reached_stream_end;
+                match inflate_tail(
+                    bytes,
+                    chunk.end_bit,
+                    local_stop,
+                    &window,
+                    remaining,
+                    false,
+                    tail_inflater,
+                    clean_scratch,
+                ) {
+                    Ok(tail) => {
+                        chunk.output.append_clean(tail.output);
+                        chunk.end_bit = tail.end_bit;
+                        chunk.reached_stream_end = tail.reached_stream_end;
+                    }
+                    Err(error) => {
+                        // Decode already took the marked allocation; put the
+                        // largest capacity back into the worker-local scratch
+                        // so the next candidate does not start cold.
+                        let (marked, clean, backend_tail) = chunk.output.into_recycle_parts();
+                        prefer_capacity(marked_scratch, marked);
+                        prefer_capacity(clean_scratch, clean);
+                        prefer_capacity(clean_scratch, backend_tail);
+                        return Err(error);
+                    }
+                }
             }
             Ok::<_, NativeError>(chunk)
         })();
@@ -2989,32 +3877,83 @@ fn emit_resolved_parts<O: Output>(
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
     index_builder: &mut IndexBuilder,
+    free_list: &ByteBufferFreeList,
 ) -> Result<(), DecodeError> {
     let (marked, clean, backend_tail) = parts;
-    emit_accounted(
+    emit_resolved_buffer(
         marked,
         config,
         output,
         accounting,
         total_output,
-        Some(index_builder),
+        index_builder,
+        free_list,
     )?;
-    emit_accounted(
+    emit_resolved_buffer(
         clean,
         config,
         output,
         accounting,
         total_output,
-        Some(index_builder),
+        index_builder,
+        free_list,
     )?;
-    emit_accounted(
+    emit_resolved_buffer(
         backend_tail,
         config,
         output,
         accounting,
         total_output,
-        Some(index_builder),
+        index_builder,
+        free_list,
     )?;
+    Ok(())
+}
+
+/// Account + emit one resolved part, then recycle empty capacity into the
+/// estimated free-list. Only called after resolve completes and the buffer is
+/// exclusively owned by the coordinator (never while still in the resolve
+/// queue).
+///
+/// `DirectOutput` returns the same cleared chunk; `ChannelOutput` sends the
+/// chunk to the reader and may return a *different* buffer stolen from the
+/// reader-local free list (see `buffer_pool`). Default `emit_reusable` returns
+/// a zero-capacity vec that this free-list drops.
+fn emit_resolved_buffer<O: Output>(
+    decoded: Vec<u8>,
+    config: &Config,
+    output: &mut O,
+    accounting: &mut MemberAccounting,
+    total_output: &mut u64,
+    index_builder: &mut IndexBuilder,
+    free_list: &ByteBufferFreeList,
+) -> Result<(), DecodeError> {
+    let next_total =
+        total_output
+            .checked_add(decoded.len() as u64)
+            .ok_or(DecodeError::OutputLimitExceeded {
+                limit: config.output_limit.unwrap_or(u64::MAX),
+            })?;
+    if config.output_limit.is_some_and(|limit| next_total > limit) {
+        return Err(DecodeError::OutputLimitExceeded {
+            limit: config.output_limit.expect("checked as some"),
+        });
+    }
+    *total_output = next_total;
+    accounting.size = accounting.size.wrapping_add(decoded.len() as u32);
+    if config.crc32_enabled {
+        accounting.crc.update(&decoded);
+        accounting.adler.update(&decoded);
+    } else if !config.raw_crc32_list.is_empty() {
+        accounting.crc.update(&decoded);
+    }
+    index_builder.push_output(&decoded);
+    if decoded.is_empty() {
+        free_list.recycle(decoded);
+        return Ok(());
+    }
+    let empty = output.emit_reusable(decoded)?;
+    free_list.recycle(empty);
     Ok(())
 }
 
@@ -3029,7 +3968,7 @@ fn wait_for_resolved(
         if let Some(result) = pending.remove(&next_sequence) {
             break result;
         }
-        match receiver.recv_timeout(Duration::from_millis(10)) {
+        match receiver.recv_timeout(COORDINATOR_RECV_TIMEOUT) {
             Ok(result) if result.sequence < next_sequence => {}
             Ok(result) => {
                 pending.insert(result.sequence, result.result);
@@ -3121,6 +4060,7 @@ fn drain_native_resolutions<O: Output>(
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
     index_builder: &mut IndexBuilder,
+    free_list: &ByteBufferFreeList,
 ) -> Result<(), DecodeError> {
     while *outstanding != 0 {
         let parts = wait_for_resolved(receiver, pending, *next_sequence, cancelled, bit_offset)?;
@@ -3131,6 +4071,7 @@ fn drain_native_resolutions<O: Output>(
             accounting,
             total_output,
             index_builder,
+            free_list,
         )?;
         *next_sequence += 1;
         *outstanding -= 1;
@@ -3205,6 +4146,643 @@ fn validate_footer<R: ReadAt + ?Sized>(
     unreachable!("a matching footer would have returned from the search")
 }
 
+/// Validates the 4-byte big-endian Adler-32 trailer at (or slightly before)
+/// `footer_offset`. Leaves the cursor immediately after the accepted trailer.
+///
+/// Native bit-position bookkeeping can land a few bytes past the true stream
+/// end (same class of issue as [`validate_footer`]); search backwards when
+/// integrity checks are enabled so a matching Adler still wins.
+fn validate_zlib_adler_footer<R: ReadAt + ?Sized>(
+    cursor: &mut SourceCursor<'_, R>,
+    footer_offset: u64,
+    member: u64,
+    accounting: &MemberAccounting,
+    crc32_enabled: bool,
+) -> Result<u64, DecodeError> {
+    const MAX_BACKEND_READ_AHEAD: u64 = 16;
+    let actual_adler = if crc32_enabled {
+        accounting.adler.finish()
+    } else {
+        0
+    };
+
+    if !crc32_enabled {
+        if footer_offset.saturating_add(4) > cursor.length() {
+            return Err(DecodeError::InvalidZlib {
+                offset: footer_offset,
+                reason: ZlibErrorKind::Truncated,
+            });
+        }
+        cursor.seek(footer_offset)?;
+        let _ = cursor
+            .read_exact::<4>(footer_offset)
+            .map_err(|error| match error {
+                DecodeError::InvalidGzip {
+                    reason: GzipErrorKind::Truncated,
+                    ..
+                } => DecodeError::InvalidZlib {
+                    offset: footer_offset,
+                    reason: ZlibErrorKind::Truncated,
+                },
+                other => other,
+            })?;
+        return Ok(footer_offset);
+    }
+
+    let mut first_error = None;
+    for read_ahead in 0..=MAX_BACKEND_READ_AHEAD {
+        let candidate = footer_offset.saturating_sub(read_ahead);
+        if candidate.saturating_add(4) > cursor.length() {
+            continue;
+        }
+        if let Err(error) = cursor.seek(candidate) {
+            first_error.get_or_insert(error);
+            continue;
+        }
+        let footer = match cursor.read_exact::<4>(candidate) {
+            Ok(footer) => footer,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        let expected_adler = u32::from_be_bytes(footer);
+        if expected_adler == actual_adler {
+            return Ok(candidate);
+        }
+        // Keep the first exact-offset mismatch as the preferred error if no
+        // read-ahead candidate matches.
+        if read_ahead == 0 {
+            first_error.get_or_insert(DecodeError::ChecksumMismatch {
+                member,
+                expected: expected_adler,
+                actual: actual_adler,
+            });
+        }
+    }
+
+    Err(first_error.unwrap_or(DecodeError::InvalidZlib {
+        offset: footer_offset,
+        reason: ZlibErrorKind::Truncated,
+    }))
+}
+
+/// Try the native estimated/marker path for a single long zlib stream; fall
+/// back to sequential when the compressed payload is too small to amortize.
+fn decode_zlib_parallel_or_sequential<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    debug_assert!(config.decoder_threads >= MIN_MARKER_PARALLEL_THREADS);
+
+    let compressed_chunk_size = adjusted_compressed_chunk_size(source, config)?;
+    // Smaller streams stay on sequential zlib-rs (marker overhead does not pay).
+    if !zlib_payload_large_enough_for_marker(source, config)? {
+        return decode_zlib_sequential(source, config, cancelled, output);
+    }
+    decode_zlib_estimated(source, config, cancelled, output, compressed_chunk_size)
+}
+
+/// Outcome of the shared single-stream estimated/marker DEFLATE body.
+struct EstimatedDeflateBodyResult {
+    /// First compressed byte after the DEFLATE bit stream (zlib/gzip trailer
+    /// start, or EOF for raw). Byte-aligned via native `align_to_byte` /
+    /// inflate unused-bits correction.
+    deflate_end_byte: u64,
+    total_output: u64,
+    accounting: MemberAccounting,
+    index_builder: IndexBuilder,
+}
+
+/// Parallel single-stream DEFLATE body shared by zlib and raw estimated paths.
+///
+/// Starts at `first_deflate_bit` (0 for raw, after CMF/FLG for zlib). Returns
+/// when the DEFLATE stream ends; callers validate trailers / leftover input.
+///
+/// Returns `Ok(None)` when the grid would have fewer than two tasks so the
+/// caller can fall back to sequential without starting workers.
+fn decode_estimated_deflate_body<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    compressed_chunk_size: usize,
+    first_deflate_bit: u64,
+    mut index_builder: IndexBuilder,
+) -> Result<Option<EstimatedDeflateBodyResult>, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    const SEARCH_BYTES: u64 = 512 * 1024;
+    const LOOKAHEAD_BYTES: u64 = 512 * 1024;
+
+    let source_len = source
+        .len()
+        .map_err(|error| DecodeError::input_io(0, error))?;
+    let length_bits = source_len.saturating_mul(8);
+    let spacing_bits = (compressed_chunk_size as u64).saturating_mul(8);
+    let task_count = usize::try_from(
+        length_bits
+            .saturating_sub(first_deflate_bit)
+            .div_ceil(spacing_bits),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
+    // Defensive: size gate should have ensured ≥2 tasks; if not, sequential.
+    if task_count < 2 {
+        return Ok(None);
+    }
+
+    index_builder.force_checkpoint(first_deflate_bit, true);
+
+    let tasks: Vec<_> = (0..task_count)
+        .map(|index| {
+            let estimated_start =
+                first_deflate_bit.saturating_add((index as u64).saturating_mul(spacing_bits));
+            let estimated_stop = estimated_start.saturating_add(spacing_bits);
+            EstimatedTask {
+                search_start_bit: estimated_start,
+                search_end_bit: if index == 0 {
+                    estimated_start
+                } else {
+                    estimated_start
+                        .saturating_add(SEARCH_BYTES.saturating_mul(8))
+                        .min(estimated_stop)
+                        .min(length_bits)
+                },
+                estimated_stop_bit: estimated_stop,
+                read_end_bit: estimated_stop
+                    .saturating_add(LOOKAHEAD_BYTES.saturating_mul(8))
+                    .min(length_bits),
+                exact_start: index == 0,
+            }
+        })
+        .collect();
+    let maximum_output = config
+        .decoded_chunk_size
+        .max(compressed_chunk_size.saturating_mul(20));
+    let task_queue = Arc::new(Injector::new());
+    let resolve_queue = Arc::new(Injector::<ResolveTask>::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let available_decode_tasks = Arc::new(AtomicUsize::new(0));
+    let available_resolve_tasks = Arc::new(AtomicUsize::new(0));
+    let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
+    let worker_count = config.decoder_threads.min(tasks.len());
+    // Soft cap: ~2 free buffers per worker bounds RSS if emit outpaces decode.
+    let output_free_list = Arc::new(ByteBufferFreeList::new(worker_count.saturating_mul(2)));
+    let machine_parallelism = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let adaptive_workers = Arc::new(AdaptiveWorkers::new(
+        worker_count,
+        machine_parallelism,
+        compressed_chunk_size.saturating_mul(16),
+        tasks.len(),
+    ));
+    let worker_pool_count = adaptive_workers.worker_pool_limit().min(worker_count);
+    let pipeline_capacity = config
+        .in_flight_chunks
+        .max(worker_pool_count)
+        .min(tasks.len());
+    let initial_task_window = adaptive_workers.current_limit().min(pipeline_capacity);
+    for index in 0..initial_task_window {
+        task_queue.push(index);
+    }
+    available_decode_tasks.store(initial_task_window, Ordering::Release);
+    let (sender, receiver) = mpsc::sync_channel::<NativeResult>(pipeline_capacity);
+    let (resolve_sender, resolve_receiver) = mpsc::sync_channel::<ResolveResult>(pipeline_capacity);
+
+    let mut total_output = 0_u64;
+    let mut current_bit = first_deflate_bit;
+    let mut next_to_schedule = initial_task_window;
+    let mut next_to_emit = 0_usize;
+    let mut pending = BTreeMap::new();
+    let mut prepared_total_output = 0_u64;
+    let mut next_resolve_sequence = 0_usize;
+    let mut next_resolve_to_emit = 0_usize;
+    let mut outstanding_resolves = 0_usize;
+    let mut resolve_pending = BTreeMap::new();
+    let mut stream_end_byte: Option<u64> = None;
+    let mut finished_accounting = MemberAccounting::new();
+
+    let scoped_result = thread::scope(|scope| -> Result<(), DecodeError> {
+        let _stop_on_exit = SignalledStopGuard {
+            stopped: &stopped,
+            work_signal: &work_signal.1,
+            limit_signal: &adaptive_workers.limit_signal,
+        };
+        let mut sender_template = Some(sender);
+        let mut resolve_sender_template = Some(resolve_sender);
+        let mut spawned_workers = 0_usize;
+
+        let mut window = Window::empty();
+        let mut accounting = MemberAccounting::new();
+        let mut footer_offset = None;
+
+        'decode: loop {
+            let spawn_target = adaptive_workers.current_limit().min(worker_pool_count);
+            while spawned_workers < spawn_target {
+                spawn_estimated_worker(
+                    scope,
+                    spawned_workers,
+                    source,
+                    &tasks,
+                    maximum_output,
+                    Arc::clone(&task_queue),
+                    Arc::clone(&resolve_queue),
+                    sender_template
+                        .as_ref()
+                        .expect("worker sender remains while calibration can grow")
+                        .clone(),
+                    resolve_sender_template
+                        .as_ref()
+                        .expect("resolve sender remains while calibration can grow")
+                        .clone(),
+                    Arc::clone(&stopped),
+                    Arc::clone(&available_decode_tasks),
+                    Arc::clone(&available_resolve_tasks),
+                    Arc::clone(&work_signal),
+                    Arc::clone(&adaptive_workers),
+                    Arc::clone(&output_free_list),
+                );
+                spawned_workers += 1;
+            }
+            if !adaptive_workers.is_calibrating() {
+                drop(sender_template.take());
+                drop(resolve_sender_template.take());
+            }
+
+            if let Some(offset) = footer_offset.take() {
+                drain_native_resolutions(
+                    &resolve_receiver,
+                    &mut resolve_pending,
+                    &mut next_resolve_to_emit,
+                    &mut outstanding_resolves,
+                    cancelled,
+                    current_bit,
+                    config,
+                    output,
+                    &mut accounting,
+                    &mut total_output,
+                    &mut index_builder,
+                    &output_free_list,
+                )?;
+                finished_accounting = accounting;
+                stream_end_byte = Some(offset);
+                break 'decode;
+            }
+
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(DecodeError::Cancelled);
+            }
+            let result = loop {
+                if let Some(result) = pending.remove(&next_to_emit) {
+                    break result;
+                }
+                match receiver.recv_timeout(COORDINATOR_RECV_TIMEOUT) {
+                    Ok(result) if result.index < next_to_emit => {}
+                    Ok(result) => {
+                        pending.insert(result.index, result.result);
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return Err(DecodeError::Cancelled);
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(DecodeError::WorkerPanicked);
+                    }
+                }
+            };
+
+            match result {
+                Ok(chunk) if chunk.start_bit as u64 == current_bit => {
+                    let reached_stream_end = enqueue_native_resolution(
+                        chunk,
+                        config,
+                        &mut current_bit,
+                        &mut window,
+                        &mut prepared_total_output,
+                        &mut next_resolve_sequence,
+                        &mut outstanding_resolves,
+                        &resolve_queue,
+                        &available_resolve_tasks,
+                        &work_signal,
+                        &mut index_builder,
+                    )?;
+                    let resolve_window = adaptive_workers.current_limit().min(pipeline_capacity);
+                    if outstanding_resolves >= resolve_window {
+                        let parts = wait_for_resolved(
+                            &resolve_receiver,
+                            &mut resolve_pending,
+                            next_resolve_to_emit,
+                            cancelled,
+                            current_bit,
+                        )?;
+                        emit_resolved_parts(
+                            parts,
+                            config,
+                            output,
+                            &mut accounting,
+                            &mut total_output,
+                            &mut index_builder,
+                            &output_free_list,
+                        )?;
+                        next_resolve_to_emit += 1;
+                        outstanding_resolves -= 1;
+                    }
+                    next_to_emit += 1;
+                    let task_window = adaptive_workers.current_limit().min(pipeline_capacity);
+                    let schedule_end = next_to_emit.saturating_add(task_window).min(tasks.len());
+                    if next_to_schedule < schedule_end {
+                        let (lock, signal) = &*work_signal;
+                        let _guard = lock.lock().expect("estimated work mutex poisoned");
+                        while next_to_schedule < schedule_end {
+                            task_queue.push(next_to_schedule);
+                            available_decode_tasks.fetch_add(1, Ordering::Release);
+                            next_to_schedule += 1;
+                        }
+                        signal.notify_all();
+                    }
+                    if reached_stream_end {
+                        footer_offset = Some(current_bit / 8);
+                    } else if next_to_emit >= tasks.len() {
+                        drain_native_resolutions(
+                            &resolve_receiver,
+                            &mut resolve_pending,
+                            &mut next_resolve_to_emit,
+                            &mut outstanding_resolves,
+                            cancelled,
+                            current_bit,
+                            config,
+                            output,
+                            &mut accounting,
+                            &mut total_output,
+                            &mut index_builder,
+                            &output_free_list,
+                        )?;
+                        footer_offset = Some(inflate_from_block(
+                            source,
+                            config,
+                            cancelled,
+                            output,
+                            current_bit,
+                            &window,
+                            &mut accounting,
+                            &mut total_output,
+                            &mut index_builder,
+                        )?);
+                        prepared_total_output = total_output;
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    drain_native_resolutions(
+                        &resolve_receiver,
+                        &mut resolve_pending,
+                        &mut next_resolve_to_emit,
+                        &mut outstanding_resolves,
+                        cancelled,
+                        current_bit,
+                        config,
+                        output,
+                        &mut accounting,
+                        &mut total_output,
+                        &mut index_builder,
+                        &output_free_list,
+                    )?;
+                    footer_offset = Some(inflate_from_block(
+                        source,
+                        config,
+                        cancelled,
+                        output,
+                        current_bit,
+                        &window,
+                        &mut accounting,
+                        &mut total_output,
+                        &mut index_builder,
+                    )?);
+                    prepared_total_output = total_output;
+                }
+            }
+        }
+
+        stopped.store(true, Ordering::Relaxed);
+        work_signal.1.notify_all();
+        Ok(())
+    });
+    stopped.store(true, Ordering::Relaxed);
+    work_signal.1.notify_all();
+    scoped_result?;
+
+    let Some(deflate_end_byte) = stream_end_byte else {
+        return Err(DecodeError::InvalidDeflate {
+            bit_offset: current_bit,
+            reason: DeflateErrorKind::Truncated,
+        });
+    };
+    Ok(Some(EstimatedDeflateBodyResult {
+        deflate_end_byte,
+        total_output,
+        accounting: finished_accounting,
+        index_builder,
+    }))
+}
+
+/// Parallel single-stream zlib via the same estimated grid / marker path as
+/// gzip. Concatenated streams after the first fall back to sequential.
+fn decode_zlib_estimated<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    compressed_chunk_size: usize,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    // Frame cursor only needs the zlib header and Adler trailer.
+    let mut frame_cursor = SourceCursor::new(source, config.input_page_size.min(256))?;
+    let index_builder = new_index_builder(config);
+    if frame_cursor.at_end() {
+        return Err(DecodeError::InvalidZlib {
+            offset: 0,
+            reason: ZlibErrorKind::Truncated,
+        });
+    }
+
+    let first_header = parse_zlib_header(&mut frame_cursor, true)?;
+    let first_deflate_bit = first_header.deflate_start.saturating_mul(8);
+
+    let Some(body) = decode_estimated_deflate_body(
+        source,
+        config,
+        cancelled,
+        output,
+        compressed_chunk_size,
+        first_deflate_bit,
+        index_builder,
+    )?
+    else {
+        return decode_zlib_sequential(source, config, cancelled, output);
+    };
+
+    let actual_footer = validate_zlib_adler_footer(
+        &mut frame_cursor,
+        body.deflate_end_byte,
+        0,
+        &body.accounting,
+        config.crc32_enabled,
+    )?;
+    let member_count = 1_u64;
+    let total_output = body.total_output;
+    let index_builder = body.index_builder;
+    // Cursor sits after the Adler trailer.
+    let stream_end = actual_footer.saturating_add(4);
+    debug_assert_eq!(frame_cursor.position(), stream_end);
+    if frame_cursor.position() != stream_end {
+        frame_cursor.seek(stream_end)?;
+    }
+
+    // Concatenated zlib streams after the first: stream-granularity parallel
+    // when ≥1 remaining stream and threads allow; else sequential.
+    if !frame_cursor.at_end() {
+        if config.decoder_threads > 1 {
+            if let Some(rest) = index_zlib_streams_from(source, config, cancelled, stream_end)? {
+                return decode_zlib_streams_parallel_from(
+                    source,
+                    config,
+                    cancelled,
+                    output,
+                    &rest,
+                    member_count,
+                    total_output,
+                    index_builder,
+                );
+            }
+        }
+        return decode_zlib_sequential_from(
+            source,
+            config,
+            cancelled,
+            output,
+            ZlibSequentialState {
+                cursor: frame_cursor,
+                index_builder,
+                member_count,
+                total_output,
+            },
+        );
+    }
+
+    let final_length = source
+        .len()
+        .map_err(|error| DecodeError::input_io(frame_cursor.position(), error))?;
+    if final_length != frame_cursor.length() {
+        return Err(DecodeError::input_io(
+            frame_cursor.position(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed source length changed during decoding",
+            ),
+        ));
+    }
+    Ok(finish_report(
+        config,
+        frame_cursor.position(),
+        total_output,
+        member_count,
+        index_builder,
+    ))
+}
+
+/// Parallel single-stream raw DEFLATE via the shared estimated/marker body.
+///
+/// Starts at bit 0 (no CMF/FLG). On stream end there is no Adler/CRC trailer;
+/// leftover compressed input is an error. Optional whole-stream CRC via
+/// `config.raw_crc32_list`.
+fn decode_raw_deflate_estimated<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    compressed_chunk_size: usize,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    debug_assert!(
+        !config.keep_index,
+        "keep_index for raw DEFLATE is rejected by DecoderBuilder::build"
+    );
+
+    let source_len = source
+        .len()
+        .map_err(|error| DecodeError::input_io(0, error))?;
+    if source_len == 0 {
+        return Err(DecodeError::InvalidDeflate {
+            bit_offset: 0,
+            reason: DeflateErrorKind::Truncated,
+        });
+    }
+
+    let Some(body) = decode_estimated_deflate_body(
+        source,
+        config,
+        cancelled,
+        output,
+        compressed_chunk_size,
+        0,
+        new_index_builder(config),
+    )?
+    else {
+        return decode_raw_deflate_sequential(source, config, cancelled, output);
+    };
+
+    // Single stream must consume the entire source (no trailer, no concat).
+    // Native end bits are byte-aligned after the final block; leftover bytes
+    // after that position match the sequential InvalidData policy.
+    if body.deflate_end_byte != source_len {
+        return Err(DecodeError::InvalidDeflate {
+            bit_offset: body.deflate_end_byte.saturating_mul(8),
+            reason: if body.deflate_end_byte < source_len {
+                DeflateErrorKind::InvalidData
+            } else {
+                DeflateErrorKind::Truncated
+            },
+        });
+    }
+
+    let final_length = source
+        .len()
+        .map_err(|error| DecodeError::input_io(body.deflate_end_byte, error))?;
+    if final_length != source_len {
+        return Err(DecodeError::input_io(
+            body.deflate_end_byte,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed source length changed during decoding",
+            ),
+        ));
+    }
+
+    crate::crc32::verify_raw_crc32_list(&config.raw_crc32_list, &body.accounting.crc)?;
+
+    Ok(finish_report(
+        config,
+        body.deflate_end_byte,
+        body.total_output,
+        1,
+        body.index_builder,
+    ))
+}
+
 fn decode_rapidgzip_estimated<R, O>(
     source: &R,
     config: &Config,
@@ -3276,6 +4854,8 @@ where
     let available_resolve_tasks = Arc::new(AtomicUsize::new(0));
     let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
     let worker_count = config.decoder_threads.min(tasks.len());
+    // Soft cap: ~2 free buffers per worker bounds RSS if emit outpaces decode.
+    let output_free_list = Arc::new(ByteBufferFreeList::new(worker_count.saturating_mul(2)));
     let machine_parallelism = thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let adaptive_workers = Arc::new(AdaptiveWorkers::new(
         worker_count,
@@ -3353,6 +4933,7 @@ where
                     Arc::clone(&available_resolve_tasks),
                     Arc::clone(&work_signal),
                     Arc::clone(&adaptive_workers),
+                    Arc::clone(&output_free_list),
                 );
                 spawned_workers += 1;
             }
@@ -3374,6 +4955,7 @@ where
                     &mut accounting,
                     &mut total_output,
                     &mut index_builder,
+                    &output_free_list,
                 )?;
                 let actual_footer = validate_footer(
                     &mut frame_cursor,
@@ -3450,8 +5032,18 @@ where
                         .min(length_bits),
                     exact_start: true,
                 };
-                let bridge_result =
-                    run_estimated_task(source, &bridge, maximum_output, &mut bridge_compressed);
+                let mut bridge_marked = Vec::new();
+                let mut bridge_clean = Vec::new();
+                let mut bridge_inflater = None;
+                let bridge_result = run_estimated_task(
+                    source,
+                    &bridge,
+                    maximum_output,
+                    &mut bridge_compressed,
+                    &mut bridge_marked,
+                    &mut bridge_clean,
+                    &mut bridge_inflater,
+                );
                 match bridge_result {
                     Ok(chunk) if chunk.start_bit as u64 == current_bit => {
                         let reached_stream_end = enqueue_native_resolution(
@@ -3484,6 +5076,7 @@ where
                                 &mut accounting,
                                 &mut total_output,
                                 &mut index_builder,
+                                &output_free_list,
                             )?;
                             next_resolve_to_emit += 1;
                             outstanding_resolves -= 1;
@@ -3517,7 +5110,7 @@ where
                 if let Some(result) = pending.remove(&next_to_emit) {
                     break result;
                 }
-                match receiver.recv_timeout(Duration::from_millis(10)) {
+                match receiver.recv_timeout(COORDINATOR_RECV_TIMEOUT) {
                     Ok(result) if result.index < next_to_emit => {}
                     Ok(result) => {
                         pending.insert(result.index, result.result);
@@ -3564,6 +5157,7 @@ where
                             &mut accounting,
                             &mut total_output,
                             &mut index_builder,
+                            &output_free_list,
                         )?;
                         next_resolve_to_emit += 1;
                         outstanding_resolves -= 1;
@@ -3596,6 +5190,7 @@ where
                             &mut accounting,
                             &mut total_output,
                             &mut index_builder,
+                            &output_free_list,
                         )?;
                         footer_offset = Some(inflate_from_block(
                             source,
@@ -3624,6 +5219,7 @@ where
                         &mut accounting,
                         &mut total_output,
                         &mut index_builder,
+                        &output_free_list,
                     )?;
                     footer_offset = Some(inflate_from_block(
                         source,
@@ -3737,6 +5333,11 @@ struct BgzfResult {
 }
 
 /// Decodes one BGZF block, appending to `output`. Returns the produced length.
+///
+/// Stream lifecycle (reset) and the one-shot inflate go through
+/// [`InflateBackend`] monomorphized to [`RawInflater`]. The extra spare byte
+/// beyond the footer ISIZE still distinguishes exact-size success from
+/// output-buffer exhaustion (including empty EOF blocks).
 fn decode_bgzf_block_into<R: ReadAt + ?Sized>(
     source: &R,
     range: BgzfRange,
@@ -3788,41 +5389,26 @@ fn decode_bgzf_block_into<R: ReadAt + ?Sized>(
         });
     }
 
-    inflater.reset(range.deflate_start.saturating_mul(8))?;
+    let bit_offset = range.deflate_start.saturating_mul(8);
+    InflateBackend::reset(inflater, bit_offset)?;
     let old_length = output.len();
+    // Reserve ISIZE + 1 so Finish can report STREAM_END with exact produced
+    // length instead of looking like buffer exhaustion.
     let writable = decoded_length.saturating_add(1);
     output.reserve(writable);
-    let spare = output.spare_capacity_mut();
-    inflater.stream.next_in = payload.as_ptr();
-    inflater.stream.avail_in = payload.len() as u32;
-    inflater.stream.next_out = spare.as_mut_ptr().cast::<u8>();
-    inflater.stream.avail_out = writable as u32;
-    let input_before = inflater.stream.avail_in;
-    let output_before = inflater.stream.avail_out;
-
-    // SAFETY: `payload` remains live for the call and fits BGZF's 64 KiB
-    // compressed-block bound. `output.reserve` provided at least `writable`
-    // bytes of valid uninitialized spare capacity, exactly matching
-    // `avail_out`; zlib writes them before Rust observes them.
-    let status = unsafe { z::inflate(&mut inflater.stream, z::Z_FINISH) };
-    let consumed =
-        usize::try_from(input_before - inflater.stream.avail_in).expect("zlib uInt fits usize");
-    let produced =
-        usize::try_from(output_before - inflater.stream.avail_out).expect("zlib uInt fits usize");
-    if status != z::Z_STREAM_END || consumed != payload.len() || produced != decoded_length {
+    let step = InflateBackend::inflate(inflater, payload, output, InflateFlush::Finish)?;
+    if step.status != inflate_status::STREAM_END
+        || step.consumed != payload.len()
+        || step.produced != decoded_length
+    {
         return Err(DecodeError::InvalidDeflate {
-            bit_offset: range.deflate_start.saturating_mul(8),
-            reason: if status == z::Z_DATA_ERROR {
+            bit_offset,
+            reason: if step.status == inflate_status::DATA_ERROR {
                 DeflateErrorKind::InvalidData
             } else {
-                DeflateErrorKind::BackendStatus(status)
+                DeflateErrorKind::BackendStatus(step.status)
             },
         });
-    }
-    // SAFETY: zlib reported `produced` bytes written through `next_out`, and
-    // that pointer covered `writable` bytes in this vector's spare capacity.
-    unsafe {
-        output.set_len(old_length + produced);
     }
     if crc32_enabled {
         let mut crc = Crc32::new();
@@ -3836,7 +5422,7 @@ fn decode_bgzf_block_into<R: ReadAt + ?Sized>(
             });
         }
     }
-    Ok(produced)
+    Ok(step.produced)
 }
 
 struct BgzfDecoded {
@@ -3858,7 +5444,7 @@ fn send_bgzf_result(
             Ok(()) | Err(TrySendError::Disconnected(_)) => return,
             Err(TrySendError::Full(returned)) => {
                 result = returned;
-                thread::park_timeout(Duration::from_millis(1));
+                thread::park_timeout(RESULT_CHANNEL_FULL_PARK);
             }
         }
     }
@@ -3906,7 +5492,12 @@ where
             let work_signal = Arc::clone(&work_signal);
             let sender = sender.clone();
             scope.spawn(move || {
+                // Compressed page and inflater reuse across blocks/tasks.
+                // Decoded/block_sizes scratches keep capacity after failed tasks;
+                // successful results transfer ownership to the coordinator.
                 let mut compressed = Vec::new();
+                let mut decoded_scratch = Vec::new();
+                let mut block_sizes_scratch = Vec::new();
                 let mut inflater = None;
 
                 while !worker_stopped.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed)
@@ -3927,7 +5518,7 @@ where
                                 let (lock, signal) = &*work_signal;
                                 let guard = lock.lock().expect("BGZF work mutex poisoned");
                                 let _ = signal
-                                    .wait_timeout_while(guard, Duration::from_millis(1), |_| {
+                                    .wait_timeout_while(guard, WORKER_IDLE_PARK, |_| {
                                         available_tasks.load(Ordering::Acquire) == 0
                                             && !worker_stopped.load(Ordering::Relaxed)
                                             && !cancelled.load(Ordering::Relaxed)
@@ -3939,11 +5530,18 @@ where
                     let first_block = index * BLOCKS_PER_TASK;
                     let past_last_block = (first_block + BLOCKS_PER_TASK).min(ranges.len());
                     let block_count = past_last_block - first_block;
-                    let mut decoded = Vec::with_capacity(block_count.saturating_mul(64 * 1024));
-                    let mut block_sizes = Vec::with_capacity(block_count);
+                    decoded_scratch.clear();
+                    block_sizes_scratch.clear();
+                    let needed = block_count.saturating_mul(64 * 1024);
+                    if decoded_scratch.capacity() < needed {
+                        decoded_scratch.reserve(needed - decoded_scratch.capacity());
+                    }
+                    if block_sizes_scratch.capacity() < block_count {
+                        block_sizes_scratch.reserve(block_count - block_sizes_scratch.capacity());
+                    }
                     let result = (|| {
                         if inflater.is_none() {
-                            inflater = Some(RawInflater::new()?);
+                            inflater = Some(<RawInflater as InflateBackend>::create()?);
                         }
                         let inflater = inflater
                             .as_mut()
@@ -3962,15 +5560,15 @@ where
                                 range,
                                 range_index as u64,
                                 &mut compressed,
-                                &mut decoded,
+                                &mut decoded_scratch,
                                 inflater,
                                 crc32_enabled,
                             )?;
-                            block_sizes.push(produced);
+                            block_sizes_scratch.push(produced);
                         }
                         Ok(BgzfDecoded {
-                            bytes: decoded,
-                            block_sizes,
+                            bytes: std::mem::take(&mut decoded_scratch),
+                            block_sizes: std::mem::take(&mut block_sizes_scratch),
                         })
                     })();
                     send_bgzf_result(&sender, &worker_stopped, BgzfResult { index, result });
@@ -3984,7 +5582,7 @@ where
                 stopped.store(true, Ordering::Relaxed);
                 return Err(DecodeError::Cancelled);
             }
-            let result = match receiver.recv_timeout(Duration::from_millis(10)) {
+            let result = match receiver.recv_timeout(COORDINATOR_RECV_TIMEOUT) {
                 Ok(result) => {
                     running = running.saturating_sub(1);
                     result
@@ -4005,11 +5603,11 @@ where
                         return Err(error);
                     }
                 };
-                let next_total = total_output
-                    .checked_add(decoded.bytes.len() as u64)
-                    .ok_or(DecodeError::OutputLimitExceeded {
+                let next_total = total_output.checked_add(decoded.bytes.len() as u64).ok_or(
+                    DecodeError::OutputLimitExceeded {
                         limit: config.output_limit.unwrap_or(u64::MAX),
-                    })?;
+                    },
+                )?;
                 if config.output_limit.is_some_and(|limit| next_total > limit) {
                     stopped.store(true, Ordering::Relaxed);
                     return Err(DecodeError::OutputLimitExceeded {
@@ -4152,8 +5750,19 @@ mod tests {
             b'l', b'd',
         ];
         let first_block_end = 10 * 8;
-        let tail =
-            inflate_tail(&encoded, 0, first_block_end, &Window::empty(), 1024, true).unwrap();
+        let mut inflater = None;
+        let mut output = Vec::new();
+        let tail = inflate_tail(
+            &encoded,
+            0,
+            first_block_end,
+            &Window::empty(),
+            1024,
+            true,
+            &mut inflater,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(tail.output, b"hello");
         assert_eq!(tail.end_bit, first_block_end);
         assert!(!tail.reached_stream_end);
@@ -4163,7 +5772,19 @@ mod tests {
     fn zlib_rs_tail_recognizes_final_z_block_boundary() {
         // Empty final fixed-Huffman block. Z_BLOCK reaches its end-of-block
         // before a subsequent inflate call would report Z_STREAM_END.
-        let tail = inflate_tail(&[0x03, 0x00], 0, 1, &Window::empty(), 1024, false).unwrap();
+        let mut inflater = None;
+        let mut output = Vec::new();
+        let tail = inflate_tail(
+            &[0x03, 0x00],
+            0,
+            1,
+            &Window::empty(),
+            1024,
+            false,
+            &mut inflater,
+            &mut output,
+        )
+        .unwrap();
         assert!(tail.output.is_empty());
         assert_eq!(tail.end_bit, 16);
         assert!(tail.reached_stream_end);
@@ -4186,5 +5807,24 @@ mod tests {
             0
         );
         assert_eq!(cursor.position(), 8);
+    }
+
+    #[test]
+    fn zlib_adler_footer_validation_recovers_backend_read_ahead() {
+        use super::validate_zlib_adler_footer;
+
+        let mut accounting = MemberAccounting::new();
+        accounting.adler.update(b"hello");
+
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&accounting.adler.finish().to_be_bytes());
+        encoded.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+
+        let mut cursor = SourceCursor::new(encoded.as_slice(), 4).unwrap();
+        assert_eq!(
+            validate_zlib_adler_footer(&mut cursor, 6, 0, &accounting, true).unwrap(),
+            0
+        );
+        assert_eq!(cursor.position(), 4);
     }
 }
