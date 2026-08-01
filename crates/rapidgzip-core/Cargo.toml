@@ -17,6 +17,7 @@ crossbeam-deque.workspace = true
 libz-rs-sys.workspace = true
 
 [dev-dependencies]
+libz-rs-sys.workspace = true
 paraseq.workspace = true
 proptest.workspace = true
 
