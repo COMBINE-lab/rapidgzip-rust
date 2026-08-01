@@ -311,3 +311,97 @@ fn a_streaming_decode_builds_the_same_index() {
 
     assert_eq!(streamed, positional);
 }
+
+#[test]
+fn the_parallel_path_produces_interior_checkpoints() {
+    let plain = corpus(24 * 1024 * 1024);
+    let compressed = gzip(&plain, 6);
+
+    let index = built_index(&compressed, 4);
+    index.validate().expect("invariants hold");
+    assert!(
+        index.checkpoint_count() >= 3,
+        "one member produced only {} checkpoints",
+        index.checkpoint_count()
+    );
+    assert!(
+        index
+            .checkpoints()
+            .iter()
+            .skip(1)
+            .any(|point| !point.compressed_offset_in_bits.is_multiple_of(8)),
+        "no interior checkpoint landed off a byte boundary"
+    );
+
+    let mut reader = IndexedReader::new(compressed, index).expect("indexed reader");
+    for target in [20_000_000usize, 5_000_000, 12_000_000, 1000] {
+        reader.seek(SeekFrom::Start(target as u64)).expect("seek");
+        let mut buffer = vec![0u8; 2048];
+        reader.read_exact(&mut buffer).expect("read");
+        assert_eq!(buffer, &plain[target..target + 2048], "target {target}");
+    }
+}
+
+#[test]
+fn interior_checkpoints_survive_a_gzidx_round_trip() {
+    let plain = corpus(24 * 1024 * 1024);
+    let compressed = gzip(&plain, 6);
+    let index = built_index(&compressed, 4);
+
+    let mut bytes = Vec::new();
+    index.write_gzidx(&mut bytes).expect("write");
+    let restored =
+        GzipIndex::read_gzidx(&mut bytes.as_slice(), Some(compressed.len() as u64)).expect("read");
+    assert_eq!(restored.checkpoint_count(), index.checkpoint_count());
+
+    let mut reader = IndexedReader::new(compressed, restored).expect("indexed reader");
+    reader.seek(SeekFrom::Start(15_000_000)).expect("seek");
+    let mut buffer = vec![0u8; 4096];
+    reader.read_exact(&mut buffer).expect("read");
+    assert_eq!(buffer, &plain[15_000_000..15_004_096]);
+}
+
+#[test]
+fn a_bgzf_index_records_every_block_start() {
+    let plain = corpus(2 * 1024 * 1024);
+    let compressed = common::bgzf(&plain, 48 * 1024);
+    let expected_blocks = plain.len().div_ceil(48 * 1024);
+
+    let index = built_index(&compressed, 4);
+    index.validate().expect("invariants hold");
+    assert_eq!(index.checkpoint_count(), expected_blocks);
+    assert!(
+        index.windows().is_empty(),
+        "BGZF blocks need no predecessor window"
+    );
+
+    let mut reader = IndexedReader::new(compressed, index).expect("indexed reader");
+    for target in [0usize, 100_000, 1_500_000, plain.len() - 1024] {
+        reader.seek(SeekFrom::Start(target as u64)).expect("seek");
+        let mut buffer = vec![0u8; 1024.min(plain.len() - target)];
+        reader.read_exact(&mut buffer).expect("read");
+        assert_eq!(buffer, &plain[target..target + buffer.len()], "at {target}");
+    }
+}
+
+#[test]
+fn a_bgzf_index_exports_as_gzi() {
+    let plain = corpus(1024 * 1024);
+    let compressed = common::bgzf(&plain, 48 * 1024);
+    let index = built_index(&compressed, 4);
+
+    let mut bytes = Vec::new();
+    index.write_gzi(&mut bytes).expect("gzi export");
+    let pairs = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    assert_eq!(pairs as usize, index.checkpoint_count() - 1);
+
+    let restored =
+        GzipIndex::read_gzi(&mut bytes.as_slice(), Some(compressed.len() as u64)).expect("read");
+    assert_eq!(restored.checkpoints(), index.checkpoints());
+
+    let mut reader = IndexedReader::new(compressed, restored).expect("indexed reader");
+    reader.seek(SeekFrom::Start(700_000)).expect("seek");
+    let mut buffer = vec![0u8; 1024];
+    reader.read_exact(&mut buffer).expect("read");
+    assert_eq!(buffer, &plain[700_000..701_024]);
+}

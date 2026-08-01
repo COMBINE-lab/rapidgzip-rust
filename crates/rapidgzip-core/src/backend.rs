@@ -93,6 +93,9 @@ where
     if let Some(index) = bgzf_index {
         if index.len() > 1 {
             runtime.set_path(DecoderPath::Bgzf);
+            if runtime.index_enabled() {
+                offer_bgzf_checkpoints(source, &index, runtime)?;
+            }
             return decode_bgzf_parallel(source, config, cancelled, output, &index, runtime);
         }
     }
@@ -1862,6 +1865,43 @@ where
     })
 }
 
+/// Offers one checkpoint per BGZF block start.
+///
+/// BGZF blocks are independent members, so every block start is a resume point
+/// needing no history. The decompressed offsets come from each block's ISIZE
+/// footer, which is exact and much cheaper than decoding.
+fn offer_bgzf_checkpoints<R: ReadAt + ?Sized>(
+    source: &R,
+    ranges: &[BgzfRange],
+    runtime: &Arc<RuntimeState>,
+) -> Result<(), DecodeError> {
+    let mut uncompressed = 0_u64;
+    let mut footer = Vec::new();
+    for range in ranges {
+        let isize_offset = range.end.checked_sub(4).ok_or(DecodeError::InvalidGzip {
+            offset: range.start,
+            reason: GzipErrorKind::Truncated,
+        })?;
+        read_range_reuse(source, isize_offset, 4, &mut footer)?;
+        let block_size = u32::from_le_bytes(footer[..4].try_into().expect("four bytes"));
+        // An empty block carries no data to seek to. The BGZF EOF marker is
+        // one, and indexing it would add a trailing entry that describes
+        // nothing.
+        if block_size != 0 {
+            runtime.offer_checkpoint(
+                Checkpoint {
+                    compressed_offset_in_bits: range.start.saturating_mul(8),
+                    uncompressed_offset_in_bytes: uncompressed,
+                    line_offset: 0,
+                },
+                &[],
+            );
+        }
+        uncompressed = uncompressed.saturating_add(u64::from(block_size));
+    }
+    Ok(())
+}
+
 fn read_range<R: ReadAt + ?Sized>(
     source: &R,
     offset: u64,
@@ -2585,6 +2625,7 @@ fn wait_for_resolved(
 fn enqueue_native_resolution(
     chunk: crate::parallel::deflate::Chunk,
     config: &Config,
+    runtime: &Arc<RuntimeState>,
     current_bit: &mut u64,
     window: &mut Window,
     prepared_total: &mut u64,
@@ -2594,6 +2635,21 @@ fn enqueue_native_resolution(
     available_resolve_tasks: &AtomicUsize,
     work_signal: &(Mutex<()>, Condvar),
 ) -> Result<bool, DecodeError> {
+    // The predecessor window is already resolved here, so this chunk start is
+    // a usable resume point. A member start carries no history and is offered
+    // where the header is parsed instead, because resuming there has to skip
+    // that header.
+    if !window.as_slice().is_empty() {
+        runtime.offer_checkpoint(
+            Checkpoint {
+                compressed_offset_in_bits: *current_bit,
+                uncompressed_offset_in_bytes: *prepared_total,
+                line_offset: 0,
+            },
+            window.as_slice(),
+        );
+    }
+
     let prepared = prepare_native_chunk(chunk, *next_sequence, window, *current_bit)?;
     let next_total = prepared_total
         .checked_add(prepared.decoded_size as u64)
@@ -2731,6 +2787,14 @@ where
     }
 
     let first_header = parse_member_header(&mut frame_cursor, true)?;
+    runtime.offer_checkpoint(
+        Checkpoint {
+            compressed_offset_in_bits: first_header.start.saturating_mul(8),
+            uncompressed_offset_in_bytes: 0,
+            line_offset: 0,
+        },
+        &[],
+    );
     let first_deflate_bit = first_header.deflate_start.saturating_mul(8);
     let length_bits = frame_cursor.length().saturating_mul(8);
     let spacing_bits = (compressed_chunk_size as u64).saturating_mul(8);
@@ -2951,6 +3015,7 @@ where
                         let reached_stream_end = enqueue_native_resolution(
                             chunk,
                             config,
+                            runtime,
                             &mut current_bit,
                             &mut window,
                             &mut prepared_total_output,
@@ -3029,6 +3094,7 @@ where
                     let reached_stream_end = enqueue_native_resolution(
                         chunk,
                         config,
+                        runtime,
                         &mut current_bit,
                         &mut window,
                         &mut prepared_total_output,
