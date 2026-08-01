@@ -148,6 +148,31 @@ BGZF workers decode eight independently framed blocks per task directly into
 one aggregate output allocation, verify every block's CRC32 and ISIZE, and
 reuse their initialized zlib-rs stream with `inflateReset`.
 
+## Containers
+
+Framing is resolved before any path is selected. An explicit format is taken as
+given, since the framing checks report a mismatch far better than a prefix
+sniff; `Format::Auto` reads two bytes and falls back to reporting missing gzip
+magic, which is what it did before zlib was supported.
+
+gzip keeps every existing path. zlib and raw DEFLATE are each exactly one
+DEFLATE stream, so they skip the BGZF and multi-member probes and go to either
+`single_stream.rs`, which runs the sequential loop over an `InputCursor` and
+therefore serves positional and non-seekable sources identically, or the
+estimated-grid path when a worker budget exists.
+
+Supporting the parallel path costs three parameters rather than a second
+implementation: where DEFLATE starts, which checksum accumulates over the
+output, and what the end of the stream verifies. zlib validates its `CMF`/`FLG`
+header, accumulates Adler-32 through `libz-rs-sys`, and checks the trailer
+where a gzip footer would be read; raw DEFLATE starts at bit zero, accumulates
+nothing, and only refuses trailing bytes and, when the caller supplied one, a
+size that disagrees.
+
+Index checkpoints for these containers record the DEFLATE start rather than a
+header start, which is what indexed_gzip records, so `IndexedReader` resumes
+there directly.
+
 ## Random-access index
 
 `index/` holds the index data model and the on-disk formats and knows nothing

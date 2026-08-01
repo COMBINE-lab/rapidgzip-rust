@@ -7,6 +7,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- zlib (RFC 1950) and raw DEFLATE (RFC 1951) decoding, selected through
+  `DecoderBuilder::format`. `Format::Auto`, the default, detects gzip against
+  zlib; raw DEFLATE must be requested. Both containers decode sequentially, in
+  parallel, from non-seekable input, and with a random-access index.
+  `DecoderBuilder::expected_uncompressed_size` verifies raw DEFLATE output,
+  which carries no checksum of its own. `DecodeReport` gains `format`.
 - Random-access indexing. `DecoderBuilder::build_index` collects a `GzipIndex`
   during an ordinary decode and returns it in `DecodeReport::index`.
   `DecoderBuilder::index_spacing` and `DecoderBuilder::compress_index_windows`

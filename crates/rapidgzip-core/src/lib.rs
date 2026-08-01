@@ -1,6 +1,7 @@
 //! Parallel, verified gzip decompression.
 //!
-//! `rapidgzip-core` decodes single-member gzip, concatenated gzip, and BGZF.
+//! `rapidgzip-core` decodes single-member gzip, concatenated gzip, BGZF, zlib
+//! streams, and raw DEFLATE.
 //! It follows rapidgzip's marker/window algorithm for parallel decoding of
 //! ordinary DEFLATE streams and uses zlib-rs as its inflate backend. It also
 //! builds random-access indexes while decoding, reads and writes them in four
@@ -34,6 +35,24 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Containers
+//!
+//! [`DecoderBuilder::format`] selects the framing. The default,
+//! [`Format::Auto`], reads the first two bytes: gzip magic selects gzip, and
+//! otherwise a valid zlib `CMF`/`FLG` pair selects zlib. Raw DEFLATE has no
+//! header to recognize, so [`Format::RawDeflate`] must be requested; letting
+//! detection guess it would turn every corrupt input into a raw stream.
+//!
+//! Verification follows the container. gzip checks a CRC32 and ISIZE per
+//! member, zlib checks its Adler-32 trailer, and both refuse trailing bytes.
+//! Raw DEFLATE carries no checksum at all, so
+//! [`DecoderBuilder::expected_uncompressed_size`] is the only end-to-end check
+//! available for it and is verified when supplied.
+//!
+//! zlib and raw DEFLATE are each one DEFLATE stream, which is what the
+//! parallel path already splits, so both decode in parallel and support the
+//! random-access index below.
 //!
 //! # Random access
 //!

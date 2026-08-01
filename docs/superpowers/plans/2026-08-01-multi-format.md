@@ -2,6 +2,8 @@
 
 > Execution checklist for `docs/superpowers/specs/2026-08-01-multi-format-decode-design.md`. Boxes are ticked as each step lands, one commit per step.
 
+**Status:** complete. All six steps landed on the `multi-format` branch.
+
 **Goal:** Decode zlib streams and raw DEFLATE with the crate's verification discipline, sequentially and through the parallel estimated-grid path.
 
 **Branch:** `multi-format`, stacked on `index-and-seek` (PR #8).
@@ -38,7 +40,7 @@
   that `IndexedReader` seeks into both.
   Verify: index and seek tests for the two formats.
 
-- [ ] **6. Documentation**
+- [x] **6. Documentation**
   Crate docs, `ARCHITECTURE.md`, `README.md`, `CHANGELOG.md`.
   Verify: `cargo test --doc`, `cargo doc` with `-D warnings`.
 

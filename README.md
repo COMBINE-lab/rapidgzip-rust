@@ -191,6 +191,29 @@ pipe. Dropping a streaming [`DecoderReader`] before end of output cancels but
 does not wait for the background thread, so a producer that stalls without
 closing cannot block the drop.
 
+## Containers
+
+The decoder accepts gzip, concatenated gzip, BGZF, zlib streams, and raw
+DEFLATE:
+
+```rust
+use rapidgzip_core::{Decoder, Format};
+
+// Auto-detects gzip against zlib.
+let decoder = Decoder::default();
+
+// Raw DEFLATE has no header, so it is requested explicitly. It also carries
+// no checksum, so an expected size is the only end-to-end check available.
+let decoder = Decoder::builder()
+    .format(Format::RawDeflate)
+    .expected_uncompressed_size(Some(4_000_000))
+    .build()?;
+```
+
+zlib streams verify their Adler-32 trailer, gzip members verify CRC32 and
+ISIZE, and every container refuses trailing bytes. All of them decode in
+parallel and support the random-access index below.
+
 ## Random access
 
 Building an index during a decode costs one predecessor window per checkpoint
