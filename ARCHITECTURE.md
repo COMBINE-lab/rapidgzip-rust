@@ -22,6 +22,39 @@ updates member accounting and calls the user's `Write`, so a writer need not be
 `Send`. `DecoderReader` substitutes a bounded synchronous channel at this final
 edge and therefore implements `Read + Send` without changing the decoder core.
 
+## Non-seekable input
+
+`rapidgzip-core` also accepts a plain `std::io::Read`. Such a source cannot be
+indexed, probed, or revisited, so paths 2 through 5 are all unreachable: each
+one begins by reading headers or block boundaries scattered across the file
+before it decodes anything. Path 1 is reachable, because it only ever moves
+forward.
+
+Both cursors implement one internal `InputCursor` trait, which is the exact set
+of forward operations path 1 and the member-header parser use: current offset,
+end of input, the readable window, consume, and confirm the source did not
+change. `SourceCursor` implements it over `ReadAt`; `StreamCursor` implements it
+over `Read` with a single window that compacts consumed bytes on refill. Member
+framing, footer verification, trailing-garbage detection, per-member history
+reset, and the output limit are therefore not reimplemented for streams: path 1
+is generic over the cursor and is the same code either way.
+
+The length snapshot does not exist for a non-seekable source rather than
+becoming mutable. A positional decode snapshots `len()` when it creates its
+cursor and re-checks it at the end, which is what `verify_source_unchanged`
+does. A stream has nothing to snapshot: end of input is whatever the reader
+reports, and the framing loop refuses to stop anywhere except at a verified
+member boundary, so trailing bytes after the last member are parsed as another
+header and rejected as trailing garbage. Reaching end of input therefore still
+means the whole input was verified, and `verify_source_unchanged` is a no-op.
+The `ReadAt` contract itself is unchanged, and no parallel path observes any of
+this.
+
+Sequencing follows the positional entry points. The first member header is
+validated against the initial window, without consuming it, before any
+coordinator is spawned. The runtime is then configured with a single worker so
+`DecoderStats` and `DecodeReport` report the concurrency actually in use.
+
 ## Marker/window algorithm
 
 The implementation follows rapidgzip 0.16.0 at upstream commit
@@ -188,3 +221,12 @@ oversized regions continue through zlib-rs instead. `DecoderReader` adds at most
 the configured in-flight chunk count plus its currently partially consumed
 chunk. Dropping it closes the consumer edge, sets cancellation, and joins the
 coordinator.
+
+A non-seekable source holds one input window instead of a positional page and
+spools nothing, so its memory is independent of the input length. Backpressure
+reaches the producer without any new mechanism: the bounded final handoff blocks
+the coordinator, the coordinator therefore stops reading, and the pipe fills.
+Dropping such a reader closes the consumer edge and sets cancellation as usual,
+but does not join. Its coordinator can be parked inside a read against a
+producer that never writes again, and a drop that could block forever is worse
+than a thread that exits at its next read or send boundary.

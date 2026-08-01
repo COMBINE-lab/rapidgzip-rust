@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Decoding of non-seekable compressed input through `Decoder::decode_stream`
+  and `Decoder::stream_reader`, which accept any `std::io::Read` and mirror
+  `Decoder::decode` and `Decoder::reader`. `Decoder::open` now routes a path
+  that cannot be read positionally, such as a FIFO, character device, or
+  socket, to the streaming decoder instead of failing, and the CLI accepts `-`
+  for standard input. Such input runs the sequential zlib-rs path that the
+  parallel paths already use as their authoritative fallback, sharing its
+  framing, footer verification, trailing-garbage detection, and output limit,
+  so it is verified identically but is not decoded in parallel.
+  `DecoderStats` and `DecodeReport` report a single worker for it rather than
+  the configured thread budget. Nothing is spooled; input memory is one
+  configured input window. Dropping a streaming `DecoderReader` before end of
+  output cancels without waiting for its background thread, so a stalled
+  producer cannot block the drop.
+
 ## [0.1.0] - 2026-07-31
 
 Initial release of the decoder-only `rapidgzip-rust` implementation.
@@ -54,4 +73,5 @@ Initial release of the decoder-only `rapidgzip-rust` implementation.
   cell; multi-worker parity and the zlib-ng-backed C++ performance gate are
   met on the published workloads.
 
+[Unreleased]: https://github.com/COMBINE-lab/rapidgzip-rust/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/COMBINE-lab/rapidgzip-rust/releases/tag/v0.1.0

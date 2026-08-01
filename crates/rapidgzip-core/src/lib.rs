@@ -13,6 +13,8 @@
 //! - [`Decoder::reader`] and [`Decoder::open`] return an owned [`DecoderReader`]
 //!   implementing [`std::io::Read`] + [`Send`]. This is suitable for parsers
 //!   that take `Box<dyn Read + Send>`, including `paraseq`.
+//! - [`Decoder::decode_stream`] and [`Decoder::stream_reader`] are the same two
+//!   interfaces for non-seekable input; see below.
 //!
 //! # Example
 //!
@@ -50,6 +52,23 @@
 //! positional reads without a shared cursor. Implementations are supplied for
 //! files on Unix and Windows, in-memory byte storage, [`std::sync::Arc`], and
 //! [`Box`]. The source length and contents must remain stable during decoding.
+//!
+//! # Non-seekable input
+//!
+//! [`Decoder::decode_stream`] and [`Decoder::stream_reader`] accept any
+//! [`std::io::Read`], so standard input, a FIFO, a process substitution, or a
+//! socket can be decoded. [`Decoder::open`] detects a path that cannot be read
+//! positionally and routes it there itself.
+//!
+//! Verification is identical: such a source runs the same sequential zlib-rs
+//! path that the parallel paths use as their authoritative fallback, sharing its
+//! member framing, footer checks, trailing-garbage detection, and output limit.
+//! It is not decoded in parallel, because every parallel path needs positional
+//! reads, and the telemetry reports one worker rather than the configured
+//! budget. Nothing is spooled: input memory is one
+//! [`DecoderBuilder::input_page_size`] window. Dropping a streaming
+//! [`DecoderReader`] before EOF cancels without waiting for its background
+//! thread, so a producer that stalls without closing cannot block the drop.
 //!
 //! [`DecoderBuilder::decoder_threads`] sets a maximum worker budget rather than
 //! eagerly creating that many threads. Parallel paths grow an elastic worker

@@ -13,12 +13,16 @@ The project provides:
 - verified decoding of single-member gzip, concatenated/multi-member gzip, and
   BGZF;
 - both a push API over `std::io::Write` and an owned `std::io::Read + Send`
-  stream suitable for parsers such as [paraseq].
+  stream suitable for parsers such as [paraseq];
+- decoding of non-seekable compressed input such as standard input, a FIFO, a
+  process substitution, or a socket.
 
-The initial `0.1.0` release focuses on correct, high-throughput streaming
-decoding. The project intentionally does not yet provide compression,
-random-access indexes, seeking in decoded output, or non-seekable compressed
-input.
+Non-seekable input is decoded sequentially by the same zlib-rs path the parallel
+decoders fall back to, so it is verified exactly as strictly as a regular file
+but is not decoded in parallel. See [Non-seekable input](#non-seekable-input).
+
+The project intentionally does not yet provide compression, random-access
+indexes, or seeking in decoded output.
 
 ## Library installation
 
@@ -124,7 +128,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Parallel input is represented by the [`ReadAt`] trait. Implementations are
 provided for files on Unix and Windows, byte slices, `Vec<u8>`, `Arc<T>`, and
 `Box<T>`. A custom source must support concurrent positional reads and keep its
-length and contents stable for the complete decode.
+length and contents stable for the complete decode. Input that cannot satisfy
+that contract is handled by the entry points below instead.
+
+### Non-seekable input
+
+[`Decoder::stream_reader`] and [`Decoder::decode_stream`] accept any
+`std::io::Read`, so gzip arriving on standard input, a FIFO, a process
+substitution, or a socket can be decoded without a second decompressor. They
+mirror [`Decoder::reader`] and [`Decoder::decode`], and `stream_reader` returns
+the same [`DecoderReader`]:
+
+```rust,no_run
+use rapidgzip_core::Decoder;
+use std::io::{self, Read};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let decoder = Decoder::default();
+    let reader = decoder.stream_reader(io::stdin())?;
+
+    // Still Read + Send, so a parser can own it.
+    let mut parser_input: Box<dyn Read + Send> = Box::new(reader);
+    io::copy(&mut parser_input, &mut io::sink())?;
+    Ok(())
+}
+```
+
+[`Decoder::open`] does this routing itself, so a program whose input is a path
+that may or may not be a regular file needs no special case:
+
+```rust,no_run
+use rapidgzip_core::Decoder;
+use std::io;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let decoder = Decoder::builder().decoder_threads(8).build()?;
+    // A regular file decodes in parallel; a FIFO decodes sequentially.
+    let mut reader = decoder.open("reads.fastq.gz")?;
+    io::copy(&mut reader, &mut io::sink())?;
+    Ok(())
+}
+```
+
+What works exactly as it does for a regular file: single-member, concatenated
+and empty members, BGZF including its 28-byte EOF member, and fully stored
+streams. A member is accepted only after a real final DEFLATE block whose CRC32
+and ISIZE both match. Truncation, invalid DEFLATE, footer mismatches, and
+trailing non-gzip bytes are all errors, and
+[`DecoderBuilder::output_limit`] still fails before emitting bytes past the
+limit. Reaching EOF, or an `Ok` report, still means the complete input was
+verified.
+
+What differs: the four parallel decode paths all need positional reads, so a
+non-seekable source always uses the sequential path. Telemetry reports this
+honestly rather than reporting an unused thread budget, so
+[`DecoderStats::path`] is [`DecoderPath::Sequential`], `configured_workers` is
+`1`, and `DecodeReport::decoder_threads` is `1`, whatever the builder was given.
+Nothing is spooled to memory or to disk: input memory is one
+[`DecoderBuilder::input_page_size`] window, and a slow consumer is throttled by
+the same bounded handoff as a positional reader, which in turn stops reading the
+pipe. Dropping a streaming [`DecoderReader`] before end of output cancels but
+does not wait for the background thread, so a producer that stalls without
+closing cannot block the drop.
 
 ## Command-line installation and use
 
@@ -145,6 +210,12 @@ rapidgzip-rust -P 16 --test reads.fastq.gz
 
 # Refuse to overwrite an existing output file.
 rapidgzip-rust -P 16 --output reads.fastq reads.fastq.gz
+
+# Read standard input, decoded sequentially and verified the same way.
+cat reads.fastq.gz | rapidgzip-rust - > reads.fastq
+
+# A FIFO or process substitution given as a path is routed the same way.
+rapidgzip-rust <(some_producer) > reads.fastq
 ```
 
 `-P`/`--threads` is a maximum decoder-worker budget. Parallel paths bootstrap
@@ -169,6 +240,10 @@ backpressured, or additional concurrency reduces throughput.
 - Work queues and reader handoff are bounded. Memory still scales with active
   workers and configured chunk sizes; the defaults are intended for throughput
   on general-purpose machines rather than minimum memory use.
+- All of the above hold identically for non-seekable input, because it runs the
+  same sequential decoder that the parallel paths already use as their
+  authoritative fallback. It is not decoded in parallel, and the telemetry says
+  so rather than reporting an unused thread budget.
 
 There is no unsafe public API and no manual `Send` or `Sync` implementation.
 Private unsafe code is limited to the zlib-rs ABI, checked SIMD operations, and
@@ -242,11 +317,17 @@ The repository is distributed under the combined terms of BSD-3-Clause and
 MIT. See [LICENSE-BSD-3-CLAUSE] and [LICENSE-MIT].
 
 [`Decoder::decode`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode
+[`Decoder::decode_stream`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode_stream
 [`Decoder::open`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.open
+[`Decoder::reader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.reader
+[`Decoder::stream_reader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.stream_reader
 [`DecoderHandle`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderHandle.html
+[`DecoderPath::Sequential`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/enum.DecoderPath.html#variant.Sequential
 [`DecoderReader::handle`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderReader.html#method.handle
+[`DecoderBuilder::input_page_size`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.input_page_size
 [`DecoderBuilder::output_limit`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.output_limit
 [`DecoderReader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderReader.html
+[`DecoderStats::path`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderStats.html#structfield.path
 [`ReadAt`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/trait.ReadAt.html
 [ARCHITECTURE.md]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/ARCHITECTURE.md
 [BENCHMARKING.md]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/BENCHMARKING.md

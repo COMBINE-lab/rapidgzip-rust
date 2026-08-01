@@ -1101,7 +1101,7 @@ fn streaming_decodes_a_real_operating_system_pipe() {
     let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
     let mut streamed = Vec::new();
     let report = decoder.decode_stream(child_stdout, &mut streamed).unwrap();
-    assert_eq!(child.wait().unwrap().success(), true);
+    assert!(child.wait().unwrap().success());
 
     let (positional, _) = decode_positional(&decoder, &compressed).unwrap();
     assert_eq!(streamed, positional);

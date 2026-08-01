@@ -223,6 +223,20 @@ impl Decoder {
     /// Input memory is bounded by one [`DecoderBuilder::input_page_size`]
     /// window; nothing is spooled.
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rapidgzip_core::Decoder;
+    /// use std::io;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let decoder = Decoder::default();
+    /// let report = decoder.decode_stream(io::stdin(), &mut io::sink())?;
+    /// println!("verified {} gzip members", report.member_count);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns the first framing, DEFLATE, verification, input, or output-limit
@@ -262,6 +276,23 @@ impl Decoder {
     /// positional reads. Dropping the reader before end of output cancels
     /// without waiting for the coordinator, so a stalled producer cannot block
     /// the drop.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rapidgzip_core::Decoder;
+    /// use std::io::{self, Read};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let decoder = Decoder::default();
+    /// let reader = decoder.stream_reader(io::stdin())?;
+    ///
+    /// // Still Read + Send, so a parser can own it.
+    /// let mut parser_input: Box<dyn Read + Send> = Box::new(reader);
+    /// io::copy(&mut parser_input, &mut io::sink())?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
