@@ -32,7 +32,10 @@ layouts, zran bit packing) is worth reusing, its structure is not.
   indexed_gzip `GZIDX`, htslib BGZF `.gzi`, and gztool.
 - Provide random access to decompressed data through a reader implementing
   `Read + Seek`.
-- Keep new code out of `backend.rs`. No new `unsafe`.
+- Keep new code out of `backend.rs`. The only new `unsafe` is inside the
+  existing raw-inflate wrapper, which moves out of `backend.rs` into its own
+  module and gains `inflatePrime` and `inflateSetDictionary` behind a safe
+  internal API. `index/` itself contains no `unsafe`.
 
 ## Non-goals
 
