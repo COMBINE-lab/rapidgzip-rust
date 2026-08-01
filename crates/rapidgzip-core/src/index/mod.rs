@@ -4,6 +4,11 @@
 //! validates it, and reads and writes the supported on-disk formats. Using an
 //! index for random access lives in [`crate::indexed`].
 
+mod window_codec;
+
+pub(crate) use window_codec::{zlib_compress_window, zlib_decompress_window};
+
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -77,8 +82,33 @@ impl StoredWindow {
         self.compressed
     }
 
-    // Used by the on-disk formats, which land in later commits.
-    #[allow(dead_code)]
+    /// Stores `bytes`, optionally zlib-compressed to reduce resident memory.
+    ///
+    /// An empty input, or history that does not shrink, is stored raw.
+    pub fn from_raw_maybe_compress(
+        bytes: impl Into<Vec<u8>>,
+        compress: bool,
+    ) -> Result<Self, IndexError> {
+        let bytes = bytes.into();
+        if !compress || bytes.is_empty() {
+            return Ok(Self::from_raw(bytes));
+        }
+        let payload = zlib_compress_window(&bytes)?;
+        if payload.len() >= bytes.len() {
+            return Ok(Self::from_raw(bytes));
+        }
+        Ok(Self::from_compressed(payload))
+    }
+
+    /// Returns the window history, expanding it when it is held compressed.
+    pub fn decompressed(&self) -> Result<Cow<'_, [u8]>, IndexError> {
+        if self.compressed {
+            Ok(Cow::Owned(zlib_decompress_window(&self.payload)?))
+        } else {
+            Ok(Cow::Borrowed(&self.payload))
+        }
+    }
+
     pub(crate) const fn from_compressed(payload: Vec<u8>) -> Self {
         Self {
             payload,
