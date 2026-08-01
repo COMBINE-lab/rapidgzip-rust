@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::crc32::Crc32;
 use crate::gzip::{InputCursor, MemberHeader, SourceCursor, StreamCursor, parse_member_header};
+use crate::index::Checkpoint;
 use crate::inflate::RawInflater;
 use crate::parallel::Window;
 use crate::parallel::adaptive::AdaptiveConcurrency;
@@ -55,7 +56,26 @@ impl<W: Write> Output for DirectOutput<'_, W> {
     }
 }
 
+/// Decodes a positional source, collecting an index when configured.
 pub(crate) fn decode_source<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    runtime: &Arc<RuntimeState>,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    if config.build_index {
+        runtime.enable_index(config.index_spacing, config.compress_index_windows);
+    }
+    let report = decode_source_inner(source, config, cancelled, output, runtime)?;
+    runtime.attach_index(report)
+}
+
+fn decode_source_inner<R, O>(
     source: &R,
     config: &Config,
     cancelled: &AtomicBool,
@@ -491,6 +511,7 @@ where
         decompressed_bytes: total_output,
         member_count: index.members.len() as u64,
         decoder_threads: config.decoder_threads,
+        index: None,
     })
 }
 
@@ -530,6 +551,7 @@ where
 /// The cursor is supplied by the caller so that the initial header can be
 /// validated before a background coordinator is spawned, matching what
 /// `Decoder::reader` does for a positional source.
+/// Decodes a non-seekable source, collecting an index when configured.
 pub(crate) fn decode_stream<R, O>(
     cursor: &mut StreamCursor<R>,
     config: &Config,
@@ -541,9 +563,13 @@ where
     R: Read,
     O: Output,
 {
+    if config.build_index {
+        runtime.enable_index(config.index_spacing, config.compress_index_windows);
+    }
     runtime.set_path(DecoderPath::Sequential);
     runtime.set_adaptive_target(1);
-    decode_members_sequential(cursor, config, cancelled, output, 0, 0, 1, runtime)
+    let report = decode_members_sequential(cursor, config, cancelled, output, 0, 0, 1, runtime)?;
+    runtime.attach_index(report)
 }
 
 /// Decodes complete members beginning at a known member boundary.
@@ -579,6 +605,16 @@ where
         debug_assert!(header.start <= header.deflate_start);
         debug_assert_eq!(header.deflate_start, cursor.position());
         let _observed_bgzf_size = header.bgzf_block_size;
+        // A member start needs no predecessor history, so it is a checkpoint
+        // every path can offer, including forward-only sources.
+        runtime.offer_checkpoint(
+            Checkpoint {
+                compressed_offset_in_bits: header.start.saturating_mul(8),
+                uncompressed_offset_in_bytes: total_output,
+                line_offset: 0,
+            },
+            &[],
+        );
         let mut inflater = RawInflater::new()?;
         let mut crc = Crc32::new();
         let mut member_output = 0_u32;
@@ -725,6 +761,7 @@ where
         decompressed_bytes: total_output,
         member_count,
         decoder_threads,
+        index: None,
     })
 }
 
@@ -1821,6 +1858,7 @@ where
         decompressed_bytes: total_output,
         member_count,
         decoder_threads: config.decoder_threads,
+        index: None,
     })
 }
 
@@ -2688,6 +2726,7 @@ where
             decompressed_bytes: 0,
             member_count: 0,
             decoder_threads: config.decoder_threads,
+            index: None,
         });
     }
 
@@ -3112,6 +3151,7 @@ where
         decompressed_bytes: total_output,
         member_count,
         decoder_threads: config.decoder_threads,
+        index: None,
     })
 }
 
@@ -3578,6 +3618,7 @@ where
         decompressed_bytes: total_output,
         member_count: ranges.len() as u64,
         decoder_threads: config.decoder_threads,
+        index: None,
     })
 }
 

@@ -4,12 +4,14 @@
 //! validates it, and reads and writes the supported on-disk formats. Using an
 //! index for random access lives in [`crate::indexed`].
 
+mod build;
 mod gzi;
 mod gzidx;
 mod gztool;
 mod native;
 mod window_codec;
 
+pub(crate) use build::IndexBuilder;
 pub use gzidx::{decode_bit_offset, encode_bit_offset};
 pub use gztool::WithLines;
 pub(crate) use window_codec::{zlib_compress_window, zlib_decompress_window};
@@ -128,7 +130,7 @@ impl StoredWindow {
 }
 
 /// Predecessor windows keyed by compressed bit offset.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WindowMap {
     windows: HashMap<u64, StoredWindow>,
 }
@@ -165,7 +167,7 @@ impl WindowMap {
 }
 
 /// An in-memory gzip random-access index.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GzipIndex {
     pub(crate) checkpoints: Vec<Checkpoint>,
     pub(crate) windows: WindowMap,

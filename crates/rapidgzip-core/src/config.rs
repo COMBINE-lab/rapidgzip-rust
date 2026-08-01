@@ -33,6 +33,9 @@ pub(crate) struct Config {
     pub(crate) compressed_chunk_size: usize,
     pub(crate) in_flight_chunks: usize,
     pub(crate) output_limit: Option<u64>,
+    pub(crate) build_index: bool,
+    pub(crate) index_spacing: u64,
+    pub(crate) compress_index_windows: bool,
 }
 
 /// Builder for an immutable, reusable [`Decoder`].
@@ -60,6 +63,9 @@ impl Default for DecoderBuilder {
                 compressed_chunk_size: MIB,
                 in_flight_chunks: decoder_threads.saturating_add(2),
                 output_limit: None,
+                build_index: false,
+                index_spacing: 4 * MIB as u64,
+                compress_index_windows: true,
             },
         }
     }
@@ -125,6 +131,40 @@ impl DecoderBuilder {
         self
     }
 
+    /// Enables collecting a random-access index while decoding.
+    ///
+    /// The index arrives in [`DecodeReport::index`] once the decode completes
+    /// and can then be persisted or handed to [`crate::IndexedReader`]. It
+    /// costs one predecessor window per interior checkpoint in memory, which
+    /// [`Self::compress_index_windows`] reduces.
+    ///
+    /// Indexing is off by default, so existing callers pay nothing.
+    pub const fn build_index(mut self, enabled: bool) -> Self {
+        self.config.build_index = enabled;
+        self
+    }
+
+    /// Sets the target spacing between interior index checkpoints in
+    /// decompressed bytes.
+    ///
+    /// Smaller spacing makes seeks cheaper and the index larger. Member and
+    /// BGZF block boundaries are always recorded regardless of this value. The
+    /// value must be non-zero and is ignored when indexing is disabled.
+    pub const fn index_spacing(mut self, bytes: u64) -> Self {
+        self.config.index_spacing = bytes;
+        self
+    }
+
+    /// Sets whether index windows are held zlib-compressed in memory.
+    ///
+    /// Compression trades a small amount of time per checkpoint for a large
+    /// reduction in resident memory on compressible data. Ignored when
+    /// indexing is disabled.
+    pub const fn compress_index_windows(mut self, enabled: bool) -> Self {
+        self.config.compress_index_windows = enabled;
+        self
+    }
+
     /// Validates the configuration and creates a reusable decoder.
     ///
     /// # Errors
@@ -152,6 +192,9 @@ impl DecoderBuilder {
         }
         if self.config.in_flight_chunks == 0 {
             return Err(ConfigError("in_flight_chunks must be non-zero"));
+        }
+        if self.config.index_spacing == 0 {
+            return Err(ConfigError("index_spacing must be non-zero"));
         }
         Ok(Decoder {
             config: self.config,

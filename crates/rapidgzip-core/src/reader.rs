@@ -285,7 +285,7 @@ impl DecoderReader {
         self.current.clear();
         loop {
             match &self.terminal {
-                Terminal::Finished(report) => return Ok(*report),
+                Terminal::Finished(report) => return Ok((*report).clone()),
                 Terminal::Failed(error) => return Err(error.clone()),
                 Terminal::Open => self.receive(),
             }

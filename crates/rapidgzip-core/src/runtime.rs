@@ -1,5 +1,6 @@
 //! Lock-free decoder telemetry and runtime worker-budget control.
 
+use crate::index::{Checkpoint, GzipIndex, IndexBuilder, IndexError};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
@@ -246,6 +247,8 @@ pub(crate) struct RuntimeState {
     started: Instant,
     limit_mutex: Mutex<()>,
     limit_signal: Condvar,
+    index_enabled: AtomicBool,
+    index: Mutex<Option<IndexBuilder>>,
 }
 
 impl RuntimeState {
@@ -270,7 +273,63 @@ impl RuntimeState {
             started: Instant::now(),
             limit_mutex: Mutex::new(()),
             limit_signal: Condvar::new(),
+            index_enabled: AtomicBool::new(false),
+            index: Mutex::new(None),
         })
+    }
+
+    /// Starts collecting a random-access index for this decode.
+    ///
+    /// Decode paths offer checkpoints through [`Self::offer_checkpoint`], which
+    /// is a cheap atomic load away from a no-op when indexing is off.
+    pub(crate) fn enable_index(&self, spacing: u64, compress_windows: bool) {
+        *self.index.lock().expect("index mutex") =
+            Some(IndexBuilder::new(spacing, compress_windows));
+        self.index_enabled.store(true, Ordering::Release);
+    }
+
+    /// Returns whether this decode collects an index.
+    pub(crate) fn index_enabled(&self) -> bool {
+        self.index_enabled.load(Ordering::Acquire)
+    }
+
+    /// Offers a checkpoint with its resolved predecessor window.
+    ///
+    /// An empty window marks a point needing no history. Offers may arrive in
+    /// any order; the builder orders them when the index is finalized.
+    pub(crate) fn offer_checkpoint(&self, checkpoint: Checkpoint, window: &[u8]) {
+        if !self.index_enabled() {
+            return;
+        }
+        if let Some(builder) = self.index.lock().expect("index mutex").as_mut() {
+            builder.offer(checkpoint, window);
+        }
+    }
+
+    /// Attaches the collected index, if any, to a finished report.
+    pub(crate) fn attach_index(
+        &self,
+        mut report: crate::DecodeReport,
+    ) -> Result<crate::DecodeReport, crate::DecodeError> {
+        if let Some(index) = self.take_index(report.compressed_bytes, report.decompressed_bytes) {
+            let index = index
+                .map_err(|error| crate::DecodeError::input_io(0, std::io::Error::other(error)))?;
+            report.index = Some(index);
+        }
+        Ok(report)
+    }
+
+    /// Finalizes the collected index against the verified decode sizes.
+    ///
+    /// Returns `None` when indexing was not requested.
+    pub(crate) fn take_index(
+        &self,
+        compressed_bytes: u64,
+        uncompressed_bytes: u64,
+    ) -> Option<Result<GzipIndex, IndexError>> {
+        let mut builder = self.index.lock().expect("index mutex").take()?;
+        builder.finish(compressed_bytes, uncompressed_bytes);
+        Some(builder.into_index())
     }
 
     fn set_worker_limit(&self, workers: usize) -> Result<(), WorkerLimitError> {

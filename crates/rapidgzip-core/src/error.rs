@@ -1,3 +1,4 @@
+use crate::index::GzipIndex;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -237,7 +238,10 @@ impl Error for DecodeError {
 }
 
 /// Statistics produced after the complete stream has been verified.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+///
+/// This type is [`Clone`] rather than [`Copy`] because it can carry a
+/// collected [`GzipIndex`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DecodeReport {
     /// Compressed bytes consumed.
     pub compressed_bytes: u64,
@@ -247,4 +251,8 @@ pub struct DecodeReport {
     pub member_count: u64,
     /// Configured decoder-worker budget.
     pub decoder_threads: usize,
+    /// Random-access index, present when
+    /// [`DecoderBuilder::build_index`](crate::DecoderBuilder::build_index) was
+    /// enabled.
+    pub index: Option<GzipIndex>,
 }

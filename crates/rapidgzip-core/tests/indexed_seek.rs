@@ -3,7 +3,7 @@
 mod common;
 
 use common::{corpus, gzip};
-use rapidgzip_core::{Checkpoint, GzipIndex, IndexedReader, StoredWindow};
+use rapidgzip_core::{Checkpoint, Decoder, GzipIndex, IndexedReader, StoredWindow};
 use std::io::{Read, Seek, SeekFrom};
 
 /// An index holding only the first member boundary, which every reader can
@@ -187,4 +187,127 @@ fn an_empty_index_reports_a_useful_error() {
     let mut buffer = [0u8; 16];
     let error = reader.read(&mut buffer).expect_err("no checkpoint");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+/// Decodes `compressed` fully and returns the index the decoder collected.
+fn built_index(compressed: &[u8], threads: usize) -> GzipIndex {
+    let decoder = Decoder::builder()
+        .decoder_threads(threads)
+        .build_index(true)
+        .build()
+        .expect("builder");
+    let mut reader = decoder.reader(compressed.to_vec()).expect("reader");
+    std::io::copy(&mut reader, &mut std::io::sink()).expect("decode");
+    reader
+        .finish()
+        .expect("report")
+        .index
+        .expect("index was requested")
+}
+
+#[test]
+fn an_index_is_absent_unless_requested() {
+    let plain = corpus(256 * 1024);
+    let compressed = gzip(&plain, 6);
+    let decoder = Decoder::builder().build().expect("builder");
+    let mut reader = decoder.reader(compressed).expect("reader");
+    std::io::copy(&mut reader, &mut std::io::sink()).expect("decode");
+    assert!(reader.finish().expect("report").index.is_none());
+}
+
+#[test]
+fn a_built_index_records_member_starts_and_sizes() {
+    let first = corpus(300 * 1024);
+    let second = corpus(200 * 1024);
+    let mut plain = first.clone();
+    plain.extend_from_slice(&second);
+
+    let first_compressed = gzip(&first, 6);
+    let mut compressed = first_compressed.clone();
+    compressed.extend_from_slice(&gzip(&second, 6));
+
+    let index = built_index(&compressed, 1);
+    index.validate().expect("invariants hold");
+    assert_eq!(index.compressed_size_in_bytes, compressed.len() as u64);
+    assert_eq!(index.uncompressed_size_in_bytes, plain.len() as u64);
+    assert_eq!(
+        index
+            .checkpoints()
+            .iter()
+            .map(|point| (
+                point.compressed_offset_in_bits,
+                point.uncompressed_offset_in_bytes
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, 0),
+            (first_compressed.len() as u64 * 8, first.len() as u64)
+        ]
+    );
+}
+
+#[test]
+fn a_built_index_seeks_correctly() {
+    let first = corpus(300 * 1024);
+    let second = corpus(200 * 1024);
+    let mut plain = first.clone();
+    plain.extend_from_slice(&second);
+
+    let mut compressed = gzip(&first, 6);
+    compressed.extend_from_slice(&gzip(&second, 6));
+
+    let index = built_index(&compressed, 1);
+    let mut reader = IndexedReader::new(compressed, index).expect("indexed reader");
+    for target in [0usize, first.len() - 5, first.len(), first.len() + 1000] {
+        reader.seek(SeekFrom::Start(target as u64)).expect("seek");
+        let mut buffer = vec![0u8; 512];
+        reader.read_exact(&mut buffer).expect("read");
+        assert_eq!(buffer, &plain[target..target + 512], "target {target}");
+    }
+}
+
+#[test]
+fn a_built_index_survives_a_native_round_trip() {
+    let plain = corpus(400 * 1024);
+    let compressed = gzip(&plain, 6);
+    let index = built_index(&compressed, 1);
+
+    let mut bytes = Vec::new();
+    index.write_native(&mut bytes).expect("write");
+    let restored = GzipIndex::read_native(&mut bytes.as_slice()).expect("read");
+    assert_eq!(restored, index);
+
+    let mut reader = IndexedReader::new(compressed, restored).expect("indexed reader");
+    reader.seek(SeekFrom::Start(200_000)).expect("seek");
+    let mut buffer = vec![0u8; 1024];
+    reader.read_exact(&mut buffer).expect("read");
+    assert_eq!(buffer, &plain[200_000..201_024]);
+}
+
+#[test]
+fn a_streaming_decode_builds_the_same_index() {
+    use std::io::Cursor;
+
+    let first = corpus(200 * 1024);
+    let second = corpus(150 * 1024);
+    let mut compressed = gzip(&first, 6);
+    compressed.extend_from_slice(&gzip(&second, 6));
+
+    let positional = built_index(&compressed, 1);
+
+    let decoder = Decoder::builder()
+        .build_index(true)
+        .build()
+        .expect("builder");
+    let mut reader = decoder
+        .stream_reader(Cursor::new(compressed.clone()))
+        .expect("stream reader");
+    std::io::copy(&mut reader, &mut std::io::sink()).expect("decode");
+    let streamed = reader
+        .finish()
+        .expect("report")
+        .index
+        .expect("index was requested");
+
+    assert_eq!(streamed, positional);
 }
