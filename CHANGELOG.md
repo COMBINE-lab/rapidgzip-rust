@@ -7,6 +7,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Asking for two decoder workers was 13% slower than asking for one. Two
+  workers entered the speculative marker/window grid, whose native
+  unknown-history decoder runs at roughly 291 MiB/s per worker against
+  662 MiB/s for the sequential zlib path, so two of them lost to one of it.
+  The grid is now entered from three workers up, where the arithmetic turns.
+  The BGZF, stored, and dense-member paths inflate with zlib and are
+  dispatched before that check, so they still gain from a second worker.
+
 - Two gzip index interoperability bugs, found by a test in which real gztool
   extracts by line from an index this crate wrote. gztool numbers lines from
   one while the index counts newlines before a point, so export and import now

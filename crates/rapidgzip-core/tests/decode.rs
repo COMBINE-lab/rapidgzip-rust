@@ -534,6 +534,11 @@ fn telemetry_reports_specialized_and_sequential_paths() {
         (stored, 4, DecoderPath::Stored, 1),
         (bgzf, 4, DecoderPath::Bgzf, 33),
         (marker.clone(), 4, DecoderPath::MarkerWindow, 1),
+        // Two workers is below the point where the speculative grid pays for
+        // itself, so it stays on the sequential path rather than becoming
+        // slower than asking for one worker.
+        (marker.clone(), 2, DecoderPath::Sequential, 1),
+        (marker.clone(), 3, DecoderPath::MarkerWindow, 1),
         (marker, 1, DecoderPath::Sequential, 1),
     ] {
         let decoder = Decoder::builder().decoder_threads(workers).build().unwrap();

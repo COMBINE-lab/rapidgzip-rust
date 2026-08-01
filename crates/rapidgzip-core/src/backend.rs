@@ -146,7 +146,7 @@ where
         // A zlib or raw stream is one DEFLATE stream, which is exactly what
         // the estimated grid splits. Neither can be BGZF or multi-member, so
         // the member probes are skipped.
-        if config.decoder_threads > 1 {
+        if config.decoder_threads >= MINIMUM_MARKER_WORKERS {
             let grid_size = adjusted_compressed_chunk_size(source, config)?;
             runtime.set_path(DecoderPath::MarkerWindow);
             return decode_rapidgzip_estimated(
@@ -190,17 +190,19 @@ where
             runtime.set_path(DecoderPath::DenseMembers);
             return decode_independent_members(source, config, cancelled, output, &index, runtime);
         }
-        let grid_size = adjusted_compressed_chunk_size(source, config)?;
-        runtime.set_path(DecoderPath::MarkerWindow);
-        return decode_rapidgzip_estimated(
-            source,
-            config,
-            cancelled,
-            output,
-            grid_size,
-            Format::Gzip,
-            runtime,
-        );
+        if config.decoder_threads >= MINIMUM_MARKER_WORKERS {
+            let grid_size = adjusted_compressed_chunk_size(source, config)?;
+            runtime.set_path(DecoderPath::MarkerWindow);
+            return decode_rapidgzip_estimated(
+                source,
+                config,
+                cancelled,
+                output,
+                grid_size,
+                Format::Gzip,
+                runtime,
+            );
+        }
     }
     runtime.set_path(DecoderPath::Sequential);
     runtime.set_adaptive_target(1);
@@ -839,6 +841,20 @@ where
         format: Format::Gzip,
     })
 }
+
+/// Worker budget below which the marker/window grid is not worth entering.
+///
+/// That path decodes with the native unknown-history decoder, which is
+/// measurably slower per byte than zlib-rs inflate: roughly 291 MiB/s per
+/// worker against 662 MiB/s for the sequential path on a text corpus. Two
+/// marker workers therefore lose to one zlib worker, and asking for two
+/// workers used to be 13% slower than asking for one. Three is where the
+/// arithmetic turns, so below that the sequential path is kept.
+///
+/// This applies only to the speculative grid. The BGZF, stored, and
+/// dense-member paths inflate with zlib and gain from a second worker, so they
+/// are dispatched before this check.
+const MINIMUM_MARKER_WORKERS: usize = 3;
 
 const INDEPENDENT_MEMBER_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const INDEPENDENT_MEMBER_PROBE_BYTES: u64 = 8 * 1024 * 1024;
