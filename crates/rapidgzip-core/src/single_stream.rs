@@ -12,7 +12,7 @@ use crate::backend::Output;
 use crate::config::Config;
 use crate::gzip::InputCursor;
 use crate::index::Checkpoint;
-use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateOutcome};
+use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateOutcome, at_bit_offset};
 use crate::runtime::RuntimeState;
 use crate::zlib::{self, Adler32};
 use crate::{DecodeError, DecodeReport, DeflateErrorKind, Format, ZlibErrorKind};
@@ -81,7 +81,9 @@ where
         // Reconstructing the slice here, rather than holding the borrow,
         // leaves the cursor free to advance below.
         let input = unsafe { std::slice::from_raw_parts(input_pointer, input_length) };
-        let step = inflater.inflate(input, &mut decoded, false)?;
+        let step = inflater
+            .inflate(input, &mut decoded, false)
+            .map_err(|error| at_bit_offset(error, cursor.position().saturating_mul(8)))?;
         cursor.advance(step.consumed);
 
         if !decoded.is_empty() {

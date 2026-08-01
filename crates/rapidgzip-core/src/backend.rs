@@ -4,7 +4,7 @@ use crate::crc32::Crc32;
 use crate::gzip::{InputCursor, MemberHeader, SourceCursor, StreamCursor, parse_member_header};
 use crate::index::Checkpoint;
 use crate::inflate::RawInflater;
-use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateOutcome};
+use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateOutcome, at_bit_offset};
 use crate::parallel::Window;
 use crate::parallel::adaptive::AdaptiveConcurrency;
 use crate::parallel::deflate::{
@@ -714,7 +714,7 @@ where
             },
             &[],
         );
-        let mut inflater = RawInflater::new()?;
+        let mut inflater = ActiveInflater::new()?;
         let mut crc = Crc32::new();
         let mut member_output = 0_u32;
         let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
@@ -737,34 +737,15 @@ where
                 decoded.reserve_exact(config.decoded_chunk_size - decoded.capacity());
             }
 
-            inflater.stream.next_in = input_pointer;
-            inflater.stream.avail_in = input_length as u32;
-            inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-            inflater.stream.avail_out = decoded.capacity() as u32;
-            let input_before = inflater.stream.avail_in;
-            let output_before = inflater.stream.avail_out;
-
-            // SAFETY:
-            // - `inflater.stream` was initialized and is uniquely borrowed.
-            // - `next_in/avail_in` describe the cursor's current readable
-            //   window. Neither cursor implementation moves or mutates that
-            //   window outside `available`, which is not called again until
-            //   after this call returns.
-            // - `next_out/avail_out` describe the uniquely owned spare
-            //   capacity of `decoded`. The backend reports how many bytes it
-            //   initialized before that length is exposed below.
-            let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
-
-            let consumed = usize::try_from(input_before - inflater.stream.avail_in)
-                .expect("zlib uInt fits usize");
-            let produced = usize::try_from(output_before - inflater.stream.avail_out)
-                .expect("zlib uInt fits usize");
-            cursor.advance(consumed);
-            // SAFETY: `output_before` was exactly `decoded.capacity()` and
-            // zlib-rs can only reduce `avail_out` after initializing those
-            // output bytes. Therefore `produced <= capacity`, and precisely
-            // the first `produced` bytes are initialized.
-            unsafe { decoded.set_len(produced) };
+            // SAFETY: the cursor's readable window stays live and unmoved
+            // until the next `available` call, which happens after this borrow
+            // ends. Reconstructing the slice here, rather than holding the
+            // borrow, leaves the cursor free to advance below.
+            let input = unsafe { std::slice::from_raw_parts(input_pointer, input_length) };
+            let step = inflater
+                .inflate(input, &mut decoded, false)
+                .map_err(|error| at_bit_offset(error, cursor.position().saturating_mul(8)))?;
+            cursor.advance(step.consumed);
 
             if !decoded.is_empty() {
                 let new_total = total_output.checked_add(decoded.len() as u64).ok_or(
@@ -783,40 +764,20 @@ where
                 decoded = output.emit_reusable(decoded)?;
             }
 
-            match status {
-                z::Z_STREAM_END => break,
-                z::Z_OK => {
-                    if consumed == 0 && produced == 0 {
+            match step.outcome {
+                InflateOutcome::StreamEnd => break,
+                InflateOutcome::Progress => {
+                    if step.consumed == 0 && step.produced == 0 {
                         return Err(DecodeError::InvalidDeflate {
                             bit_offset: cursor.position().saturating_mul(8),
                             reason: DeflateErrorKind::Stalled,
                         });
                     }
                 }
-                z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {}
-                z::Z_BUF_ERROR => {
+                InflateOutcome::Blocked => {
                     return Err(DecodeError::InvalidDeflate {
                         bit_offset: cursor.position().saturating_mul(8),
                         reason: DeflateErrorKind::Truncated,
-                    });
-                }
-                z::Z_NEED_DICT => {
-                    return Err(DecodeError::InvalidDeflate {
-                        bit_offset: header.deflate_start.saturating_mul(8),
-                        reason: DeflateErrorKind::UnexpectedDictionary,
-                    });
-                }
-                z::Z_DATA_ERROR => {
-                    let _diagnostic = inflater.message();
-                    return Err(DecodeError::InvalidDeflate {
-                        bit_offset: cursor.position().saturating_mul(8),
-                        reason: DeflateErrorKind::InvalidData,
-                    });
-                }
-                other => {
-                    return Err(DecodeError::InvalidDeflate {
-                        bit_offset: cursor.position().saturating_mul(8),
-                        reason: DeflateErrorKind::BackendStatus(other),
                     });
                 }
             }

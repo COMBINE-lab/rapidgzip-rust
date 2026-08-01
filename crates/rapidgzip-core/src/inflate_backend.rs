@@ -39,6 +39,12 @@ pub(crate) struct InflateStep {
 
 /// A raw-inflate implementation usable by the whole-stream paths.
 ///
+/// The trait carries only what those paths need. In particular it has no
+/// dictionary call: every stream they inflate starts at its own beginning,
+/// with no predecessor history. Installing a window is the business of the
+/// paths that resume mid-stream, which keep a concrete
+/// [`crate::inflate::RawInflater`].
+///
 /// Implementations hold raw pointers into a C-ABI stream state, so they are
 /// not `Send`. Every path creates its backend on the thread that uses it.
 pub(crate) trait InflateBackend: Sized {
@@ -49,9 +55,6 @@ pub(crate) trait InflateBackend: Sized {
     ///
     /// `bit_offset` names the stream start for diagnostics only.
     fn reset(&mut self, bit_offset: u64) -> Result<(), DecodeError>;
-
-    /// Installs `window` as the DEFLATE history, at most 32768 bytes.
-    fn set_dictionary(&mut self, window: &[u8], bit_offset: u64) -> Result<(), DecodeError>;
 
     /// Inflates from `input`, appending into the spare capacity of `output`.
     ///
@@ -67,6 +70,19 @@ pub(crate) trait InflateBackend: Sized {
 
     /// Returns the backend's last diagnostic message, when it has one.
     fn message(&self) -> Option<String>;
+}
+
+/// Rewrites a backend DEFLATE error so it names `bit_offset` as its position.
+///
+/// A backend sees only the buffer it was handed, so it cannot know where that
+/// buffer sits in the stream and reports position zero. The call site knows.
+pub(crate) fn at_bit_offset(error: DecodeError, bit_offset: u64) -> DecodeError {
+    match error {
+        DecodeError::InvalidDeflate { reason, .. } => {
+            DecodeError::InvalidDeflate { bit_offset, reason }
+        }
+        other => other,
+    }
 }
 
 /// The backend the whole-stream paths use.

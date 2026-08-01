@@ -52,7 +52,6 @@ bit-accurate contract must not be reachable from the paths that depend on it.
 pub(crate) trait InflateBackend: Sized {
     fn new() -> Result<Self, DecodeError>;
     fn reset(&mut self, bit_offset: u64) -> Result<(), DecodeError>;
-    fn set_dictionary(&mut self, window: &[u8], bit_offset: u64) -> Result<(), DecodeError>;
     /// Inflates from `input` into the spare capacity of `output`.
     fn inflate(&mut self, input: &[u8], output: &mut Vec<u8>, finish: bool)
         -> Result<InflateStep, DecodeError>;

@@ -12,6 +12,11 @@ mod window;
 use crate::gzip::{SourceCursor, parse_member_header};
 use crate::index::{Checkpoint, GzipIndex, WINDOW_SIZE};
 use crate::inflate::RawInflater;
+// `RawInflater` gets its construction, reset, and diagnostic calls from the
+// backend trait. This reader stays on the concrete type regardless: it resumes
+// at arbitrary bit offsets, which needs `inflatePrime` and a dictionary, and
+// the trait deliberately exposes neither.
+use crate::inflate_backend::InflateBackend;
 use crate::{DecodeError, ReadAt};
 use libz_rs_sys as z;
 use std::io::{self, Read, Seek, SeekFrom};
