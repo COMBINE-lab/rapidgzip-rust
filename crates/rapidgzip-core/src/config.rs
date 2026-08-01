@@ -39,8 +39,9 @@ pub enum Format {
     /// from offset 0 through end-of-stream; leftover compressed bytes after
     /// `Z_STREAM_END` are an error. No on-stream integrity trailer (no
     /// CRC/Adler); optional whole-stream verification is available via
-    /// [`DecoderBuilder::raw_crc32_list`]. Not selected by [`Format::Auto`].
-    /// Random-access index collection (`keep_index`) is not supported.
+    /// [`DecoderBuilder::raw_crc32_list`] (at most one CRC value). Not selected
+    /// by [`Format::Auto`]. Random-access index collection (`keep_index`) is
+    /// not supported.
     RawDeflate,
 }
 
@@ -105,10 +106,11 @@ pub(crate) struct Config {
     /// Optional external CRC32 values for raw DEFLATE integrity (gzip-style
     /// IEEE CRC32 of uncompressed output).
     ///
-    /// Empty means no external check. For [`Format::RawDeflate`], a non-empty
-    /// list verifies the whole-stream CRC against the first element after a
-    /// successful inflate (MVP: multi-segment lists are not yet applied).
-    /// Ignored for gzip and zlib (those formats use their own trailers).
+    /// Empty means no external check. At most one value is supported: for
+    /// [`Format::RawDeflate`], a single-element list verifies the whole-stream
+    /// CRC after a successful inflate. Lists with two or more elements are
+    /// rejected by [`DecoderBuilder::build`]. Ignored for gzip and zlib (those
+    /// formats use their own trailers).
     pub(crate) raw_crc32_list: Vec<u32>,
 }
 
@@ -244,19 +246,23 @@ impl DecoderBuilder {
 
     /// Sets an optional external CRC32 list for raw DEFLATE integrity checks.
     ///
-    /// Raw DEFLATE (RFC 1951) has no on-stream trailer. When the format is
-    /// [`Format::RawDeflate`] and `list` is non-empty, a successful decode
-    /// verifies that the gzip-style IEEE CRC32 of the full uncompressed output
-    /// matches `list[0]`. Multi-element segment lists are accepted but only the
-    /// first value is used in this MVP. An empty list disables the check
-    /// (default).
+    /// Raw DEFLATE (RFC 1951) has no on-stream trailer. Whole-stream external
+    /// CRC supports **at most one** value:
+    /// - empty list: no external check (default);
+    /// - one element: after a successful decode with [`Format::RawDeflate`],
+    ///   verifies that the gzip-style IEEE CRC32 of the full uncompressed
+    ///   output matches that value;
+    /// - two or more elements: rejected by [`Self::build`] with
+    ///   [`ConfigError`] (fail-closed; multi-segment CRCs are not supported
+    ///   without length boundaries).
     ///
     /// Ignored for gzip and zlib (those formats verify their own trailers when
     /// [`Self::crc32_enabled`] is true). Independent of `crc32_enabled`.
     ///
     /// # Errors
     ///
-    /// Mismatch returns [`crate::DecodeError::ChecksumMismatch`] with
+    /// [`Self::build`] returns [`ConfigError`] when `list.len() > 1`. Decode
+    /// mismatch returns [`crate::DecodeError::ChecksumMismatch`] with
     /// `member: 0`.
     pub fn raw_crc32_list(mut self, list: Vec<u32>) -> Self {
         self.config.raw_crc32_list = list;
@@ -388,7 +394,8 @@ impl DecoderBuilder {
     /// # Errors
     ///
     /// Returns [`ConfigError`] when a size or count violates the constraints
-    /// documented on its setter.
+    /// documented on its setter, including a [`Self::raw_crc32_list`] with more
+    /// than one element.
     pub fn build(self) -> Result<Decoder, ConfigError> {
         if self.config.decoder_threads == 0 {
             return Err(ConfigError("decoder_threads must be non-zero"));
@@ -418,6 +425,11 @@ impl DecoderBuilder {
         }
         if self.config.keep_index && matches!(self.config.format, Format::RawDeflate) {
             return Err(ConfigError("index not supported for raw deflate"));
+        }
+        if self.config.raw_crc32_list.len() > 1 {
+            return Err(ConfigError(
+                "raw_crc32_list supports at most one whole-stream CRC value",
+            ));
         }
         Ok(Decoder {
             config: self.config,
@@ -687,12 +699,21 @@ mod tests {
         let default = Decoder::builder().build().unwrap();
         assert!(default.config.raw_crc32_list.is_empty());
         let with_list = Decoder::builder()
-            .raw_crc32_list(vec![0x1234_5678, 0x9abc_def0])
+            .raw_crc32_list(vec![0x1234_5678])
             .build()
             .unwrap();
+        assert_eq!(with_list.config.raw_crc32_list, vec![0x1234_5678]);
+    }
+
+    #[test]
+    fn raw_crc32_list_rejects_multi_element_at_build() {
+        let multi = Decoder::builder().raw_crc32_list(vec![0x1234_5678, 0x9abc_def0]);
+        // Setter accepts the list; validation is deferred to build.
+        assert_eq!(multi.config.raw_crc32_list, vec![0x1234_5678, 0x9abc_def0]);
+        let error = multi.build().unwrap_err();
         assert_eq!(
-            with_list.config.raw_crc32_list,
-            vec![0x1234_5678, 0x9abc_def0]
+            error.to_string(),
+            "raw_crc32_list supports at most one whole-stream CRC value"
         );
     }
 

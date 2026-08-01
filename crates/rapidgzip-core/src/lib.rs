@@ -81,7 +81,8 @@
 //! Adler-32 trailer instead of CRC32/ISIZE. Both integrity checks can be
 //! disabled via [`DecoderBuilder::crc32_enabled`]. Raw DEFLATE has no on-stream
 //! trailer; optional whole-stream CRC32 verification is available via
-//! [`DecoderBuilder::raw_crc32_list`]. Format selection defaults to auto-detect
+//! [`DecoderBuilder::raw_crc32_list`] (at most one external CRC value; multi-
+//! element lists are rejected at build time). Format selection defaults to auto-detect
 //! ([`Format::Auto`], gzip vs zlib only); use [`DecoderBuilder::format`] to
 //! require gzip, zlib, or raw DEFLATE. Reaching reader EOF or receiving a
 //! successful [`DecodeReport`] means the complete compressed input was verified

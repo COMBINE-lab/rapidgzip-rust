@@ -388,7 +388,7 @@ fn resolve_stream_format<R: Read>(
 /// Shared inflate-loop helper: pulls from the stream cursor, writes to output,
 /// updates integrity state and the index builder. Returns on stream end.
 ///
-/// Inflate goes through [`InflateBackend`] (monomorphized to [`RawInflater`]
+/// Inflate goes through [`InflateBackend`] (monomorphized to [`ActiveInflater`]
 /// at the gzip/zlib/raw call sites).
 #[allow(clippy::too_many_arguments)]
 fn inflate_until_stream_end<R, O, I>(

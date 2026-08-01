@@ -24,10 +24,14 @@ impl Crc32 {
 /// Verifies an optional external whole-stream CRC32 for raw DEFLATE.
 ///
 /// When `list` is empty, succeeds immediately. Otherwise compares the
-/// gzip-style IEEE CRC32 of the full uncompressed output against `list[0]`.
-/// Multi-element segment lists are accepted but only the first value is used
-/// (MVP).
+/// gzip-style IEEE CRC32 of the full uncompressed output against the single
+/// expected value. Call sites only run after [`crate::DecoderBuilder::build`],
+/// which rejects lists longer than one element.
 pub(crate) fn verify_raw_crc32_list(list: &[u32], crc: &Crc32) -> Result<(), DecodeError> {
+    debug_assert!(
+        list.len() <= 1,
+        "raw_crc32_list longer than one must be rejected at DecoderBuilder::build"
+    );
     let Some(&expected) = list.first() else {
         return Ok(());
     };

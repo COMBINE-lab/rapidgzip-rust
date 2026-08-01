@@ -29,21 +29,43 @@ use std::os::raw::c_int;
 /// zlib-compatible `Z_BLOCK` stop contract.
 ///
 /// The zlib-rs fallback is allocated lazily: pure NoFlush/Finish sequential
-/// decode never creates it. It is created on first [`InflateFlush::Block`]
-/// use, or earlier if non-empty prime / set_dictionary run (so mid-stream
-/// Block resume such as estimated-path tails stays in sync). Once created,
-/// reset / prime / set_dictionary keep it aligned with the ISA-L stream setup.
+/// decode (including seek `prepare_at_bit_offset` prime + dictionary setup)
+/// never creates it. Non-empty prime / set_dictionary always update ISA-L and
+/// either forward to an existing fallback or stash pending values replayed
+/// onto a fresh [`crate::backend::RawInflater`] on first
+/// [`InflateFlush::Block`]. Once created, reset / prime / set_dictionary keep
+/// the fallback aligned with ISA-L stream setup.
 pub(crate) struct IsalInflater {
     state: Box<inflate_state>,
     /// Lazy zlib-rs fallback for [`InflateFlush::Block`] only.
     block_zlib: Option<crate::backend::RawInflater>,
+    /// Last non-empty prime when `block_zlib` is still None (replay order: prime then dict).
+    pending_prime: Option<(u8, u8, u64)>,
+    /// Pending dictionary bytes + bit_offset when `block_zlib` is still None.
+    pending_dict: Option<(Vec<u8>, u64)>,
 }
 
 impl IsalInflater {
-    /// Create the Block fallback on first need; returns a mutable borrow.
+    /// Create the Block fallback on first need, replaying any pending prime then
+    /// dictionary (same order as [`InflateBackend::install_bit_resume`]).
+    ///
+    /// Pending values are cleared only after successful apply so a failed replay
+    /// can be retried without losing setup.
     fn ensure_block_zlib(&mut self) -> Result<&mut crate::backend::RawInflater, DecodeError> {
         if self.block_zlib.is_none() {
-            self.block_zlib = Some(crate::backend::RawInflater::new()?);
+            let mut block = crate::backend::RawInflater::new()?;
+            if let Some((bits, value, bit_offset)) = self.pending_prime {
+                block.prime(bits, value, bit_offset)?;
+            }
+            if let Some((ref bytes, bit_offset)) = self.pending_dict {
+                // Bytes came from a validated `Window` in `set_dictionary`.
+                let window =
+                    Window::new(bytes.clone()).expect("pending dict length already validated");
+                block.set_dictionary(&window, bit_offset)?;
+            }
+            self.pending_prime = None;
+            self.pending_dict = None;
+            self.block_zlib = Some(block);
         }
         Ok(self.block_zlib.as_mut().expect("block_zlib set above"))
     }
@@ -204,9 +226,11 @@ impl InflateBackend for IsalInflater {
         state.crc_flag = ISAL_DEFLATE;
         Ok(Self {
             state,
-            // Defer zlib-rs Block fallback until first Block inflate or
-            // non-empty prime/dictionary (mid-stream Block resume).
+            // Defer zlib-rs Block fallback until first Block inflate.
+            // Seek/resume prime + dictionary stay on ISA-L (+ pending) only.
             block_zlib: None,
+            pending_prime: None,
+            pending_dict: None,
         })
     }
 
@@ -214,6 +238,9 @@ impl InflateBackend for IsalInflater {
         // SAFETY: state was initialized by create/reset.
         unsafe { isal_inflate_reset(&mut *self.state) };
         self.state.crc_flag = ISAL_DEFLATE;
+        // Drop any setup not yet applied to the Block fallback.
+        self.pending_prime = None;
+        self.pending_dict = None;
         // Keep an already-allocated fallback in sync for later Block steps;
         // leave None untouched so pure NoFlush paths stay free of zlib-rs.
         if let Some(block) = self.block_zlib.as_mut() {
@@ -236,9 +263,13 @@ impl InflateBackend for IsalInflater {
         // ISA-L uses read_in (LSB-first bit buffer) + read_in_length.
         self.state.read_in = u64::from(value) & ((1_u64 << bits) - 1);
         self.state.read_in_length = i32::from(bits);
-        // Non-empty prime may precede Block (estimated-path mid-byte resume):
-        // create the fallback now so it receives the same primed bits.
-        self.ensure_block_zlib()?.prime(bits, value, bit_offset)?;
+        // Always keep ISA-L primed. Only touch zlib-rs if it already exists;
+        // otherwise stash for replay on first Block (last non-empty prime wins).
+        if let Some(block) = self.block_zlib.as_mut() {
+            block.prime(bits, value, bit_offset)?;
+        } else {
+            self.pending_prime = Some((bits, value, bit_offset));
+        }
         Ok(())
     }
 
@@ -265,9 +296,13 @@ impl InflateBackend for IsalInflater {
                 reason: DeflateErrorKind::BackendStatus(status),
             });
         }
-        // Non-empty dict may precede Block; create fallback so history matches.
-        self.ensure_block_zlib()?
-            .set_dictionary(window, bit_offset)?;
+        // Always apply to ISA-L. Forward to existing fallback, else store pending
+        // dict bytes for first-Block replay (no allocation on NoFlush seek).
+        if let Some(block) = self.block_zlib.as_mut() {
+            block.set_dictionary(window, bit_offset)?;
+        } else {
+            self.pending_dict = Some((bytes.to_vec(), bit_offset));
+        }
         Ok(())
     }
 
@@ -462,21 +497,108 @@ mod tests {
     }
 
     #[test]
-    fn block_zlib_allocates_on_nonempty_prime() {
-        let mut inf = IsalInflater::create().unwrap();
-        assert!(inf.block_zlib.is_none());
-        // Mid-byte resume may prime before the first Block inflate.
-        inf.prime(3, 0x01, 0).unwrap();
-        assert!(inf.block_zlib.is_some());
-    }
-
-    #[test]
-    fn block_zlib_allocates_on_nonempty_dictionary() {
+    fn noflush_prime_and_dictionary_leave_block_zlib_none() {
+        // Seek prepare_at_bit_offset: prime + dict + NoFlush must not allocate
+        // the zlib-rs Block fallback.
         let mut inf = IsalInflater::create().unwrap();
         assert!(inf.block_zlib.is_none());
         let window = Window::new(b"predecessor-history-bytes".to_vec()).unwrap();
+        // install_bit_resume order: prime then set_dictionary.
+        inf.prime(3, 0x01, 5).unwrap();
+        inf.set_dictionary(&window, 5).unwrap();
+        assert!(inf.block_zlib.is_none());
+        assert_eq!(inf.pending_prime, Some((3, 0x01, 5)));
+        assert_eq!(
+            inf.pending_dict.as_ref().map(|(b, o)| (b.as_slice(), *o)),
+            Some((b"predecessor-history-bytes".as_slice(), 5))
+        );
+
+        // NoFlush path still uses only ISA-L (fresh inflater: no bad prime).
+        let mut noflush = IsalInflater::create().unwrap();
+        let input = stored_hi();
+        let mut out = Vec::with_capacity(16);
+        let step = noflush
+            .inflate_capped(&input, &mut out, InflateFlush::NoFlush, 16)
+            .unwrap();
+        assert!(noflush.block_zlib.is_none());
+        assert_eq!(&out, b"hi");
+        assert_eq!(step.status, status::STREAM_END);
+    }
+
+    #[test]
+    fn nonempty_prime_and_dictionary_stay_pending_until_block() {
+        let mut inf = IsalInflater::create().unwrap();
+        assert!(inf.block_zlib.is_none());
+        // Mid-byte resume may prime before the first Block inflate — stash only.
+        inf.prime(3, 0x01, 0).unwrap();
+        assert!(inf.block_zlib.is_none());
+        assert_eq!(inf.pending_prime, Some((3, 0x01, 0)));
+
+        let window = Window::new(b"predecessor-history-bytes".to_vec()).unwrap();
         inf.set_dictionary(&window, 0).unwrap();
+        assert!(inf.block_zlib.is_none());
+        assert!(inf.pending_dict.is_some());
+
+        // First Block allocates, replays pending (prime then dict), clears pending.
+        // stored_hi does not need the primed bits; only assert allocation + no panic.
+        let mut out = Vec::with_capacity(16);
+        let _ = inf.inflate_capped(&stored_hi(), &mut out, InflateFlush::Block, 16);
         assert!(inf.block_zlib.is_some());
+        assert!(inf.pending_prime.is_none());
+        assert!(inf.pending_dict.is_none());
+    }
+
+    #[test]
+    fn pending_dictionary_replays_on_first_block_and_decodes() {
+        // Non-empty dict alone is safe for a stored block (no lookbacks).
+        let mut inf = IsalInflater::create().unwrap();
+        let window = Window::new(b"predecessor-history-bytes".to_vec()).unwrap();
+        inf.set_dictionary(&window, 0).unwrap();
+        assert!(inf.block_zlib.is_none());
+        assert!(inf.pending_dict.is_some());
+
+        let input = stored_hi();
+        let mut out = Vec::with_capacity(16);
+        let step = inf
+            .inflate_capped(&input, &mut out, InflateFlush::Block, 16)
+            .unwrap();
+        assert!(inf.block_zlib.is_some());
+        assert!(inf.pending_dict.is_none());
+        assert_eq!(&out, b"hi");
+        assert!(
+            step.status == status::STREAM_END || step.status == status::OK,
+            "status={}",
+            step.status
+        );
+    }
+
+    #[test]
+    fn reset_clears_pending_setup() {
+        let mut inf = IsalInflater::create().unwrap();
+        inf.prime(3, 0x01, 0).unwrap();
+        let window = Window::new(b"predecessor-history-bytes".to_vec()).unwrap();
+        inf.set_dictionary(&window, 0).unwrap();
+        assert!(inf.pending_prime.is_some());
+        assert!(inf.pending_dict.is_some());
+
+        inf.reset(0).unwrap();
+        assert!(inf.block_zlib.is_none());
+        assert!(inf.pending_prime.is_none());
+        assert!(inf.pending_dict.is_none());
+
+        // Clean Block decode after reset (no stale prime).
+        let input = stored_hi();
+        let mut out = Vec::with_capacity(16);
+        let step = inf
+            .inflate_capped(&input, &mut out, InflateFlush::Block, 16)
+            .unwrap();
+        assert!(inf.block_zlib.is_some());
+        assert_eq!(&out, b"hi");
+        assert!(
+            step.status == status::STREAM_END || step.status == status::OK,
+            "status={}",
+            step.status
+        );
     }
 
     #[test]

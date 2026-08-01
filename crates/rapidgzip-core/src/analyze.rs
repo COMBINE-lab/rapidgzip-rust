@@ -3,8 +3,8 @@
 //! Walks members and DEFLATE blocks with raw inflate via
 //! [`InflateBackend`] and [`InflateFlush::Block`] so callers can inspect
 //! framing without writing payload. Used by the CLI `--analyze` path and
-//! available as [`crate::Decoder::analyze`]. Monomorphized to zlib-rs
-//! [`RawInflater`] today.
+//! available as [`crate::Decoder::analyze`]. Monomorphized to
+//! [`crate::inflate_backend::ActiveInflater`].
 //!
 //! Supports gzip (including BGZF), zlib (RFC 1950), and raw DEFLATE (RFC 1951
 //! via explicit [`Format::RawDeflate`]; never auto-selected).
@@ -639,7 +639,8 @@ struct DeflateWalk {
 }
 
 /// Inflates raw DEFLATE from the cursor with [`InflateFlush::Block`], recording
-/// block spans. Generic over [`InflateBackend`]; monomorphized to [`RawInflater`].
+/// block spans. Generic over [`InflateBackend`]; monomorphized to
+/// [`crate::inflate_backend::ActiveInflater`].
 fn walk_deflate_blocks<R, F, I>(
     source: &R,
     cursor: &mut SourceCursor<'_, R>,
