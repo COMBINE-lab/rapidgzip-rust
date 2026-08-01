@@ -127,18 +127,21 @@ mod backend;
 mod config;
 mod crc32;
 mod error;
+mod format;
 mod gzip;
 mod indexed;
 mod inflate;
 mod read_at;
 mod reader;
 mod runtime;
+mod zlib;
 
 pub mod index;
 pub mod parallel;
 
 pub use config::{ConfigError, Decoder, DecoderBuilder};
-pub use error::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind};
+pub use error::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ZlibErrorKind};
+pub use format::Format;
 pub use index::{Checkpoint, GzipIndex, IndexError, StoredWindow, WindowMap};
 pub use indexed::IndexedReader;
 pub use read_at::ReadAt;

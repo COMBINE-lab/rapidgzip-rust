@@ -50,6 +50,55 @@ impl Display for GzipErrorKind {
     }
 }
 
+/// The reason a zlib container was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ZlibErrorKind {
+    /// The header bytes are not a legal zlib header.
+    BadHeader,
+    /// The stream did not use the DEFLATE compression method.
+    UnsupportedCompressionMethod(u8),
+    /// The declared window exponent exceeds DEFLATE's 32 KiB history.
+    UnsupportedWindowSize(u8),
+    /// The stream requires a preset dictionary, which this crate cannot supply.
+    PresetDictionary,
+    /// The header or the Adler-32 trailer was truncated.
+    Truncated,
+    /// The Adler-32 trailer did not match the decompressed output.
+    ChecksumMismatch {
+        /// Checksum stored in the trailer.
+        expected: u32,
+        /// Checksum computed over the output.
+        actual: u32,
+    },
+    /// Bytes followed a complete zlib stream.
+    TrailingGarbage,
+}
+
+impl Display for ZlibErrorKind {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadHeader => formatter.write_str("invalid zlib header bytes"),
+            Self::UnsupportedCompressionMethod(method) => {
+                write!(formatter, "unsupported zlib compression method {method}")
+            }
+            Self::UnsupportedWindowSize(exponent) => write!(
+                formatter,
+                "unsupported zlib window exponent {exponent}, expected at most 7"
+            ),
+            Self::PresetDictionary => {
+                formatter.write_str("zlib stream requires a preset dictionary")
+            }
+            Self::Truncated => formatter.write_str("truncated zlib header or trailer"),
+            Self::ChecksumMismatch { expected, actual } => write!(
+                formatter,
+                "zlib Adler-32 mismatch: expected {expected:#010x}, got {actual:#010x}"
+            ),
+            Self::TrailingGarbage => formatter.write_str("trailing data after a zlib stream"),
+        }
+    }
+}
+
 /// The reason a DEFLATE stream was rejected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -102,6 +151,13 @@ pub enum DecodeError {
         offset: u64,
         /// Detailed reason.
         reason: GzipErrorKind,
+    },
+    /// The zlib framing was invalid.
+    InvalidZlib {
+        /// Compressed byte offset.
+        offset: u64,
+        /// Detailed reason.
+        reason: ZlibErrorKind,
     },
     /// The raw DEFLATE payload was invalid.
     InvalidDeflate {
@@ -164,8 +220,13 @@ impl DecodeError {
             | Self::InvalidDeflate {
                 reason: DeflateErrorKind::Truncated,
                 ..
+            }
+            | Self::InvalidZlib {
+                reason: ZlibErrorKind::Truncated,
+                ..
             } => io::ErrorKind::UnexpectedEof,
             Self::InvalidGzip { .. }
+            | Self::InvalidZlib { .. }
             | Self::InvalidDeflate { .. }
             | Self::ChecksumMismatch { .. }
             | Self::SizeMismatch { .. } => io::ErrorKind::InvalidData,
@@ -196,6 +257,9 @@ impl Display for DecodeError {
             } => write!(formatter, "output I/O error: {source}"),
             Self::InvalidGzip { offset, reason } => {
                 write!(formatter, "invalid gzip data at byte {offset}: {reason}")
+            }
+            Self::InvalidZlib { offset, reason } => {
+                write!(formatter, "invalid zlib data at byte {offset}: {reason}")
             }
             Self::InvalidDeflate { bit_offset, reason } => {
                 write!(
