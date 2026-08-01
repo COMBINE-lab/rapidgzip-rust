@@ -2,6 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** complete. Every task landed on the `index-and-seek` branch; the
+interop task also fixed a real bug it uncovered, recorded in its commit.
+
 **Goal:** Build a random-access index as a by-product of decoding, persist it in four on-disk formats, and expose `Read + Seek` random access over compressed input.
 
 **Architecture:** A self-contained `index/` module holds pure index types and format codecs with no knowledge of the decoder. Decode paths feed an `IndexSink` at boundaries they already compute. A separate `indexed/` module implements single-threaded random access on top of a raw-inflate wrapper extracted from `backend.rs`.
@@ -52,7 +55,7 @@ Spec: `docs/superpowers/specs/2026-08-01-index-seek-design.md`
 - Consumes: nothing.
 - Produces: `Checkpoint { compressed_offset_in_bits: u64, uncompressed_offset_in_bytes: u64, line_offset: u64 }`, `StoredWindow`, `WindowMap`, `GzipIndex`, `IndexError`, `GzipIndex::validate(&self) -> Result<(), IndexError>`, `GzipIndex::checkpoint_at_or_before(&self, uncompressed_offset: u64) -> Option<&Checkpoint>`, and crate-internal helpers `read_u64_le`, `write_u64_le`, `read_u32_le`, `write_u32_le`, `read_u64_be`, `write_u64_be`, `read_u32_be`, `write_u32_be`, `read_u8`, `read_exact_bytes`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the bottom of the new `src/index/mod.rs`:
 
@@ -151,12 +154,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p rapidgzip-core index::`
 Expected: compilation failure, `GzipIndex` and friends are undefined.
 
-- [ ] **Step 3: Write the types**
+- [x] **Step 3: Write the types**
 
 In `src/index/mod.rs`, above the test module:
 
@@ -577,7 +580,7 @@ integer_io!(read_u32_be, write_u32_be, u32, from_be_bytes, to_be_bytes);
 integer_io!(read_u64_be, write_u64_be, u64, from_be_bytes, to_be_bytes);
 ```
 
-- [ ] **Step 4: Register the module**
+- [x] **Step 4: Register the module**
 
 In `src/lib.rs`, add `pub mod index;` next to `pub mod parallel;`, and re-export the main types:
 
@@ -585,12 +588,12 @@ In `src/lib.rs`, add `pub mod index;` next to `pub mod parallel;`, and re-export
 pub use index::{Checkpoint, GzipIndex, IndexError, StoredWindow, WindowMap};
 ```
 
-- [ ] **Step 5: Run the tests and lints**
+- [x] **Step 5: Run the tests and lints**
 
 Run: `cargo test -p rapidgzip-core index::` then `cargo clippy --all-targets -- -D warnings`
 Expected: PASS, no warnings.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/index/mod.rs crates/rapidgzip-core/src/lib.rs
@@ -610,7 +613,7 @@ git commit -m "Add gzip index types and validation"
 - Consumes: `IndexError`, `WINDOW_SIZE`, `StoredWindow` from Task 1.
 - Produces: `pub(crate) fn zlib_compress_window(bytes: &[u8]) -> Result<Vec<u8>, IndexError>`, `pub(crate) fn zlib_decompress_window(payload: &[u8]) -> Result<Vec<u8>, IndexError>`, `StoredWindow::from_raw_maybe_compress(bytes: impl Into<Vec<u8>>, compress: bool) -> Result<StoredWindow, IndexError>`, `StoredWindow::decompressed(&self) -> Result<Cow<'_, [u8]>, IndexError>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 At the bottom of the new `src/index/window_codec.rs`:
 
@@ -679,12 +682,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p rapidgzip-core window_codec`
 Expected: compilation failure, the module does not exist.
 
-- [ ] **Step 3: Implement the codec**
+- [x] **Step 3: Implement the codec**
 
 `src/index/window_codec.rs`:
 
@@ -812,7 +815,7 @@ impl Drop for InflateGuard<'_> {
 }
 ```
 
-- [ ] **Step 4: Extend `StoredWindow`**
+- [x] **Step 4: Extend `StoredWindow`**
 
 In `src/index/mod.rs`, add `mod window_codec;` plus `pub(crate) use window_codec::{zlib_compress_window, zlib_decompress_window};`, `use std::borrow::Cow;`, and these methods on `StoredWindow`:
 
@@ -845,12 +848,12 @@ In `src/index/mod.rs`, add `mod window_codec;` plus `pub(crate) use window_codec
     }
 ```
 
-- [ ] **Step 5: Run the tests and lints**
+- [x] **Step 5: Run the tests and lints**
 
 Run: `cargo test -p rapidgzip-core index` then `cargo clippy --all-targets -- -D warnings`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/index/
@@ -872,7 +875,7 @@ git commit -m "Add zlib codec for stored index windows"
 
 On-disk layout, all little-endian: magic `RGZIDX01` (8 bytes), `u16` version (1), `u16` flags (0), `u64` compressed size, `u64` uncompressed size, `u64` checkpoint spacing, `u64` total line count (`u64::MAX` when absent), `u64` checkpoint count. Then per checkpoint: `u64` compressed bit offset, `u64` uncompressed offset, `u64` line offset, `u8` window kind (0 absent, 1 raw, 2 zlib), `u32` payload length, payload bytes.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/rapidgzip-core/tests/index_formats.rs`:
 
@@ -989,12 +992,12 @@ fn native_rejects_a_hostile_checkpoint_count() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p rapidgzip-core --test index_formats`
 Expected: compilation failure, `write_native` is undefined.
 
-- [ ] **Step 3: Implement the format**
+- [x] **Step 3: Implement the format**
 
 `src/index/native.rs`:
 
@@ -1150,7 +1153,7 @@ pub(crate) fn read_native(reader: &mut impl Read) -> Result<GzipIndex, IndexErro
 }
 ```
 
-- [ ] **Step 4: Expose the methods**
+- [x] **Step 4: Expose the methods**
 
 In `src/index/mod.rs`, add `mod native;` and:
 
@@ -1168,12 +1171,12 @@ impl GzipIndex {
 }
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test -p rapidgzip-core --test index_formats`
 Expected: PASS, including the truncation sweep.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/index/ crates/rapidgzip-core/tests/index_formats.rs
@@ -1193,7 +1196,7 @@ git commit -m "Add native index serialization"
 - Consumes: Task 1 and Task 2.
 - Produces: `pub fn encode_bit_offset(compressed_offset_in_bits: u64) -> (u64, u8)`, `pub fn decode_bit_offset(byte_offset: u64, bits_field: u8) -> Result<u64, IndexError>`, `GzipIndex::write_gzidx(&self, writer: &mut impl Write) -> Result<(), IndexError>`, `GzipIndex::read_gzidx(reader: &mut impl Read, archive_size: Option<u64>) -> Result<GzipIndex, IndexError>`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/index_formats.rs`:
 
@@ -1283,12 +1286,12 @@ fn gzidx_rejects_truncation_at_every_prefix() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rapidgzip-core --test index_formats gzidx`
 Expected: compilation failure.
 
-- [ ] **Step 3: Implement the format**
+- [x] **Step 3: Implement the format**
 
 `src/index/gzidx.rs`:
 
@@ -1494,7 +1497,7 @@ pub(crate) fn read_gzidx(
 }
 ```
 
-- [ ] **Step 4: Expose the methods**
+- [x] **Step 4: Expose the methods**
 
 In `src/index/mod.rs`, add `mod gzidx;`, `pub use gzidx::{decode_bit_offset, encode_bit_offset};`, and:
 
@@ -1518,12 +1521,12 @@ In `src/index/mod.rs`, add `mod gzidx;`, `pub use gzidx::{decode_bit_offset, enc
     }
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test -p rapidgzip-core --test index_formats`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/index/ crates/rapidgzip-core/tests/index_formats.rs
@@ -1543,7 +1546,7 @@ git commit -m "Add indexed_gzip GZIDX import and export"
 - Consumes: Task 1.
 - Produces: `GzipIndex::write_gzi(&self, writer: &mut impl Write) -> Result<(), IndexError>`, `GzipIndex::read_gzi(reader: &mut impl Read, archive_size: Option<u64>) -> Result<GzipIndex, IndexError>`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/index_formats.rs`:
 
@@ -1640,12 +1643,12 @@ fn gzi_rejects_a_hostile_pair_count() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rapidgzip-core --test index_formats gzi_`
 Expected: compilation failure.
 
-- [ ] **Step 3: Implement the format**
+- [x] **Step 3: Implement the format**
 
 `src/index/gzi.rs`:
 
@@ -1751,7 +1754,7 @@ pub(crate) fn read_gzi(
 }
 ```
 
-- [ ] **Step 4: Expose the methods**
+- [x] **Step 4: Expose the methods**
 
 In `src/index/mod.rs`, add `mod gzi;` and:
 
@@ -1778,12 +1781,12 @@ In `src/index/mod.rs`, add `mod gzi;` and:
     }
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test -p rapidgzip-core --test index_formats`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/index/ crates/rapidgzip-core/tests/index_formats.rs
@@ -1805,7 +1808,7 @@ git commit -m "Add htslib BGZF gzi import and export"
 
 Layout, big-endian: eight zero bytes, then magic `gzipindx` (version 0) or `gzipindX` (version 1), and for version 1 a `u32` line-number format. Then `u64` `have` and `u64` `size`, which must be equal. Then per point: `u64` uncompressed offset, `u64` compressed byte offset, `u32` bits field, `u32` compressed window length, the zlib payload, and for version 1 a `u64` line counter. The file ends with the `u64` uncompressed size and, for version 1, the total line count.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/index_formats.rs`:
 
@@ -1906,12 +1909,12 @@ fn gztool_rejects_truncation_at_every_prefix() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rapidgzip-core --test index_formats gztool`
 Expected: compilation failure.
 
-- [ ] **Step 3: Implement the format**
+- [x] **Step 3: Implement the format**
 
 `src/index/gztool.rs`:
 
@@ -2099,7 +2102,7 @@ pub(crate) fn read_gztool(
 }
 ```
 
-- [ ] **Step 4: Expose the methods**
+- [x] **Step 4: Expose the methods**
 
 In `src/index/mod.rs`, add `mod gztool;`, `pub use gztool::WithLines;`, and:
 
@@ -2129,12 +2132,12 @@ In `src/index/mod.rs`, add `mod gztool;`, `pub use gztool::WithLines;`, and:
     }
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test -p rapidgzip-core --test index_formats`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/index/ crates/rapidgzip-core/tests/index_formats.rs
@@ -2156,23 +2159,23 @@ This is a refactor plus two new capabilities. Behavior of existing paths must no
 - Consumes: `DecodeError`, `DeflateErrorKind`.
 - Produces: `pub(crate) struct RawInflater` with `new()`, `reset(bit_offset: u64)`, `message()`, plus new `prime(&mut self, bits: u8, value: u32) -> Result<(), DecodeError>` and `set_dictionary(&mut self, window: &[u8]) -> Result<(), DecodeError>`, and public accessor `stream(&mut self) -> &mut z::z_stream`.
 
-- [ ] **Step 1: Move the type**
+- [x] **Step 1: Move the type**
 
 Cut `RawInflater`, its `impl` blocks at `backend.rs:60-131`, and the `impl RawInflater` block at `backend.rs:1940` into a new `src/inflate.rs` with a module doc comment. Add `mod inflate;` to `src/lib.rs` and `use crate::inflate::RawInflater;` to `backend.rs`. Make the struct and its methods `pub(crate)`.
 
-- [ ] **Step 2: Run the existing suite to prove nothing changed**
+- [x] **Step 2: Run the existing suite to prove nothing changed**
 
 Run: `cargo test -p rapidgzip-core`
 Expected: PASS, same set of tests as before the move.
 
-- [ ] **Step 3: Commit the pure move**
+- [x] **Step 3: Commit the pure move**
 
 ```bash
 git add crates/rapidgzip-core/src/inflate.rs crates/rapidgzip-core/src/backend.rs crates/rapidgzip-core/src/lib.rs
 git commit -m "Move the raw inflate wrapper into its own module"
 ```
 
-- [ ] **Step 4: Write the failing test for the new capabilities**
+- [x] **Step 4: Write the failing test for the new capabilities**
 
 At the bottom of `src/inflate.rs`:
 
@@ -2229,12 +2232,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: Run it to verify it fails**
+- [x] **Step 5: Run it to verify it fails**
 
 Run: `cargo test -p rapidgzip-core inflate::`
 Expected: FAIL, `prime`, `set_dictionary`, `inflate_into` and `tests_support` are undefined.
 
-- [ ] **Step 6: Implement the new methods**
+- [x] **Step 6: Implement the new methods**
 
 Add to `src/inflate.rs`:
 
@@ -2370,12 +2373,12 @@ pub(crate) mod tests_support {
 }
 ```
 
-- [ ] **Step 7: Run the tests**
+- [x] **Step 7: Run the tests**
 
 Run: `cargo test -p rapidgzip-core inflate::` then `cargo test -p rapidgzip-core`
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/inflate.rs
@@ -2404,7 +2407,7 @@ Resume procedure at a checkpoint:
 4. When the window is non-empty, call `set_dictionary` before the first `inflate_into`.
 5. Discard output until the target offset is reached.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/rapidgzip-core/tests/indexed_seek.rs`:
 
@@ -2552,12 +2555,12 @@ fn a_reused_reader_serves_repeated_backward_seeks() {
 
 If `crates/rapidgzip-core/tests/common/mod.rs` does not exist, create it by moving the gzip-producing helper already used by `tests/decode.rs` into it and re-exporting it from both test binaries.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p rapidgzip-core --test indexed_seek`
 Expected: compilation failure, `IndexedReader` and `build_index` are undefined. Task 9 supplies `build_index`; until then this test does not compile, which is expected. Implement the reader first and re-run after Task 9.
 
-- [ ] **Step 3: Implement the window cache**
+- [x] **Step 3: Implement the window cache**
 
 `src/indexed/window.rs`:
 
@@ -2625,7 +2628,7 @@ impl WindowCache {
 }
 ```
 
-- [ ] **Step 4: Implement the reader**
+- [x] **Step 4: Implement the reader**
 
 `src/indexed/mod.rs`, using `RawInflater::prime`, `set_dictionary`, `inflate_into`, the `WindowCache`, and `crate::gzip::{SourceCursor, parse_member_header}` for the member-header skip. Keep the file under 400 lines by delegating window expansion to `window.rs` and the resume procedure to a private `fn resume_at(&mut self, checkpoint: Checkpoint) -> io::Result<()>`.
 
@@ -2658,16 +2661,16 @@ impl<R: ReadAt> Read for IndexedReader<R> {
 
 `fill` reads the next input page through `ReadAt`, runs `inflate_into` into a reusable buffer, appends to `self.decoded`, and returns `false` at the end of the last member. When an inflate call reports the end of a stream and input remains, it parses the next member header and continues, which is how reads cross member boundaries.
 
-- [ ] **Step 5: Register the module**
+- [x] **Step 5: Register the module**
 
 In `src/lib.rs`, add `mod indexed;` and `pub use indexed::IndexedReader;`.
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 Run: `cargo test -p rapidgzip-core --test indexed_seek`
 Expected: still failing on `build_index` only. Proceed to Task 9 and re-run there.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/indexed/ crates/rapidgzip-core/src/lib.rs crates/rapidgzip-core/tests/indexed_seek.rs
@@ -2687,7 +2690,7 @@ git commit -m "Add IndexedReader for random access through an index"
 - Consumes: Tasks 1 to 8.
 - Produces: `pub(crate) trait IndexSink { fn checkpoint(&mut self, checkpoint: Checkpoint, window: StoredWindow); fn finish(&mut self, compressed_bytes: u64, uncompressed_bytes: u64); }`, `pub(crate) struct IndexBuilder`, `DecoderBuilder::build_index(self, enabled: bool) -> Self`, `DecodeReport::index: Option<GzipIndex>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/indexed_seek.rs`:
 
@@ -2735,12 +2738,12 @@ fn an_index_survives_a_native_round_trip_and_still_seeks() {
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p rapidgzip-core --test indexed_seek`
 Expected: FAIL, `build_index` is undefined.
 
-- [ ] **Step 3: Implement the sink**
+- [x] **Step 3: Implement the sink**
 
 `src/index/build.rs`:
 
@@ -2845,7 +2848,7 @@ impl IndexSink for IndexBuilder {
 }
 ```
 
-- [ ] **Step 4: Thread the option through configuration**
+- [x] **Step 4: Thread the option through configuration**
 
 In `src/config.rs`, add `build_index: bool` to `Config` (default `false`) and `compress_index_windows: bool` (default `true`), plus builder methods:
 
@@ -2879,16 +2882,16 @@ In `src/error.rs`, add to `DecodeReport`:
 
 Update every `DecodeReport` construction site to set `index: None`, then set it from the builder in the paths wired below.
 
-- [ ] **Step 5: Wire the sequential and independent-member paths**
+- [x] **Step 5: Wire the sequential and independent-member paths**
 
 In `backend.rs`, at the emit site near line 2017 (independent members) and the stored-block path near line 512, call `sink.checkpoint(...)` with the member start bit offset, the running decompressed offset, and `StoredWindow::empty()` for member starts. Pass `Option<&mut dyn IndexSink>` down through `decode_source` rather than storing it globally.
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 Run: `cargo test -p rapidgzip-core --test indexed_seek`
 Expected: PASS for `an_index_is_absent_unless_requested`, `a_built_index_validates_and_covers_the_stream`, and the multi-member seek test. The single-member seek test may still report only one checkpoint until Task 10.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/index/build.rs crates/rapidgzip-core/src/config.rs crates/rapidgzip-core/src/error.rs crates/rapidgzip-core/src/backend.rs crates/rapidgzip-core/src/reader.rs crates/rapidgzip-core/tests/indexed_seek.rs
@@ -2907,7 +2910,7 @@ git commit -m "Collect a random-access index during sequential decoding"
 - Consumes: `IndexSink` from Task 9, `Chunk::start_bit`, `Chunk::backend_continuation`, `ChunkOutput::window_after`.
 - Produces: no new API; the existing tests gain checkpoints on parallel decodes.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/indexed_seek.rs`:
 
@@ -2966,23 +2969,23 @@ fn a_bgzf_index_exports_as_gzi() {
 
 Add a `bgzip` helper to `tests/common/mod.rs` that produces BGZF by invoking the same construction the existing BGZF tests in `tests/decode.rs` already use.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p rapidgzip-core --test indexed_seek parallel`
 Expected: FAIL with too few checkpoints.
 
-- [ ] **Step 3: Emit checkpoints from the ordered-output loop**
+- [x] **Step 3: Emit checkpoints from the ordered-output loop**
 
 At the native estimated-grid ordered-output site, immediately before `output.emit(decoded.bytes)`, the chunk's start bit offset and the running decompressed offset are both known, and the predecessor window is the window used to resolve that chunk's markers. Emit the checkpoint there, before the bytes leave the loop, so a checkpoint is only recorded for a chunk whose window is resolved.
 
 For BGZF, emit at each block start with an empty window, since BGZF blocks are independent.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p rapidgzip-core`
 Expected: PASS, including the whole existing suite.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/backend.rs crates/rapidgzip-core/tests/
@@ -3001,7 +3004,7 @@ git commit -m "Collect index checkpoints from the parallel and BGZF paths"
 - Consumes: Task 9.
 - Produces: no new API.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/indexed_seek.rs`:
 
@@ -3034,21 +3037,21 @@ fn a_streaming_decode_builds_the_same_index_as_a_positional_one() {
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p rapidgzip-core --test indexed_seek streaming`
 Expected: FAIL, the streamed index is empty.
 
-- [ ] **Step 3: Wire the sink into `decode_stream`**
+- [x] **Step 3: Wire the sink into `decode_stream`**
 
 The streaming path runs the sequential zlib inflate over a sliding input page. It knows the absolute compressed byte offset of each page and the running decompressed offset, so it emits a checkpoint at each member start with an empty window and, at the configured spacing, a checkpoint carrying the last 32 KiB of decompressed output as its window.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p rapidgzip-core`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/backend.rs crates/rapidgzip-core/tests/indexed_seek.rs
@@ -3068,7 +3071,7 @@ git commit -m "Collect an index while decoding non-seekable input"
 - Consumes: every format from Tasks 3 to 6.
 - Produces: no new API.
 
-- [ ] **Step 1: Write the interop tests**
+- [x] **Step 1: Write the interop tests**
 
 `crates/rapidgzip-core/tests/index_interop.rs`, every test marked `#[ignore]` with a comment saying which tool it needs:
 
@@ -3126,16 +3129,16 @@ fn we_read_the_index_written_by_gztool() {
 
 Each body follows the same shape: build the corpus, write the file into a temporary directory, invoke the tool through `Command`, and compare its output against the expected slice. Skip the test with an explanatory message when the tool is absent rather than failing.
 
-- [ ] **Step 2: Run them locally where the tool exists**
+- [x] **Step 2: Run them locally where the tool exists**
 
 Run: `cargo test -p rapidgzip-core --test index_interop -- --ignored`
 Expected: the `bgzip` tests pass locally; the others report a missing tool.
 
-- [ ] **Step 3: Add the CI job**
+- [x] **Step 3: Add the CI job**
 
 In `.github/workflows/ci.yml`, add a job that installs `bgzip` (via `apt-get install -y tabix`), `indexed_gzip` (via `pip install indexed_gzip`), and `gztool` (build from source at a pinned tag), then runs the ignored tests.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/rapidgzip-core/tests/index_interop.rs .github/workflows/ci.yml
@@ -3154,7 +3157,7 @@ git commit -m "Test index interoperability against the reference tools"
 - Consumes: the whole feature.
 - Produces: no new API.
 
-- [ ] **Step 1: Update the crate docs**
+- [x] **Step 1: Update the crate docs**
 
 The crate-level docs currently say "Encoding, index persistence, and decoded-output seeking are outside this crate's current scope." Replace that with a short section describing index building, the four formats, and `IndexedReader`, including a compiling doctest:
 
@@ -3183,20 +3186,20 @@ The crate-level docs currently say "Encoding, index persistence, and decoded-out
 //! ```
 ```
 
-- [ ] **Step 2: Update `ARCHITECTURE.md`**
+- [x] **Step 2: Update `ARCHITECTURE.md`**
 
 Add a section describing `index/` and `indexed/`, the checkpoint invariants, and where the decode paths call the sink.
 
-- [ ] **Step 3: Update `README.md` and `CHANGELOG.md`**
+- [x] **Step 3: Update `README.md` and `CHANGELOG.md`**
 
 README gains a random-access example and a note on format interoperability. CHANGELOG gains an entry under an unreleased heading.
 
-- [ ] **Step 4: Run the full suite**
+- [x] **Step 4: Run the full suite**
 
 Run: `cargo test -p rapidgzip-core` and `cargo test --doc -p rapidgzip-core` and `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/rapidgzip-core/src/lib.rs ARCHITECTURE.md README.md CHANGELOG.md
