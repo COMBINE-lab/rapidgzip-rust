@@ -27,13 +27,27 @@ use std::os::raw::c_int;
 /// [`InflateFlush::Block`] (keep_index / analyze bit-accurate block walks) is
 /// delegated to an internal zlib-rs inflater: ISA-L does not expose a
 /// zlib-compatible `Z_BLOCK` stop contract.
+///
+/// The zlib-rs fallback is allocated lazily: pure NoFlush/Finish sequential
+/// decode never creates it. It is created on first [`InflateFlush::Block`]
+/// use, or earlier if non-empty prime / set_dictionary run (so mid-stream
+/// Block resume such as estimated-path tails stays in sync). Once created,
+/// reset / prime / set_dictionary keep it aligned with the ISA-L stream setup.
 pub(crate) struct IsalInflater {
     state: Box<inflate_state>,
-    /// Fallback for [`InflateFlush::Block`] only.
-    block_zlib: crate::backend::RawInflater,
+    /// Lazy zlib-rs fallback for [`InflateFlush::Block`] only.
+    block_zlib: Option<crate::backend::RawInflater>,
 }
 
 impl IsalInflater {
+    /// Create the Block fallback on first need; returns a mutable borrow.
+    fn ensure_block_zlib(&mut self) -> Result<&mut crate::backend::RawInflater, DecodeError> {
+        if self.block_zlib.is_none() {
+            self.block_zlib = Some(crate::backend::RawInflater::new()?);
+        }
+        Ok(self.block_zlib.as_mut().expect("block_zlib set above"))
+    }
+
     fn map_status(ret: c_int, state: &inflate_state, produced: usize, consumed: usize) -> i32 {
         // Positive ISA-L codes are success classes; negatives are errors.
         if ret < 0 {
@@ -190,7 +204,9 @@ impl InflateBackend for IsalInflater {
         state.crc_flag = ISAL_DEFLATE;
         Ok(Self {
             state,
-            block_zlib: crate::backend::RawInflater::new()?,
+            // Defer zlib-rs Block fallback until first Block inflate or
+            // non-empty prime/dictionary (mid-stream Block resume).
+            block_zlib: None,
         })
     }
 
@@ -198,7 +214,11 @@ impl InflateBackend for IsalInflater {
         // SAFETY: state was initialized by create/reset.
         unsafe { isal_inflate_reset(&mut *self.state) };
         self.state.crc_flag = ISAL_DEFLATE;
-        self.block_zlib.reset(bit_offset)?;
+        // Keep an already-allocated fallback in sync for later Block steps;
+        // leave None untouched so pure NoFlush paths stay free of zlib-rs.
+        if let Some(block) = self.block_zlib.as_mut() {
+            block.reset(bit_offset)?;
+        }
         Ok(())
     }
 
@@ -216,14 +236,19 @@ impl InflateBackend for IsalInflater {
         // ISA-L uses read_in (LSB-first bit buffer) + read_in_length.
         self.state.read_in = u64::from(value) & ((1_u64 << bits) - 1);
         self.state.read_in_length = i32::from(bits);
-        self.block_zlib.prime(bits, value, bit_offset)?;
+        // Non-empty prime may precede Block (estimated-path mid-byte resume):
+        // create the fallback now so it receives the same primed bits.
+        self.ensure_block_zlib()?.prime(bits, value, bit_offset)?;
         Ok(())
     }
 
     fn set_dictionary(&mut self, window: &Window, bit_offset: u64) -> Result<(), DecodeError> {
         let bytes = window.as_slice();
         if bytes.is_empty() {
-            self.block_zlib.set_dictionary(window, bit_offset)?;
+            // Empty dict is a no-op for zlib; only forward if fallback exists.
+            if let Some(block) = self.block_zlib.as_mut() {
+                block.set_dictionary(window, bit_offset)?;
+            }
             return Ok(());
         }
         // SAFETY: dict points at live window bytes; length fits u32 for DEFLATE window.
@@ -240,7 +265,9 @@ impl InflateBackend for IsalInflater {
                 reason: DeflateErrorKind::BackendStatus(status),
             });
         }
-        self.block_zlib.set_dictionary(window, bit_offset)?;
+        // Non-empty dict may precede Block; create fallback so history matches.
+        self.ensure_block_zlib()?
+            .set_dictionary(window, bit_offset)?;
         Ok(())
     }
 
@@ -253,7 +280,7 @@ impl InflateBackend for IsalInflater {
     ) -> Result<InflateStep, DecodeError> {
         if matches!(flush, InflateFlush::Block) {
             return self
-                .block_zlib
+                .ensure_block_zlib()?
                 .inflate_capped(input, output, flush, max_produce);
         }
         // Finish/NoFlush: ISA-L (Finish approximated by running until stream end).
@@ -308,7 +335,9 @@ impl InflateBackend for IsalInflater {
         flush: InflateFlush,
     ) -> Result<InflateStep, DecodeError> {
         if matches!(flush, InflateFlush::Block) {
-            return self.block_zlib.inflate_into_slice(input, output, flush);
+            return self
+                .ensure_block_zlib()?
+                .inflate_into_slice(input, output, flush);
         }
         if output.is_empty() {
             return Ok(InflateStep {
@@ -354,6 +383,7 @@ impl InflateBackend for IsalInflater {
 mod tests {
     use super::*;
     use crate::inflate_backend::InflateBackend;
+    use crate::parallel::Window;
 
     /// Final stored block containing "hi" (raw DEFLATE).
     fn stored_hi() -> Vec<u8> {
@@ -378,6 +408,75 @@ mod tests {
         assert_eq!(step.status, status::STREAM_END);
         assert_eq!(step.consumed, input.len());
         assert_eq!(step.produced, 2);
+    }
+
+    #[test]
+    fn block_zlib_stays_none_on_noflush_path() {
+        // Hot sequential path must not pay for the zlib-rs Block fallback.
+        let mut inf = IsalInflater::create().unwrap();
+        assert!(inf.block_zlib.is_none());
+        let input = stored_hi();
+        let mut out = Vec::with_capacity(16);
+        inf.inflate_capped(&input, &mut out, InflateFlush::NoFlush, 16)
+            .unwrap();
+        assert!(inf.block_zlib.is_none());
+        inf.reset(0).unwrap();
+        assert!(inf.block_zlib.is_none());
+        // Empty dict / zero prime must not allocate either.
+        inf.set_dictionary(&Window::empty(), 0).unwrap();
+        inf.prime(0, 0, 0).unwrap();
+        assert!(inf.block_zlib.is_none());
+    }
+
+    #[test]
+    fn block_zlib_allocates_on_first_block_flush() {
+        let mut inf = IsalInflater::create().unwrap();
+        assert!(inf.block_zlib.is_none());
+        let input = stored_hi();
+        let mut out = Vec::with_capacity(16);
+        let step = inf
+            .inflate_capped(&input, &mut out, InflateFlush::Block, 16)
+            .unwrap();
+        assert!(inf.block_zlib.is_some());
+        assert_eq!(&out, b"hi");
+        // Z_BLOCK often returns Z_OK at the final block end (not only STREAM_END).
+        assert!(
+            step.status == status::STREAM_END || step.status == status::OK,
+            "status={}",
+            step.status
+        );
+        assert!(step.at_block_end || step.last_block || step.status == status::STREAM_END);
+        // Reset keeps the fallback alive and reuses it.
+        inf.reset(0).unwrap();
+        assert!(inf.block_zlib.is_some());
+        out.clear();
+        let step2 = inf
+            .inflate_capped(&input, &mut out, InflateFlush::Block, 16)
+            .unwrap();
+        assert_eq!(&out, b"hi");
+        assert!(
+            step2.status == status::STREAM_END || step2.status == status::OK,
+            "status={}",
+            step2.status
+        );
+    }
+
+    #[test]
+    fn block_zlib_allocates_on_nonempty_prime() {
+        let mut inf = IsalInflater::create().unwrap();
+        assert!(inf.block_zlib.is_none());
+        // Mid-byte resume may prime before the first Block inflate.
+        inf.prime(3, 0x01, 0).unwrap();
+        assert!(inf.block_zlib.is_some());
+    }
+
+    #[test]
+    fn block_zlib_allocates_on_nonempty_dictionary() {
+        let mut inf = IsalInflater::create().unwrap();
+        assert!(inf.block_zlib.is_none());
+        let window = Window::new(b"predecessor-history-bytes".to_vec()).unwrap();
+        inf.set_dictionary(&window, 0).unwrap();
+        assert!(inf.block_zlib.is_some());
     }
 
     #[test]

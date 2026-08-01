@@ -385,7 +385,7 @@ fn raw_payload_large_enough_for_marker<R: ReadAt + ?Sized>(
 /// end-of-stream is an error. No random-access index (`keep_index` is rejected
 /// at config build time).
 ///
-/// Inflate goes through [`InflateBackend`] monomorphized to [`RawInflater`].
+/// Inflate goes through [`InflateBackend`] monomorphized to [`ActiveInflater`].
 fn decode_raw_deflate_sequential<R, O>(
     source: &R,
     config: &Config,
@@ -670,7 +670,7 @@ where
 /// Used as the full sequential entry and as the multi-stream continuation
 /// after a parallel first stream finishes.
 ///
-/// Inflate goes through [`InflateBackend`] monomorphized to [`RawInflater`].
+/// Inflate goes through [`InflateBackend`] monomorphized to [`ActiveInflater`].
 fn decode_zlib_sequential_from<R, O>(
     source: &R,
     config: &Config,
@@ -1041,7 +1041,7 @@ fn index_zlib_streams_from<R: ReadAt + ?Sized>(
 
 /// Decode one zlib stream range into `output`, verifying Adler-32 when enabled.
 ///
-/// Inflate goes through [`InflateBackend`] monomorphized to [`RawInflater`].
+/// Inflate goes through [`InflateBackend`] monomorphized to [`ActiveInflater`].
 /// Each step reserves at least `output_step` spare and hard-caps produce via
 /// [`InflateBackend::inflate_capped`] so batch size matches the prior raw
 /// `avail_out` limit.
@@ -1889,8 +1889,9 @@ where
 /// intermediate checkpoints can be recorded at DEFLATE block boundaries with
 /// bit-accurate compressed offsets and a rolling 32 KiB predecessor window.
 ///
-/// Inflate goes through [`InflateBackend`] monomorphized to [`RawInflater`]
-/// (zlib-rs only today; future ISA-L can swap the type parameter).
+/// Inflate goes through [`InflateBackend`] monomorphized to [`ActiveInflater`]
+/// (zlib-rs `RawInflater` by default; ISA-L `IsalInflater` with the `isal`
+/// feature).
 #[allow(clippy::too_many_arguments)]
 fn decode_members_sequential<R, O>(
     source: &R,
@@ -5338,7 +5339,7 @@ struct BgzfResult {
 /// Decodes one BGZF block, appending to `output`. Returns the produced length.
 ///
 /// Stream lifecycle (reset) and the one-shot inflate go through
-/// [`InflateBackend`] monomorphized to [`RawInflater`]. The extra spare byte
+/// [`InflateBackend`] monomorphized to [`ActiveInflater`]. The extra spare byte
 /// beyond the footer ISIZE still distinguishes exact-size success from
 /// output-buffer exhaustion (including empty EOF blocks).
 fn decode_bgzf_block_into<R: ReadAt + ?Sized>(

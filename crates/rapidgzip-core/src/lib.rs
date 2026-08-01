@@ -7,9 +7,11 @@
 //! `decoder_threads >= 4`), and raw DEFLATE (RFC 1951, explicit
 //! [`Format::RawDeflate`]; same estimated marker path when threads and size
 //! allow). It follows rapidgzip's marker/window algorithm for parallel decoding
-//! of ordinary DEFLATE streams and uses zlib-rs as its sequential inflate
-//! backend (via a crate-private `InflateBackend` trait so a future optional
-//! ISA-L-style backend can plug in without public API churn). Encoding is
+//! of ordinary DEFLATE streams. Sequential inflate defaults to zlib-rs
+//! (`RawInflater` as `ActiveInflater`); enable the optional **`isal`** feature
+//! to monomorphize sequential paths to ISA-L `IsalInflater` instead
+//! (system/prefix `libisal`). Both backends share the crate-private
+//! `InflateBackend` trait so callers see no public API churn. Encoding is
 //! outside this crate's scope.
 //!
 //! Random-access **index** support: the in-memory [`GzipIndex`] model and
@@ -24,8 +26,8 @@
 //! with [`Decoder::reader_with_index`] / [`Decoder::open_with_index`] and
 //! [`IndexedReader`] ([`std::io::Read`] + [`std::io::Seek`]). Full-stream
 //! decompress with an imported index can use the parallel
-//! [`Decoder::decode_with_index`] path (checkpoint segments + zlib-rs, no
-//! marker speculation).
+//! [`Decoder::decode_with_index`] path (checkpoint segments + sequential
+//! inflate via `ActiveInflater`, no marker speculation).
 //!
 //! # Output interfaces
 //!

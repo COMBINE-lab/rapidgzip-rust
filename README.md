@@ -285,9 +285,11 @@ See [SAFETY.md] for the complete audit.
 
 The current implementation clears its zlib-ng-backed C++ rapidgzip parity gate
 on the public FASTQ workload and on synthetic single-member, concatenated, and
-BGZF corpora. On the public FASTQ workload it also exceeds the ISA-L-enabled
-C++ build at multi-worker budgets; the remaining measured ISA-L gap is the
-one-worker case.
+BGZF corpora. On the public FASTQ workload (default zlib-rs builds) it also
+exceeds the ISA-L-enabled C++ build at multi-worker budgets; the former
+one-worker gap against C++ ISA-L is closed on fair synthetic corpora when
+building with the optional **`isal`** feature (see
+[benchmarks/RESULTS-SNAPSHOT.md](benchmarks/RESULTS-SNAPSHOT.md)).
 
 Performance is workload- and machine-dependent. Reproduce the published
 measurements rather than treating these results as a universal speed claim:
@@ -296,6 +298,8 @@ measurements rather than treating these results as a universal speed claim:
 - [BENCHMARKING.md] records corpora, commands, versions, thread counts, hashes,
   throughput, and memory measurements.
 - [PERFORMANCE_AUDIT.md] records the ISA-L comparison and optimization audit.
+- [benchmarks/RESULTS-SNAPSHOT.md](benchmarks/RESULTS-SNAPSHOT.md) is the fair
+  re-bench with Rust `--features isal` vs C++ rapidgzip ISA-L.
 
 ## Platform and compatibility policy
 

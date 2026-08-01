@@ -48,3 +48,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.87.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
+
+  # Optional ISA-L backend (requires system libisal).
+  isal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libisal
+        run: sudo apt-get update && sudo apt-get install -y libisal-dev
+      - run: cargo test -p rapidgzip-core --features isal --locked
+      - run: cargo clippy -p rapidgzip-core --features isal --all-targets --locked -- -D warnings
+      - run: cargo check -p rapidgzip-rust-cli --features isal --locked

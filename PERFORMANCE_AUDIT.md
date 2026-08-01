@@ -100,8 +100,14 @@ monomorphized to `ActiveInflater` — zlib-rs by default, ISA-L with `isal`):
 - **ISA-L** (`isal` feature): `isal_inflate*` only in `isal_backend.rs`.
 
 Default product residual without `isal`: P=1 and small / low-thread budgets
-remain zlib-rs-limited. With `isal`, sequential paths use ISA-L; re-bench for
-P=1 vs C++ rapidgzip/ISA-L as needed.
+remain zlib-rs-limited. With `isal`, sequential paths use ISA-L.
+
+**2026-08-01 (0.2.1):** the optional **`isal`** feature now ships. Fair re-bench
+of Rust `--features isal` vs C++ rapidgzip 0.16 ISA-L is in
+[benchmarks/RESULTS-SNAPSHOT.md](benchmarks/RESULTS-SNAPSHOT.md) (~**1.35×**
+P=1 thrpt geometric mean on the synthetic fair corpora; do not treat those
+cells as a re-measure of the older public-FASTQ matrix below). Default builds
+stay zlib-rs-only.
 
 Shipped parallel paths and format coverage are listed in
 [CHANGELOG.md](CHANGELOG.md); intentional sequential product gates (P=1 stream
@@ -116,16 +122,23 @@ and 44, its median throughput is 228.5%, 146.5%, 116.3%, and 99.7% of that
 control, with a 140.4% geometric mean and lower observed peak RSS in every
 cell. The reproducible matrix is in [BENCHMARKING.md](BENCHMARKING.md).
 
-Against ISA-L-enabled rapidgzip, Rust reaches 91.7%, 133.9%, 104.5%, and
-100.6%, with a 106.6% geometric mean. The remaining formal ISA-L failure is
-therefore narrow and specific: the one-worker path is 658.7 MiB/s versus
-718.3 MiB/s. That path is authoritative zlib-rs inflate rather than the native
-marker decoder, so further multi-worker marker tuning will not close it.
+Against ISA-L-enabled rapidgzip **on default (zlib-rs) builds**, the historical
+public-FASTQ matrix reached 91.7%, 133.9%, 104.5%, and 100.6%, with a 106.6%
+geometric mean. The remaining formal ISA-L failure was therefore narrow and
+specific: the one-worker path at 658.7 MiB/s versus 718.3 MiB/s. That path is
+authoritative sequential inflate rather than the native marker decoder, so
+further multi-worker marker tuning does not close it.
 
-Pure-Rust gzippy reaches 798.1 MiB/s at one worker on the same file. This is
-strong evidence that an ISA-L binding is not inherently required, although its
-library/output design differs from this project's incremental `Read + Send`
-contract.
+**Status (0.2.1):** that one-worker residual is **narrowed / closed as a product
+gate** by the optional `isal` feature (sequential inflate → ISA-L
+`IsalInflater`). Fair synthetic re-bench: [benchmarks/RESULTS-SNAPSHOT.md](benchmarks/RESULTS-SNAPSHOT.md)
+(~1.35× P=1 geo mean vs C++ ISA-L). The FASTQ numbers above are **not**
+re-measured with `isal` here; keep them as the zlib-rs-era record only.
+
+Pure-Rust gzippy reaches 798.1 MiB/s at one worker on the same file. This was
+strong evidence that an ISA-L binding is not the only way to beat zlib-rs on
+throughput, although its library/output design differs from this project's
+incremental `Read + Send` contract.
 
 ## What changed
 
@@ -219,6 +232,14 @@ assumption is required.
 
 ## Closing the remaining ISA-L gap
 
+> **Update 2026-08-01 (0.2.1):** optional feature **`isal`** ships; sequential
+> inflate can use ISA-L as `ActiveInflater`. Fair re-bench (~**1.35×** P=1
+> thrpt geo mean vs C++ rapidgzip ISA-L on synthetic corpora):
+> [benchmarks/RESULTS-SNAPSHOT.md](benchmarks/RESULTS-SNAPSHOT.md). The
+> zlib-rs-era FASTQ profiling and priority list below remain historical
+> context for default (no-`isal`) builds; they are not a claim that the
+> optional backend is unfinished.
+
 The paired one-worker follow-up attributed the gap more precisely:
 
 | counter | Rust/zlib-rs | C++/ISA-L | gzippy |
@@ -255,19 +276,23 @@ The next architectural work, in priority order, is:
 2. Evaluate a faster CRC fold. Even eliminating CRC entirely would only just
    cross the 95% threshold, so CRC work must accompany an inflater improvement
    and remain verified on every member.
-3. If a second backend is acceptable, evaluate it behind an explicit feature
-   without changing the default. The observed gzippy path cannot be adopted as
-   a drop-in crate call: it owns the complete input/output and its fastest
-   kernel is Linux/x86-64-specific. Reusing its algorithm would require design
-   work for resumable output and non-x86 fallbacks.
+3. ~~If a second backend is acceptable, evaluate it behind an explicit feature
+   without changing the default.~~ **Done in 0.2.1** as optional `isal` /
+   `IsalInflater` (default remains zlib-rs). The observed gzippy path still
+   cannot be adopted as a drop-in crate call: it owns the complete input/output
+   and its fastest kernel is Linux/x86-64-specific.
 4. Otherwise, build an in-tree whole-loop x86-64 kernel with runtime dispatch,
    plus safe scalar and AArch64 paths. This is likely capable of closing the
    gap, but it is a substantially larger unsafe surface than the current
    localized loads and marker replacement.
 
-The formal remaining gate is at least 95% of ISA-L-enabled rapidgzip in the
-one-worker FASTQ cell while preserving at least 100% geometric mean across all
-four budgets, correctness, the streaming API, and memory behavior.
+The formal remaining gate **for default zlib-rs builds** was at least 95% of
+ISA-L-enabled rapidgzip in the one-worker FASTQ cell while preserving at least
+100% geometric mean across all four budgets, correctness, the streaming API,
+and memory behavior. With **`isal`** enabled, that P=1 product residual is
+addressed via a second backend rather than further zlib-rs-only tuning (fair
+synthetic evidence in [benchmarks/RESULTS-SNAPSHOT.md](benchmarks/RESULTS-SNAPSHOT.md);
+no new FASTQ cell is published here).
 
 ## Does ISA-L support NEON?
 
