@@ -1,6 +1,7 @@
 //! On-disk index format round-trips and rejection tests.
 
 use rapidgzip_core::index::WINDOW_SIZE;
+use rapidgzip_core::index::WithLines;
 use rapidgzip_core::{Checkpoint, GzipIndex, IndexError, StoredWindow};
 
 /// An index with a member-boundary point and an interior point whose
@@ -422,7 +423,9 @@ fn gztool_round_trips_without_lines() {
 fn gztool_round_trips_with_lines() {
     use rapidgzip_core::index::WithLines;
 
-    let index = sample_index();
+    let mut index = sample_index();
+    // The line-aware format is only writable for an index that counted lines.
+    index.total_line_count = Some(9_000);
     let mut bytes = Vec::new();
     index
         .write_gztool(&mut bytes, WithLines::Yes)
@@ -431,7 +434,7 @@ fn gztool_round_trips_with_lines() {
 
     let restored = GzipIndex::read_gztool(&mut bytes.as_slice(), Some(1_000_000)).expect("read");
     assert_eq!(restored.checkpoints(), index.checkpoints());
-    assert_eq!(restored.total_line_count, Some(1234));
+    assert_eq!(restored.total_line_count, Some(9_000));
     assert_same_windows(&index, &restored);
 }
 
@@ -483,7 +486,9 @@ fn gztool_rejects_bad_magic() {
 fn gztool_rejects_truncation_at_every_prefix() {
     use rapidgzip_core::index::WithLines;
 
-    let index = sample_index();
+    let mut index = sample_index();
+    // The line-aware format is only writable for an index that counted lines.
+    index.total_line_count = Some(9_000);
     let mut bytes = Vec::new();
     index
         .write_gztool(&mut bytes, WithLines::Yes)
@@ -494,4 +499,41 @@ fn gztool_rejects_truncation_at_every_prefix() {
             "prefix of {length} bytes was accepted"
         );
     }
+}
+
+#[test]
+fn gztool_with_lines_refuses_an_index_without_line_counters() {
+    let index = sample_index();
+    assert_eq!(index.total_line_count, None);
+
+    let mut written = Vec::new();
+    let error = index
+        .write_gztool(&mut written, WithLines::Yes)
+        .expect_err("no line counters");
+    assert_eq!(error, IndexError::MissingLineCounters);
+
+    // Without line counters the version 0 format is still perfectly valid.
+    let mut plain = Vec::new();
+    index
+        .write_gztool(&mut plain, WithLines::No)
+        .expect("write");
+    assert!(!plain.is_empty());
+
+    // Once counters exist, the line-aware format round-trips them.
+    let mut annotated_index = sample_index();
+    annotated_index.total_line_count = Some(9_000);
+    let mut annotated = Vec::new();
+    annotated_index
+        .write_gztool(&mut annotated, WithLines::Yes)
+        .expect("write");
+    let restored = GzipIndex::read_gztool(&mut annotated.as_slice(), None).expect("read");
+    assert_eq!(restored.total_line_count, Some(9_000));
+    assert_eq!(
+        restored
+            .checkpoints()
+            .iter()
+            .map(|point| point.line_offset)
+            .collect::<Vec<_>>(),
+        vec![0, 1234]
+    );
 }

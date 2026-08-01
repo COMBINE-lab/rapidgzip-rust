@@ -5,6 +5,10 @@ mod common;
 use common::{corpus, gzip};
 use rapidgzip_core::{Checkpoint, Decoder, GzipIndex, IndexedReader, StoredWindow};
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
+
+/// Bytes in a minimal gzip member header, which carries no optional fields.
+const GZIP_HEADER_BYTES: u64 = 10;
 
 /// An index holding only the first member boundary, which every reader can
 /// build without help from the decoder.
@@ -239,9 +243,15 @@ fn a_built_index_records_member_starts_and_sizes() {
                 point.uncompressed_offset_in_bytes
             ))
             .collect::<Vec<_>>(),
+        // A member checkpoint records where DEFLATE begins, past the ten-byte
+        // member header, which is the offset indexed_gzip and gztool resume
+        // from.
         vec![
-            (0, 0),
-            (first_compressed.len() as u64 * 8, first.len() as u64)
+            (GZIP_HEADER_BYTES * 8, 0),
+            (
+                (first_compressed.len() as u64 + GZIP_HEADER_BYTES) * 8,
+                first.len() as u64
+            )
         ]
     );
 }
@@ -404,4 +414,77 @@ fn a_bgzf_index_exports_as_gzi() {
     let mut buffer = vec![0u8; 1024];
     reader.read_exact(&mut buffer).expect("read");
     assert_eq!(buffer, &plain[700_000..701_024]);
+}
+
+/// Builds text whose lines are long enough to span several checkpoints.
+fn numbered_lines(count: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for index in 0..count {
+        bytes.extend_from_slice(format!("{index:08} {}\n", "payload".repeat(8)).as_bytes());
+    }
+    bytes
+}
+
+fn line_indexed_reader(decoded: &[u8]) -> IndexedReader<Arc<[u8]>> {
+    let compressed: Arc<[u8]> = gzip(decoded, 6).into();
+    let decoder = Decoder::builder()
+        .decoder_threads(4)
+        .count_lines(true)
+        .build_index(true)
+        .index_spacing(64 * 1024)
+        .build()
+        .expect("decoder");
+    let report = decoder
+        .decode(&compressed, &mut std::io::sink())
+        .expect("decode");
+    IndexedReader::new(compressed, report.index.expect("index")).expect("reader")
+}
+
+#[test]
+fn seeking_to_a_line_lands_on_its_first_byte() {
+    let decoded = numbered_lines(20_000);
+    let mut reader = line_indexed_reader(&decoded);
+
+    for line in [0_u64, 1, 999, 10_000, 19_999] {
+        let offset = reader.seek_to_line(line).expect("seek");
+        let expected = decoded
+            .iter()
+            .enumerate()
+            .filter(|&(_, &byte)| byte == b'\n')
+            .nth(line.wrapping_sub(1) as usize)
+            .map_or(0, |(index, _)| index as u64 + 1);
+        assert_eq!(offset, expected, "wrong offset for line {line}");
+
+        let mut buffer = vec![0_u8; 8];
+        reader.read_exact(&mut buffer).expect("read");
+        assert_eq!(buffer, format!("{line:08}").as_bytes());
+    }
+}
+
+#[test]
+fn seeking_past_the_last_line_lands_at_the_end() {
+    let decoded = numbered_lines(500);
+    let mut reader = line_indexed_reader(&decoded);
+    let offset = reader.seek_to_line(10_000).expect("seek");
+    assert_eq!(offset, decoded.len() as u64);
+    let mut rest = Vec::new();
+    reader.read_to_end(&mut rest).expect("read");
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn seeking_by_line_needs_an_index_that_records_them() {
+    let decoded = numbered_lines(500);
+    let compressed: Arc<[u8]> = gzip(&decoded, 6).into();
+    let decoder = Decoder::builder()
+        .build_index(true)
+        .build()
+        .expect("decoder");
+    let report = decoder
+        .decode(&compressed, &mut std::io::sink())
+        .expect("decode");
+    let mut reader = IndexedReader::new(compressed, report.index.expect("index")).expect("reader");
+
+    let error = reader.seek_to_line(1).expect_err("no line counters");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 }

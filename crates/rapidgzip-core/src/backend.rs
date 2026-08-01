@@ -715,10 +715,13 @@ where
         debug_assert_eq!(header.deflate_start, cursor.position());
         let _observed_bgzf_size = header.bgzf_block_size;
         // A member start needs no predecessor history, so it is a checkpoint
-        // every path can offer, including forward-only sources.
+        // every path can offer, including forward-only sources. The recorded
+        // position is where DEFLATE begins, not where the member header does:
+        // indexed_gzip and gztool both resume by inflating raw DEFLATE at the
+        // recorded offset, so a header there is data they cannot decode.
         runtime.offer_checkpoint(
             Checkpoint {
-                compressed_offset_in_bits: header.start.saturating_mul(8),
+                compressed_offset_in_bits: header.deflate_start.saturating_mul(8),
                 uncompressed_offset_in_bytes: total_output,
                 line_offset: 0,
             },
@@ -2962,17 +2965,13 @@ where
             (first_header.start, first_header.deflate_start)
         }
     };
-    // gzip records the member header, whose start a reader detects and skips.
-    // zlib and raw DEFLATE record the DEFLATE start instead, which is what
-    // indexed_gzip does and what a reader can resume from directly.
-    let checkpoint_start = if format == Format::Gzip {
-        stream_start
-    } else {
-        first_deflate_byte
-    };
+    // Every container records where DEFLATE begins rather than where its
+    // header does. That is what indexed_gzip and gztool write, and what any
+    // reader resuming with raw inflate needs.
+    let _ = stream_start;
     runtime.offer_checkpoint(
         Checkpoint {
-            compressed_offset_in_bits: checkpoint_start.saturating_mul(8),
+            compressed_offset_in_bits: first_deflate_byte.saturating_mul(8),
             uncompressed_offset_in_bytes: 0,
             line_offset: 0,
         },

@@ -235,6 +235,23 @@ impl GzipIndex {
             .map(|index| &self.checkpoints[index])
     }
 
+    /// Returns the last checkpoint at or before line `line`.
+    ///
+    /// Returns `None` when the index carries no line counters, which is the
+    /// case for every index built without
+    /// [`DecoderBuilder::count_lines`](crate::DecoderBuilder::count_lines) and
+    /// for every format that cannot store them.
+    #[must_use]
+    pub fn checkpoint_at_or_before_line(&self, line: u64) -> Option<&Checkpoint> {
+        self.total_line_count?;
+        let position = self
+            .checkpoints
+            .partition_point(|point| point.line_offset <= line);
+        position
+            .checked_sub(1)
+            .map(|index| &self.checkpoints[index])
+    }
+
     /// Writes this index in the crate's native versioned format.
     ///
     /// The native format is the only one that round-trips every field,
@@ -396,6 +413,8 @@ pub enum IndexError {
     },
     /// The index ended before a complete value could be read.
     Truncated,
+    /// A line-aware format was requested for an index without line counters.
+    MissingLineCounters,
     /// A window payload could not be compressed or decompressed.
     WindowCodec(&'static str),
     /// An I/O failure occurred.
@@ -442,6 +461,8 @@ impl Display for IndexError {
                 "archive size {archive_size} does not match index size {index_size}"
             ),
             Self::Truncated => formatter.write_str("truncated index"),
+            Self::MissingLineCounters => formatter
+                .write_str("the index has no line counters; build it with count_lines enabled"),
             Self::WindowCodec(reason) => write!(formatter, "index window codec failure: {reason}"),
             Self::Io { source } => write!(formatter, "index I/O error: {source}"),
         }
@@ -485,6 +506,7 @@ impl PartialEq for IndexError {
                 },
             ) => left_index == right_index && left_archive == right_archive,
             (Self::Truncated, Self::Truncated) => true,
+            (Self::MissingLineCounters, Self::MissingLineCounters) => true,
             (Self::WindowCodec(left), Self::WindowCodec(right)) => left == right,
             (Self::Io { source: left }, Self::Io { source: right }) => {
                 left.kind() == right.kind() && left.to_string() == right.to_string()

@@ -280,3 +280,70 @@ fn gztool_reads_the_index_we_write() {
     let extracted = run(Command::new("gztool").args(["-b", "5000000"]).arg(&archive));
     assert_eq!(&extracted[..1024], &plain[5_000_000..5_001_024]);
 }
+
+#[test]
+#[ignore = "requires gztool"]
+fn gztool_extracts_by_line_from_the_index_we_write() {
+    if !available("gztool", &["-h"]) {
+        println!("skipped: gztool is not installed");
+        return;
+    }
+    let directory = workspace("gztool-reads-our-lines");
+    let plain = corpus(8 * 1024 * 1024);
+    let archive = directory.join("corpus.gz");
+    write(&archive, &gzip(&plain, 6));
+
+    let decoder = Decoder::builder()
+        .build_index(true)
+        .count_lines(true)
+        .build()
+        .expect("builder");
+    let mut reader = decoder.open(&archive).expect("open");
+    std::io::copy(&mut reader, &mut std::io::sink()).expect("decode");
+    let index = reader
+        .finish()
+        .expect("report")
+        .index
+        .expect("index was requested");
+    assert!(
+        index.total_line_count.is_some(),
+        "counting lines must annotate the index"
+    );
+
+    let exported = directory.join("corpus.gzi");
+    let mut bytes = Vec::new();
+    index
+        .write_gztool(&mut bytes, WithLines::Yes)
+        .expect("gztool export");
+    write(&exported, &bytes);
+
+    // `-L` extracts starting at a decompressed line number, which only works
+    // if our line counters mean what gztool believes they mean. This is the
+    // check that the counters are correct rather than merely present.
+    // gztool numbers lines from one, so `-L 50000` is the line our own API
+    // calls 49999. Getting this wrong is exactly the bug the counters would
+    // have, so the test pins the convention rather than assuming it.
+    let target_line = 50_000_usize;
+    let extracted = run(Command::new("gztool")
+        .args(["-L", &target_line.to_string()])
+        .arg(&archive));
+    let zero_based = target_line - 1;
+    let start = plain
+        .iter()
+        .enumerate()
+        .filter(|&(_, &byte)| byte == b'\n')
+        .nth(zero_based - 1)
+        .map(|(offset, _)| offset + 1)
+        .expect("the corpus has that many lines");
+    assert_eq!(&extracted[..512], &plain[start..start + 512]);
+
+    // Our own reader must land on the same byte for the same line.
+    let file = fs::File::open(&archive).expect("open the archive");
+    let mut reader = IndexedReader::new(file, index).expect("indexed reader");
+    assert_eq!(
+        reader
+            .seek_to_line(zero_based as u64)
+            .expect("seek by line"),
+        start as u64
+    );
+}

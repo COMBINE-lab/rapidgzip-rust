@@ -46,6 +46,11 @@ pub(crate) fn write_gztool(
     lines: WithLines,
 ) -> Result<(), IndexError> {
     let with_lines = lines == WithLines::Yes;
+    // Writing zeros here would produce a file gztool accepts and then trusts,
+    // so an index that never counted lines is refused rather than downgraded.
+    if with_lines && index.total_line_count.is_none() {
+        return Err(IndexError::MissingLineCounters);
+    }
     write_u64_be(writer, 0)?;
     if with_lines {
         writer.write_all(MAGIC_V1).map_err(IndexError::io)?;
@@ -93,7 +98,10 @@ pub(crate) fn write_gztool(
         }
 
         if with_lines {
-            write_u64_be(writer, checkpoint.line_offset)?;
+            // gztool numbers lines from one, so its first point reads L1 with
+            // no preceding newline. Our offsets count newlines before the
+            // point, which is the same information shifted by one.
+            write_u64_be(writer, checkpoint.line_offset.saturating_add(1))?;
             maximum_line = maximum_line.max(checkpoint.line_offset);
         }
     }
@@ -164,7 +172,12 @@ pub(crate) fn read_gztool(
             read_exact_bytes(reader, &mut payload)?;
             StoredWindow::from_raw(zlib_decompress_window(&payload)?)
         };
-        let line_offset = if with_lines { read_u64_be(reader)? } else { 0 };
+        // See the writer: gztool's line numbers start at one.
+        let line_offset = if with_lines {
+            read_u64_be(reader)?.saturating_sub(1)
+        } else {
+            0
+        };
 
         index.push(
             Checkpoint {
