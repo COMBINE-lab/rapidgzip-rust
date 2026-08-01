@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `raw_crc32_list`: fail-closed — more than one CRC value is rejected at
+  `DecoderBuilder::build` (single whole-stream CRC only).
+- ISA-L backend (`isal` feature): lazy zlib-rs `Block` fallback; pending
+  prime/dictionary so NoFlush seek resume does not allocate zlib-rs.
+- ISA-L backend: `InflateFlush::Finish` multi-steps `isal_inflate` until
+  STREAM_END (or hard error / stall / `max_produce` / spare exhaustion) so
+  BGZF one-shot members that leave data in `tmp_out` after `INPUT_DONE`
+  complete in a single public call. `NoFlush` remains single-step.
+- CI: optional Ubuntu `isal` job with `libisal-dev` (`cargo test` /
+  `clippy` / CLI check with `--features isal`).
+
+### Docs
+
+- Fair bench snapshot and residual notes for optional ISA-L; monomorphization
+  docs use `ActiveInflater` (zlib-rs default, ISA-L with `isal`).
+
 ## [0.2.1] - 2026-08-01
 
 ### Added

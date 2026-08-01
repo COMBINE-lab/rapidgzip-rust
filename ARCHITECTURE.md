@@ -67,7 +67,8 @@ Positional routes after format resolution:
      `InflateFlush::Block` (block spans + `last_block`; ISA-L backend delegates
      Block flush to an internal zlib-rs inflater);
    - parallel BGZF one-shot block inflate via trait `inflate`
-     (`InflateFlush::Finish`);
+     (`InflateFlush::Finish`; ISA-L multi-steps `isal_inflate` until
+     STREAM_END within that public call when `tmp_out` still drains);
    - parallel independent-member workers: trait `create`/`reset`/
      `inflate_capped` so the per-member output budget cannot overshoot spare
      capacity (no raw `stream.avail_out` at the call site);

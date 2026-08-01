@@ -44,13 +44,18 @@ Results land in `target/bench-results/<UTC-timestamp>/` (`matrix-verify.tsv`,
 | Affinity | Non-CI auto-sets `TASKSET=0-(nproc-1)` when unset; wraps every timed process |
 | Fail closed | Timed commands that exit non-zero drop the row (no invented thrpt from flag mismatches) |
 | Auto-detect | If `RAPIDGZIP_CPP*` unset: `target/bench-venv/bin/rapidgzip`, else `PATH`. ISA-L symbols → `rapidgzip-cpp-isal` |
+| Rust tool label | Default zlib-rs build → `rapidgzip-rust`. Binary with ISA-L symbols (`isal_`/`libisal`, or `ldd` → libisal) → `rapidgzip-rust-isal` |
 | Throughput | `DECODED_BYTES` or auto via `rapidgzip-rust --count` |
 
-**Intentionally not equalized:** inflate backend. C++ manylinux wheels embed
-ISA-L; Rust uses zlib-rs. That is an implementation difference, not a
-methodology bug — report the backend label honestly and do not claim ISA-L
-parity from a zlib-ng-only binary. PyPI entrypoints are Python wrappers
-(baseline RSS includes the interpreter).
+**Intentionally not equalized by default:** inflate backend. C++ manylinux
+wheels embed ISA-L; Rust **defaults** to zlib-rs. That is an implementation
+difference, not a methodology bug — report the backend label honestly and do
+not claim ISA-L parity from a zlib-rs-only binary. For fair P=1 thrpt vs C++
+ISA-L, build Rust with `--features isal` (system/prefix `libisal`; see
+`ISAL_INSTALL_PREFIX` / `LD_LIBRARY_PATH`). Fair harnesses label that binary
+`rapidgzip-rust-isal` when ISA-L symbols are present; the default remains
+`rapidgzip-rust`. PyPI entrypoints are Python wrappers (baseline RSS includes
+the interpreter).
 
 ### Installing C++ rapidgzip for comparison
 

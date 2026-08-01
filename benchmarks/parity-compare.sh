@@ -110,6 +110,23 @@ cpp_binary_has_isal() {
     return 1
 }
 
+# Rust CLI: label ISA-L builds distinctly (binary text and/or DT_NEEDED via ldd).
+rust_binary_has_isal() {
+    local bin=$1
+    if [[ -f "$bin" ]] && grep -aqiE 'isal_|libisal' "$bin" 2>/dev/null; then
+        return 0
+    fi
+    if command -v ldd > /dev/null 2>&1 && ldd "$bin" 2>/dev/null | grep -aqiE 'libisal'; then
+        return 0
+    fi
+    return 1
+}
+
+rust_tool=rapidgzip-rust
+if is_available "$rust_binary" && rust_binary_has_isal "$rust_binary"; then
+    rust_tool=rapidgzip-rust-isal
+fi
+
 if [[ -z "$cpp_isal_binary" && -z "$cpp_zlib_ng_binary" && -z "${RAPIDGZIP_CPP:-}" ]]; then
     if command -v rapidgzip > /dev/null 2>&1; then
         _auto=$(command -v rapidgzip)
@@ -289,7 +306,7 @@ for input in "${inputs[@]}"; do
                 done
             done
             for run in $(seq 1 "$runs"); do
-                benchmark_one "$corpus" verify rapidgzip-rust "$threads" "$run" "$decoded_bytes" \
+                benchmark_one "$corpus" verify "$rust_tool" "$threads" "$run" "$decoded_bytes" \
                     "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -t "$input" >> "$raw_tsv"
                 for bin in "${cpp_bins[@]+"${cpp_bins[@]}"}"; do
                     label=$(cpp_label "$bin")
@@ -313,7 +330,7 @@ for input in "${inputs[@]}"; do
                 done
             done
             for run in $(seq 1 "$runs"); do
-                benchmark_one "$corpus" stdout rapidgzip-rust "$threads" "$run" "$decoded_bytes" \
+                benchmark_one "$corpus" stdout "$rust_tool" "$threads" "$run" "$decoded_bytes" \
                     "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -c "$input" >> "$raw_tsv"
                 for bin in "${cpp_bins[@]+"${cpp_bins[@]}"}"; do
                     label=$(cpp_label "$bin")
@@ -349,7 +366,7 @@ for input in "${inputs[@]}"; do
                         > /dev/null 2> /dev/null || true
                 done
                 for run in $(seq 1 "$runs"); do
-                    benchmark_one "$corpus" index rapidgzip-rust "$threads" "$run" "$decoded_bytes" \
+                    benchmark_one "$corpus" index "$rust_tool" "$threads" "$run" "$decoded_bytes" \
                         "$rust_binary" -P "$threads" -c --import-index "$rust_idx" "$input" >> "$raw_tsv"
                 done
             else
@@ -391,7 +408,7 @@ for input in "${inputs[@]}"; do
                 # Time the decoder only: feed via stdin redirection (not `cat |`).
                 # This avoids measuring an extra process while still testing the
                 # non-seekable sequential path. Documented as stdin stream mode.
-                benchmark_one "$corpus" stdin rapidgzip-rust "$threads" "$run" "$decoded_bytes" \
+                benchmark_one "$corpus" stdin "$rust_tool" "$threads" "$run" "$decoded_bytes" \
                     "$rust_binary" -P "$threads" -c - < "$input" >> "$raw_tsv"
                 for bin in "${cpp_bins[@]+"${cpp_bins[@]}"}"; do
                     label=$(cpp_label "$bin")

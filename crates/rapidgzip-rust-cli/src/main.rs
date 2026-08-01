@@ -54,10 +54,16 @@ impl CliFormat {
     }
 }
 
+/// Package version; append `+isal` when built with the optional ISA-L backend.
+#[cfg(feature = "isal")]
+const CLI_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+isal");
+#[cfg(not(feature = "isal"))]
+const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rapidgzip-rust",
-    version,
+    version = CLI_VERSION,
     about = "Parallel, verified gzip decompression"
 )]
 struct Arguments {

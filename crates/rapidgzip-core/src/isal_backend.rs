@@ -35,6 +35,11 @@ use std::os::raw::c_int;
 /// onto a fresh [`crate::backend::RawInflater`] on first
 /// [`InflateFlush::Block`]. Once created, reset / prime / set_dictionary keep
 /// the fallback aligned with ISA-L stream setup.
+///
+/// [`InflateFlush::Finish`] multi-steps `isal_inflate` within one public
+/// inflate call (drain `tmp_out` after `INPUT_DONE`) so BGZF-style one-shot
+/// members can reach STREAM_END with exact produce/consume when the output
+/// budget covers the full member. [`InflateFlush::NoFlush`] stays single-step.
 pub(crate) struct IsalInflater {
     state: Box<inflate_state>,
     /// Lazy zlib-rs fallback for [`InflateFlush::Block`] only.
@@ -213,6 +218,94 @@ impl IsalInflater {
         let produced = (out_before - state.avail_out) as usize;
         (ret, consumed, produced)
     }
+
+    /// Drive ISA-L with Finish semantics: loop `isal_inflate` until STREAM_END
+    /// (FINISH block state), a hard error, output budget exhaustion, or a true
+    /// stall (0 consumed and 0 produced).
+    ///
+    /// ISA-L often returns `ISAL_DECOMP_OK` with `INPUT_DONE` while `tmp_out`
+    /// still holds data (large stored blocks). Callers such as BGZF require one
+    /// public `Finish` step to reach STREAM_END with exact produce/consume when
+    /// the output budget covers the full member.
+    ///
+    /// `max_produce` is a hard cap on newly produced bytes for this public call
+    /// (same contract as [`InflateBackend::inflate_capped`]). Intermediate
+    /// progress advances raw input consumption; a single
+    /// [`Self::step_from_result`] at the end applies trailer prefetch refund.
+    ///
+    /// # Safety
+    /// `out_base` must point at a writable buffer of at least `max_out` bytes
+    /// that remains live for the duration of this call. Only the first
+    /// `produced` bytes are initialized.
+    unsafe fn finish_drive(
+        state: &mut inflate_state,
+        input: &[u8],
+        out_base: *mut u8,
+        max_out: usize,
+    ) -> InflateStep {
+        if max_out == 0 {
+            return InflateStep {
+                status: status::BUF_ERROR,
+                consumed: 0,
+                produced: 0,
+                unused_bits: 0,
+                at_block_end: false,
+                last_block: false,
+            };
+        }
+
+        let mut total_consumed = 0usize;
+        let mut total_produced = 0usize;
+        // Overwritten by the first `run_inflate`; only used if the loop body
+        // never runs (defensive — max_out > 0 always enters once).
+        let mut last_ret = ISAL_DECOMP_OK as c_int;
+
+        loop {
+            let out_room = max_out - total_produced;
+            if out_room == 0 {
+                break;
+            }
+            debug_assert!(total_consumed <= input.len());
+            let rem_in = &input[total_consumed..];
+            let in_len = rem_in.len().min(u32::MAX as usize);
+            let next_in = if in_len == 0 {
+                std::ptr::null_mut()
+            } else {
+                rem_in.as_ptr().cast_mut()
+            };
+            // SAFETY: out_base + total_produced is within the caller's buffer
+            // of length max_out; out_room > 0 and total_produced + out_room == max_out.
+            let next_out = unsafe { out_base.add(total_produced) };
+
+            // SAFETY: next_in/out cover live slices of the stated lengths.
+            let (ret, consumed, produced) = unsafe {
+                Self::run_inflate(state, next_in, in_len as u32, next_out, out_room as u32)
+            };
+            last_ret = ret;
+            total_consumed += consumed;
+            total_produced += produced;
+            debug_assert!(total_produced <= max_out);
+            debug_assert!(total_consumed <= input.len());
+
+            // Hard error: stop and surface via step_from_result.
+            if ret < 0 {
+                break;
+            }
+            // Fully flushed stream.
+            if state.block_state == isal_block_state_ISAL_BLOCK_FINISH {
+                break;
+            }
+            // Intermediate OK / OUT_OVERFLOW / END_INPUT with progress: keep
+            // draining remaining input and tmp_out within the budget.
+            if consumed > 0 || produced > 0 {
+                continue;
+            }
+            // True stall: no progress and not finished.
+            break;
+        }
+
+        Self::step_from_result(last_ret, state, total_consumed, total_produced)
+    }
 }
 
 impl InflateBackend for IsalInflater {
@@ -318,7 +411,6 @@ impl InflateBackend for IsalInflater {
                 .ensure_block_zlib()?
                 .inflate_capped(input, output, flush, max_produce);
         }
-        // Finish/NoFlush: ISA-L (Finish approximated by running until stream end).
         let start_len = output.len();
         let spare = output.capacity().saturating_sub(start_len);
         let out_len = spare.min(max_produce).min(u32::MAX as usize);
@@ -332,35 +424,40 @@ impl InflateBackend for IsalInflater {
                 last_block: false,
             });
         }
-        let in_len = input.len().min(u32::MAX as usize);
-        let next_in = if in_len == 0 {
-            std::ptr::null_mut()
-        } else {
-            input.as_ptr().cast_mut()
-        };
         let next_out = output.spare_capacity_mut().as_mut_ptr().cast::<u8>();
 
-        // SAFETY: next_in/out cover live slices of the stated lengths.
-        let (ret, consumed, produced) = unsafe {
-            Self::run_inflate(
-                &mut self.state,
-                next_in,
-                in_len as u32,
-                next_out,
-                out_len as u32,
-            )
+        // Finish: multi-step until STREAM_END / budget / hard error / stall.
+        // NoFlush: single isal_inflate (unchanged streaming contract).
+        let step = if matches!(flush, InflateFlush::Finish) {
+            // SAFETY: next_out points at `out_len` bytes of uniquely owned spare
+            // capacity; finish_drive initializes at most `step.produced` of them.
+            unsafe { Self::finish_drive(&mut self.state, input, next_out, out_len) }
+        } else {
+            let in_len = input.len().min(u32::MAX as usize);
+            let next_in = if in_len == 0 {
+                std::ptr::null_mut()
+            } else {
+                input.as_ptr().cast_mut()
+            };
+            // SAFETY: next_in/out cover live slices of the stated lengths.
+            let (ret, consumed, produced) = unsafe {
+                Self::run_inflate(
+                    &mut self.state,
+                    next_in,
+                    in_len as u32,
+                    next_out,
+                    out_len as u32,
+                )
+            };
+            debug_assert!(produced <= out_len);
+            Self::step_from_result(ret, &mut self.state, consumed, produced)
         };
-        debug_assert!(produced <= out_len);
-        // SAFETY: isal_inflate initialized `produced` bytes of spare capacity.
+        debug_assert!(step.produced <= out_len);
+        // SAFETY: isal_inflate initialized `step.produced` bytes of spare capacity.
         unsafe {
-            output.set_len(start_len + produced);
+            output.set_len(start_len + step.produced);
         }
-        Ok(Self::step_from_result(
-            ret,
-            &mut self.state,
-            consumed,
-            produced,
-        ))
+        Ok(step)
     }
 
     fn inflate_into_slice(
@@ -374,7 +471,8 @@ impl InflateBackend for IsalInflater {
                 .ensure_block_zlib()?
                 .inflate_into_slice(input, output, flush);
         }
-        if output.is_empty() {
+        let out_len = output.len().min(u32::MAX as usize);
+        if out_len == 0 {
             return Ok(InflateStep {
                 status: status::BUF_ERROR,
                 consumed: 0,
@@ -384,8 +482,17 @@ impl InflateBackend for IsalInflater {
                 last_block: false,
             });
         }
+
+        // Finish: multi-step until STREAM_END / out full / hard error / stall.
+        // NoFlush: single isal_inflate (unchanged streaming contract).
+        if matches!(flush, InflateFlush::Finish) {
+            // SAFETY: output is a uniquely owned slice of length >= out_len.
+            return Ok(unsafe {
+                Self::finish_drive(&mut self.state, input, output.as_mut_ptr(), out_len)
+            });
+        }
+
         let in_len = input.len().min(u32::MAX as usize);
-        let out_len = output.len().min(u32::MAX as usize);
         let next_in = if in_len == 0 {
             std::ptr::null_mut()
         } else {
@@ -736,5 +843,123 @@ mod tests {
         assert!(saw_non_end, "expected at least one non-STREAM_END step");
         assert_eq!(all, payload);
         assert_eq!(consumed_total, input.len());
+    }
+
+    /// Final stored block with `n` payload bytes (raw DEFLATE).
+    fn large_stored_block(n: usize) -> (Vec<u8>, Vec<u8>) {
+        assert!(n <= u16::MAX as usize);
+        let payload: Vec<u8> = (0..n as u32).map(|i| (i % 251) as u8).collect();
+        let mut input = Vec::new();
+        input.push(1); // BFINAL stored
+        let len = payload.len() as u16;
+        input.extend_from_slice(&len.to_le_bytes());
+        input.extend_from_slice(&(!len).to_le_bytes());
+        input.extend_from_slice(&payload);
+        (input, payload)
+    }
+
+    #[test]
+    fn finish_large_stored_one_call_streams_end() {
+        // BGZF-style: one Finish call with full spare must reach STREAM_END
+        // even when ISA-L would need multiple isal_inflate to drain tmp_out.
+        let (input, payload) = large_stored_block(8600);
+        let mut inf = IsalInflater::create().unwrap();
+        let mut out = Vec::with_capacity(9000);
+        let step = inf
+            .inflate_capped(&input, &mut out, InflateFlush::Finish, 9000)
+            .unwrap();
+        assert_eq!(step.status, status::STREAM_END, "status={}", step.status);
+        assert_eq!(step.produced, payload.len());
+        assert_eq!(step.consumed, input.len());
+        assert_eq!(out, payload);
+        // Finish path must not allocate the Block zlib-rs fallback.
+        assert!(inf.block_zlib.is_none());
+    }
+
+    #[test]
+    fn finish_honors_max_produce_then_completes() {
+        // max_produce is a hard cap per public call even under Finish.
+        // First call may return OK with a partial produce; a second Finish
+        // call with remaining budget must reach STREAM_END.
+        let (input, payload) = large_stored_block(8600);
+        let mut inf = IsalInflater::create().unwrap();
+        let mut out = Vec::with_capacity(9000);
+
+        let step1 = inf
+            .inflate_capped(&input, &mut out, InflateFlush::Finish, 4096)
+            .unwrap();
+        assert!(
+            step1.status == status::OK || step1.status == status::BUF_ERROR,
+            "partial Finish status={}",
+            step1.status
+        );
+        assert_eq!(step1.produced, 4096);
+        assert_eq!(out.len(), 4096);
+        assert_eq!(&out[..], &payload[..4096]);
+
+        let step2 = inf
+            .inflate_capped(
+                &input[step1.consumed..],
+                &mut out,
+                InflateFlush::Finish,
+                9000,
+            )
+            .unwrap();
+        assert_eq!(step2.status, status::STREAM_END, "status={}", step2.status);
+        assert_eq!(step1.consumed + step2.consumed, input.len());
+        assert_eq!(step1.produced + step2.produced, payload.len());
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn finish_into_slice_large_stored_one_call() {
+        let (input, payload) = large_stored_block(8600);
+        let mut inf = IsalInflater::create().unwrap();
+        let mut buf = vec![0u8; 9000];
+        let step = inf
+            .inflate_into_slice(&input, &mut buf, InflateFlush::Finish)
+            .unwrap();
+        assert_eq!(step.status, status::STREAM_END, "status={}", step.status);
+        assert_eq!(step.produced, payload.len());
+        assert_eq!(step.consumed, input.len());
+        assert_eq!(&buf[..step.produced], payload.as_slice());
+    }
+
+    #[test]
+    fn noflush_does_not_loop_past_first_isal_step() {
+        // NoFlush stays single-step: with a produce cap that fits ISA-L's first
+        // fill of a large stored block, one public call must not invent extra
+        // progress beyond what one isal_inflate produced (Finish multi-steps).
+        let (input, payload) = large_stored_block(8600);
+        let mut noflush = IsalInflater::create().unwrap();
+        let mut out_nf = Vec::with_capacity(9000);
+        let step_nf = noflush
+            .inflate_capped(&input, &mut out_nf, InflateFlush::NoFlush, 9000)
+            .unwrap();
+
+        // Fresh inflater, Finish with same budget must fully complete.
+        let mut finish = IsalInflater::create().unwrap();
+        let mut out_f = Vec::with_capacity(9000);
+        let step_f = finish
+            .inflate_capped(&input, &mut out_f, InflateFlush::Finish, 9000)
+            .unwrap();
+        assert_eq!(step_f.status, status::STREAM_END);
+        assert_eq!(out_f, payload);
+
+        // If NoFlush already reached STREAM_END, both paths agree.
+        // Otherwise Finish produced strictly more by multi-stepping tmp_out.
+        if step_nf.status == status::STREAM_END {
+            assert_eq!(out_nf, payload);
+            assert_eq!(step_nf.consumed, input.len());
+        } else {
+            assert_eq!(step_nf.status, status::OK, "status={}", step_nf.status);
+            assert!(
+                step_nf.produced < payload.len(),
+                "NoFlush partial produce={}, payload={}",
+                step_nf.produced,
+                payload.len()
+            );
+            assert!(step_f.produced > step_nf.produced);
+        }
     }
 }

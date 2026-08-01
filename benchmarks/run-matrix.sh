@@ -147,6 +147,23 @@ cpp_binary_has_isal() {
     return 1
 }
 
+# Rust CLI: label ISA-L builds distinctly (binary text and/or DT_NEEDED via ldd).
+rust_binary_has_isal() {
+    local bin=$1
+    if [[ -f "$bin" ]] && grep -aqiE 'isal_|libisal' "$bin" 2>/dev/null; then
+        return 0
+    fi
+    if command -v ldd > /dev/null 2>&1 && ldd "$bin" 2>/dev/null | grep -aqiE 'libisal'; then
+        return 0
+    fi
+    return 1
+}
+
+rust_tool=rapidgzip-rust
+if [[ "${SKIP_RUST:-0}" != 1 ]] && is_available "$rust_binary" && rust_binary_has_isal "$rust_binary"; then
+    rust_tool=rapidgzip-rust-isal
+fi
+
 # Auto-detect C++ rapidgzip when no explicit CPP env vars are set.
 # Prefer labeling PyPI/source builds with ISA-L as RAPIDGZIP_CPP_ISAL when
 # only one binary is available (fair headline competitor).
@@ -442,11 +459,11 @@ for input in "${inputs[@]}"; do
             if [[ "${SKIP_RUST:-0}" != 1 ]]; then
                 case "$mode" in
                     verify)
-                        benchmark_one "$corpus" rapidgzip-rust "$threads" "$run" "$decoded_bytes" \
+                        benchmark_one "$corpus" "$rust_tool" "$threads" "$run" "$decoded_bytes" \
                             "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -t "$input" >> "$raw_tsv"
                         ;;
                     stdout)
-                        benchmark_one "$corpus" rapidgzip-rust "$threads" "$run" "$decoded_bytes" \
+                        benchmark_one "$corpus" "$rust_tool" "$threads" "$run" "$decoded_bytes" \
                             "$rust_binary" -P "$threads" --chunk-size "$chunk_size_kib" -c "$input" >> "$raw_tsv"
                         ;;
                 esac

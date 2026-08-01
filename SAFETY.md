@@ -38,8 +38,15 @@ indexed_decode paths use the trait surface only.
 With the optional **`isal`** feature, `ActiveInflater` is `IsalInflater`
 (`isal_backend.rs`): raw inflate goes through `isal_inflate` /
 `isal_inflate_init` / `reset` / `set_dict` (system or prefix `libisal` via
-`isal-sys`). `InflateFlush::Block` still uses an internal zlib-rs
-`RawInflater`. Default builds without `isal` link only zlib-rs.
+`isal-sys`). `InflateFlush::Block` still uses a **lazy** internal zlib-rs
+`RawInflater` (allocated only on first Block; prime/dictionary are stashed
+until then so pure NoFlush seek paths never create it). `InflateFlush::Finish`
+may invoke `isal_inflate` multiple times within one public
+`inflate_capped` / `inflate_into_slice` call (draining `tmp_out` after
+`INPUT_DONE`) while still writing only into the caller's spare capacity or
+fixed slice and extending length by the aggregated produced count.
+`NoFlush` remains a single `isal_inflate`. Default builds without `isal`
+link only zlib-rs.
 
 - `inflateInit2_` receives a live, uniquely borrowed `z_stream`, the matching
   Rust structure size, zlib-rs's static version string, and raw-window value
