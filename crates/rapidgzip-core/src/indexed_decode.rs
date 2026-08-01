@@ -15,7 +15,9 @@ use crate::backend::{Output, prepare_inflater_at_bit_offset};
 use crate::config::Config;
 use crate::gzip::{SourceCursor, parse_member_header};
 use crate::index::{GzipIndex, INDEXED_GZIP_WINDOW_SIZE, IndexError, StoredWindow};
-use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateFlush, status as inflate_status};
+use crate::inflate_backend::{
+    ActiveInflater, InflateBackend, InflateFlush, status as inflate_status,
+};
 use crate::parallel::Window;
 use crate::{DecodeError, DecodeReport, DeflateErrorKind, ReadAt};
 use crossbeam_deque::{Injector, Steal};
@@ -270,8 +272,9 @@ fn inflate_segment<R: ReadAt + ?Sized>(
         })?
     };
 
-    let (mut inflater, mut compressed_byte) =
-        prepare_inflater_at_bit_offset::<ActiveInflater, _>(start_bit, &window, source, page_size, true)?;
+    let (mut inflater, mut compressed_byte) = prepare_inflater_at_bit_offset::<ActiveInflater, _>(
+        start_bit, &window, source, page_size, true,
+    )?;
 
     let exact = need;
     let mut out: Vec<u8> = match exact {

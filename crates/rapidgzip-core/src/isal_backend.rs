@@ -93,8 +93,8 @@ impl IsalInflater {
         let at_block_end = state.block_state == isal_block_state_ISAL_BLOCK_NEW_HDR
             || state.block_state == isal_block_state_ISAL_BLOCK_FINISH
             || state.bfinal != 0;
-        let last_block = state.bfinal != 0
-            || state.block_state == isal_block_state_ISAL_BLOCK_FINISH;
+        let last_block =
+            state.bfinal != 0 || state.block_state == isal_block_state_ISAL_BLOCK_FINISH;
         (at_block_end, last_block)
     }
 
@@ -293,7 +293,12 @@ impl InflateBackend for IsalInflater {
         unsafe {
             output.set_len(start_len + produced);
         }
-        Ok(Self::step_from_result(ret, &mut self.state, consumed, produced))
+        Ok(Self::step_from_result(
+            ret,
+            &mut self.state,
+            consumed,
+            produced,
+        ))
     }
 
     fn inflate_into_slice(
@@ -332,7 +337,12 @@ impl InflateBackend for IsalInflater {
                 out_len as u32,
             )
         };
-        Ok(Self::step_from_result(ret, &mut self.state, consumed, produced))
+        Ok(Self::step_from_result(
+            ret,
+            &mut self.state,
+            consumed,
+            produced,
+        ))
     }
 
     fn message(&self) -> Option<String> {
@@ -507,5 +517,3 @@ mod tests {
         assert_eq!(consumed_total, input.len());
     }
 }
-
-

@@ -12,7 +12,9 @@ use crate::config::{Config, Format};
 use crate::crc32::Crc32;
 use crate::gzip::MemberHeader;
 use crate::index::IndexBuilder;
-use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateFlush, status as inflate_status};
+use crate::inflate_backend::{
+    ActiveInflater, InflateBackend, InflateFlush, status as inflate_status,
+};
 use crate::zlib::{Adler32, ZlibHeader, is_zlib_cmf_flg};
 use crate::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ZlibErrorKind};
 use std::io::{self, BufRead, BufReader, Read, Write};

@@ -26,7 +26,9 @@ use crate::gzip::{SourceCursor, parse_member_header};
 use crate::index::{
     GzipIndex, INDEXED_GZIP_WINDOW_SIZE, IndexError, StoredWindow, WindowCompression,
 };
-use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateFlush, status as inflate_status};
+use crate::inflate_backend::{
+    ActiveInflater, InflateBackend, InflateFlush, status as inflate_status,
+};
 use crate::parallel::Window;
 use crate::{DecodeError, DeflateErrorKind, ReadAt};
 use std::cmp::min;
@@ -1491,8 +1493,9 @@ fn decode_window_independent<R: ReadAt + ?Sized>(
     }
 
     let window = window_from_stored_cached(index.window_for(start_bit), start_bit, expand_cache)?;
-    let (mut inflater, mut compressed_byte) =
-        prepare_inflater_at_bit_offset::<ActiveInflater, _>(start_bit, &window, source, page_size, true)?;
+    let (mut inflater, mut compressed_byte) = prepare_inflater_at_bit_offset::<ActiveInflater, _>(
+        start_bit, &window, source, page_size, true,
+    )?;
 
     let mut uncompressed_pos = checkpoint_u;
 

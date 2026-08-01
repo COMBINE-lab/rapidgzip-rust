@@ -3,7 +3,9 @@ use crate::config::{Config, Format};
 use crate::crc32::Crc32;
 use crate::gzip::{MemberHeader, SourceCursor, parse_member_header};
 use crate::index::IndexBuilder;
-use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateFlush, status as inflate_status};
+use crate::inflate_backend::{
+    ActiveInflater, InflateBackend, InflateFlush, status as inflate_status,
+};
 use crate::parallel::adaptive::AdaptiveConcurrency;
 use crate::parallel::deflate::{
     ChunkOutput, Error as NativeError, InitialHistory, ResolvedParts, decode_to_estimated_boundary,
@@ -208,7 +210,6 @@ impl RawInflater {
             })
         }
     }
-
 }
 
 /// Prepares an [`InflateBackend`] at an absolute compressed bit offset with history.
@@ -681,7 +682,9 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    decode_zlib_sequential_from_with::<R, O, ActiveInflater>(source, config, cancelled, output, state)
+    decode_zlib_sequential_from_with::<R, O, ActiveInflater>(
+        source, config, cancelled, output, state,
+    )
 }
 
 /// Generic sequential zlib path over [`InflateBackend`].

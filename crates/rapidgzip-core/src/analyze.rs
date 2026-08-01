@@ -464,8 +464,12 @@ fn analyze_raw_deflate<R: ReadAt + ?Sized>(
     let deflate_start = cursor.position();
     debug_assert_eq!(deflate_start, 0);
 
-    let walk =
-        walk_deflate_blocks::<_, _, crate::inflate_backend::ActiveInflater>(source, &mut cursor, deflate_start, |_| Ok(()))?;
+    let walk = walk_deflate_blocks::<_, _, crate::inflate_backend::ActiveInflater>(
+        source,
+        &mut cursor,
+        deflate_start,
+        |_| Ok(()),
+    )?;
 
     // Single stream must consume the entire source (no trailer, no concat).
     if !cursor.at_end() {
@@ -507,13 +511,17 @@ fn analyze_gzip_member<R: ReadAt + ?Sized>(
     debug_assert_eq!(header.deflate_start, cursor.position());
 
     let mut crc = Crc32::new();
-    let walk =
-        walk_deflate_blocks::<_, _, crate::inflate_backend::ActiveInflater>(source, cursor, header.deflate_start, |chunk| {
+    let walk = walk_deflate_blocks::<_, _, crate::inflate_backend::ActiveInflater>(
+        source,
+        cursor,
+        header.deflate_start,
+        |chunk| {
             if crc32_enabled {
                 crc.update(chunk);
             }
             Ok(())
-        })?;
+        },
+    )?;
 
     let footer_offset = cursor.position();
     let footer = cursor.read_exact::<8>(footer_offset)?;
@@ -567,13 +575,17 @@ fn analyze_zlib_stream<R: ReadAt + ?Sized>(
     debug_assert_eq!(header.deflate_start, cursor.position());
 
     let mut adler = Adler32::new();
-    let walk =
-        walk_deflate_blocks::<_, _, crate::inflate_backend::ActiveInflater>(source, cursor, header.deflate_start, |chunk| {
+    let walk = walk_deflate_blocks::<_, _, crate::inflate_backend::ActiveInflater>(
+        source,
+        cursor,
+        header.deflate_start,
+        |chunk| {
             if crc32_enabled {
                 adler.update(chunk);
             }
             Ok(())
-        })?;
+        },
+    )?;
 
     // Adler-32 trailer is four big-endian bytes (RFC 1950).
     let footer_offset = cursor.position();
