@@ -136,6 +136,16 @@ where
 {
     let format = resolve_source_format(source, config)?;
     if format != Format::Gzip {
+        // A zlib or raw stream is one DEFLATE stream, which is exactly what
+        // the estimated grid splits. Neither can be BGZF or multi-member, so
+        // the member probes are skipped.
+        if config.decoder_threads > 1 {
+            let grid_size = adjusted_compressed_chunk_size(source, config)?;
+            runtime.set_path(DecoderPath::MarkerWindow);
+            return decode_rapidgzip_estimated(
+                source, config, cancelled, output, grid_size, format, runtime,
+            );
+        }
         runtime.set_path(DecoderPath::Sequential);
         runtime.set_adaptive_target(1);
         let mut cursor = SourceCursor::new(source, config.input_page_size)?;
@@ -175,7 +185,15 @@ where
         }
         let grid_size = adjusted_compressed_chunk_size(source, config)?;
         runtime.set_path(DecoderPath::MarkerWindow);
-        return decode_rapidgzip_estimated(source, config, cancelled, output, grid_size, runtime);
+        return decode_rapidgzip_estimated(
+            source,
+            config,
+            cancelled,
+            output,
+            grid_size,
+            Format::Gzip,
+            runtime,
+        );
     }
     runtime.set_path(DecoderPath::Sequential);
     runtime.set_adaptive_target(1);
@@ -2021,6 +2039,8 @@ fn read_range_reuse<R: ReadAt + ?Sized>(
 struct MemberAccounting {
     crc: Crc32,
     size: u32,
+    /// Running Adler-32, kept only for zlib framing.
+    adler: Option<crate::zlib::Adler32>,
 }
 
 impl MemberAccounting {
@@ -2028,6 +2048,28 @@ impl MemberAccounting {
         Self {
             crc: Crc32::new(),
             size: 0,
+            adler: None,
+        }
+    }
+
+    /// Returns accounting for `format`, which decides which checksum runs.
+    const fn for_format(format: Format) -> Self {
+        Self {
+            crc: Crc32::new(),
+            size: 0,
+            adler: match format {
+                Format::Zlib => Some(crate::zlib::Adler32::new()),
+                _ => None,
+            },
+        }
+    }
+
+    fn update(&mut self, decoded: &[u8]) {
+        self.size = self.size.wrapping_add(decoded.len() as u32);
+        if let Some(adler) = self.adler.as_mut() {
+            adler.update(decoded);
+        } else {
+            self.crc.update(decoded);
         }
     }
 }
@@ -2051,8 +2093,7 @@ fn emit_accounted<O: Output>(
         });
     }
     *total_output = next_total;
-    accounting.size = accounting.size.wrapping_add(decoded.len() as u32);
-    accounting.crc.update(&decoded);
+    accounting.update(&decoded);
     if !decoded.is_empty() {
         output.emit(decoded)?;
     }
@@ -2838,12 +2879,73 @@ fn validate_footer<R: ReadAt + ?Sized>(
     unreachable!("a matching footer would have returned from the search")
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Verifies the end of a zlib or raw DEFLATE stream decoded in parallel.
+///
+/// `stream_end` is the byte offset just past the DEFLATE data. zlib reads and
+/// checks its Adler-32 trailer there; raw DEFLATE has nothing to read. Both
+/// refuse trailing bytes, and raw DEFLATE checks a caller-supplied size.
+fn finish_single_stream<R: ReadAt + ?Sized>(
+    cursor: &mut SourceCursor<'_, R>,
+    stream_end: u64,
+    format: Format,
+    accounting: &MemberAccounting,
+    config: &Config,
+    total_output: u64,
+) -> Result<(), DecodeError> {
+    cursor.seek(stream_end)?;
+    if format == Format::Zlib {
+        let trailer = cursor
+            .read_exact::<4>(stream_end)
+            .map_err(|_| DecodeError::InvalidZlib {
+                offset: stream_end,
+                reason: crate::ZlibErrorKind::Truncated,
+            })?;
+        let actual = accounting
+            .adler
+            .expect("zlib framing keeps an Adler-32")
+            .finish();
+        crate::zlib::verify_trailer(trailer, actual).map_err(|error| match error {
+            DecodeError::InvalidZlib { reason, .. } => DecodeError::InvalidZlib {
+                offset: stream_end,
+                reason,
+            },
+            other => other,
+        })?;
+    }
+
+    if cursor.position() != cursor.length() {
+        return Err(match format {
+            Format::Zlib => DecodeError::InvalidZlib {
+                offset: cursor.position(),
+                reason: crate::ZlibErrorKind::TrailingGarbage,
+            },
+            _ => DecodeError::InvalidDeflate {
+                bit_offset: cursor.position().saturating_mul(8),
+                reason: DeflateErrorKind::TrailingGarbage,
+            },
+        });
+    }
+
+    if let Some(expected) = config.expected_uncompressed_size {
+        if expected != total_output {
+            return Err(DecodeError::UnexpectedOutputSize {
+                expected,
+                actual: total_output,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn decode_rapidgzip_estimated<R, O>(
     source: &R,
     config: &Config,
     cancelled: &AtomicBool,
     output: &mut O,
     compressed_chunk_size: usize,
+    format: Format,
     runtime: &Arc<RuntimeState>,
 ) -> Result<DecodeReport, DecodeError>
 where
@@ -2862,20 +2964,46 @@ where
             member_count: 0,
             decoder_threads: config.decoder_threads,
             index: None,
-            format: Format::Gzip,
+            format,
         });
     }
 
-    let first_header = parse_member_header(&mut frame_cursor, true)?;
+    // Where the DEFLATE data starts, and where a resume point may be offered,
+    // is all the framing this path needs before the grid is laid out.
+    let (stream_start, first_deflate_byte) = match format {
+        Format::Zlib => {
+            let header = frame_cursor
+                .read_exact::<2>(0)
+                .map_err(|_| DecodeError::InvalidZlib {
+                    offset: 0,
+                    reason: crate::ZlibErrorKind::Truncated,
+                })?;
+            crate::zlib::validate_header(header[0], header[1], 0)?;
+            (0, 2)
+        }
+        Format::RawDeflate => (0, 0),
+        _ => {
+            let first_header = parse_member_header(&mut frame_cursor, true)?;
+            (first_header.start, first_header.deflate_start)
+        }
+    };
+    // gzip records the member header, whose start a reader detects and skips.
+    // zlib and raw DEFLATE record the DEFLATE start instead, which is what
+    // indexed_gzip does and what a reader can resume from directly.
+    let checkpoint_start = if format == Format::Gzip {
+        stream_start
+    } else {
+        first_deflate_byte
+    };
     runtime.offer_checkpoint(
         Checkpoint {
-            compressed_offset_in_bits: first_header.start.saturating_mul(8),
+            compressed_offset_in_bits: checkpoint_start.saturating_mul(8),
             uncompressed_offset_in_bytes: 0,
             line_offset: 0,
         },
         &[],
     );
-    let first_deflate_bit = first_header.deflate_start.saturating_mul(8);
+    let first_deflate_bit = first_deflate_byte.saturating_mul(8);
     let length_bits = frame_cursor.length().saturating_mul(8);
     let spacing_bits = (compressed_chunk_size as u64).saturating_mul(8);
     let task_count = usize::try_from(
@@ -2969,7 +3097,7 @@ where
         let mut live_workers = vec![false; worker_pool_count];
 
         let mut window = Window::empty();
-        let mut accounting = MemberAccounting::new();
+        let mut accounting = MemberAccounting::for_format(format);
         let mut footer_offset = None;
         let mut bridge_compressed = Vec::new();
 
@@ -3020,6 +3148,19 @@ where
                     &mut accounting,
                     &mut total_output,
                 )?;
+                if format != Format::Gzip {
+                    finish_single_stream(
+                        &mut frame_cursor,
+                        offset,
+                        format,
+                        &accounting,
+                        config,
+                        total_output,
+                    )?;
+                    member_count = 1;
+                    runtime.set_member_count(member_count);
+                    break 'decode;
+                }
                 let actual_footer =
                     validate_footer(&mut frame_cursor, offset, member_count, &accounting)?;
                 member_count += 1;
@@ -3298,7 +3439,7 @@ where
         member_count,
         decoder_threads: config.decoder_threads,
         index: None,
-        format: Format::Gzip,
+        format,
     })
 }
 

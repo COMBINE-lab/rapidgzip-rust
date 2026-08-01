@@ -27,13 +27,13 @@
   detection and dispatch in `decode_source` and `decode_stream`.
   Verify: detection matrix and explicit-format mismatch tests.
 
-- [ ] **4. Parallel decode through the estimated grid**
+- [x] **4. Parallel decode through the estimated grid**
   zlib and raw DEFLATE enter `decode_rapidgzip_estimated`, starting at the
   format's DEFLATE offset and verifying the format's trailer at the end
   instead of a gzip footer.
   Verify: parallel output equals sequential output on the same corpora.
 
-- [ ] **5. Indexing coverage**
+- [x] **5. Indexing coverage**
   Confirm `build_index` produces interior checkpoints for zlib and raw, and
   that `IndexedReader` seeks into both.
   Verify: index and seek tests for the two formats.

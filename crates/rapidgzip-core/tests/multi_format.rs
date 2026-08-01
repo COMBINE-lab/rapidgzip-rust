@@ -323,3 +323,141 @@ fn an_owned_reader_decodes_zlib() {
     assert_eq!(output, plain);
     assert_eq!(reader.finish().expect("report").format, Format::Zlib);
 }
+
+/// Decodes with a worker budget that forces the parallel path.
+fn decode_parallel(compressed: &[u8], format: Format) -> (Vec<u8>, rapidgzip_core::DecodeReport) {
+    let decoder = Decoder::builder()
+        .format(format)
+        .decoder_threads(4)
+        .build()
+        .expect("builder");
+    let mut output = Vec::new();
+    let report = decoder
+        .decode(&compressed.to_vec(), &mut output)
+        .expect("parallel decode");
+    (output, report)
+}
+
+#[test]
+fn the_parallel_path_matches_the_sequential_one() {
+    let plain = corpus(24 * 1024 * 1024);
+
+    for (compressed, format) in [
+        (zlib(&plain, 6), Format::Zlib),
+        (raw_deflate(&plain, 6), Format::RawDeflate),
+    ] {
+        let (sequential, sequential_report) = decode(&compressed, format).expect("sequential");
+        let (parallel, parallel_report) = decode_parallel(&compressed, format);
+
+        assert_eq!(sequential, plain, "sequential output for {format}");
+        assert_eq!(parallel, plain, "parallel output for {format}");
+        assert_eq!(
+            parallel_report.decompressed_bytes,
+            sequential_report.decompressed_bytes
+        );
+        assert_eq!(
+            parallel_report.compressed_bytes,
+            sequential_report.compressed_bytes
+        );
+        assert_eq!(parallel_report.format, format);
+    }
+}
+
+#[test]
+fn the_parallel_path_still_verifies_the_adler32() {
+    let plain = corpus(24 * 1024 * 1024);
+    let mut compressed = zlib(&plain, 6);
+    let last = compressed.len() - 1;
+    compressed[last] ^= 0xff;
+
+    let decoder = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(4)
+        .build()
+        .expect("builder");
+    let error = decoder
+        .decode(&compressed, &mut Vec::new())
+        .expect_err("rejected");
+    assert!(
+        matches!(
+            error,
+            DecodeError::InvalidZlib {
+                reason: ZlibErrorKind::ChecksumMismatch { .. },
+                ..
+            }
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_parallel_path_rejects_trailing_bytes() {
+    let plain = corpus(24 * 1024 * 1024);
+    let mut compressed = zlib(&plain, 6);
+    compressed.extend_from_slice(b"extra");
+
+    let decoder = Decoder::builder()
+        .format(Format::Zlib)
+        .decoder_threads(4)
+        .build()
+        .expect("builder");
+    let error = decoder
+        .decode(&compressed, &mut Vec::new())
+        .expect_err("rejected");
+    assert!(
+        matches!(
+            error,
+            DecodeError::InvalidZlib {
+                reason: ZlibErrorKind::TrailingGarbage,
+                ..
+            }
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_index_is_built_and_seekable_for_both_formats() {
+    use rapidgzip_core::IndexedReader;
+    use std::io::{Seek, SeekFrom};
+
+    let plain = corpus(24 * 1024 * 1024);
+
+    for (compressed, format) in [
+        (zlib(&plain, 6), Format::Zlib),
+        (raw_deflate(&plain, 6), Format::RawDeflate),
+    ] {
+        let decoder = Decoder::builder()
+            .format(format)
+            .decoder_threads(4)
+            .build_index(true)
+            .build()
+            .expect("builder");
+        let mut reader = decoder.reader(compressed.clone()).expect("reader");
+        std::io::copy(&mut reader, &mut std::io::sink()).expect("decode");
+        let index = reader
+            .finish()
+            .expect("report")
+            .index
+            .expect("index was requested");
+
+        index.validate().expect("invariants hold");
+        assert!(
+            index.checkpoint_count() >= 3,
+            "{format} produced only {} checkpoints",
+            index.checkpoint_count()
+        );
+
+        let mut random = IndexedReader::new(compressed, index).expect("indexed reader");
+        for target in [0usize, 1000, 9_000_000, 20_000_000] {
+            random.seek(SeekFrom::Start(target as u64)).expect("seek");
+            let mut buffer = vec![0u8; 2048];
+            random.read_exact(&mut buffer).expect("read");
+            assert_eq!(
+                buffer,
+                &plain[target..target + 2048],
+                "{format} at {target}"
+            );
+        }
+    }
+}
