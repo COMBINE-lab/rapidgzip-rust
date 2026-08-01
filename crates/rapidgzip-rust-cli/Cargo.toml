@@ -15,6 +15,11 @@ categories = ["compression", "command-line-utilities"]
 name = "rapidgzip-rust"
 path = "src/main.rs"
 
+[features]
+default = []
+# Faster single-thread inflate via ISA-L (requires system/prefix libisal).
+isal = ["rapidgzip-core/isal"]
+
 [dependencies]
 clap.workspace = true
 rapidgzip-core.workspace = true

@@ -7,12 +7,12 @@
 //! (parallel gzip / multi-stream or marker zlib / marker raw DEFLATE when each
 //! format’s thread and size gates allow).
 
-use crate::backend::{DirectOutput, Output, RawInflater, decode_source};
+use crate::backend::{DirectOutput, Output, decode_source};
 use crate::config::{Config, Format};
 use crate::crc32::Crc32;
 use crate::gzip::MemberHeader;
 use crate::index::IndexBuilder;
-use crate::inflate_backend::{InflateBackend, InflateFlush, status as inflate_status};
+use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateFlush, status as inflate_status};
 use crate::zlib::{Adler32, ZlibHeader, is_zlib_cmf_flg};
 use crate::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ZlibErrorKind};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -517,7 +517,7 @@ where
     };
     // Reuse one raw-inflate stream across concatenated gzip members. Each member
     // starts with an empty window; `reset` clears history.
-    let mut inflater = <RawInflater as InflateBackend>::create()?;
+    let mut inflater = <ActiveInflater as InflateBackend>::create()?;
 
     while !cursor.at_end()? {
         let header = parse_member_header(cursor, member_count == 0)?;
@@ -607,7 +607,7 @@ where
     };
     // Reuse one raw-inflate stream across concatenated zlib members. Each member
     // starts with an empty window; `reset` clears history.
-    let mut inflater = <RawInflater as InflateBackend>::create()?;
+    let mut inflater = <ActiveInflater as InflateBackend>::create()?;
 
     while !cursor.at_end()? {
         let header = parse_zlib_header(cursor, member_count == 0)?;
@@ -704,7 +704,7 @@ where
 
     let mut index_builder = new_index_builder(config);
     let mut total_output = 0_u64;
-    let mut inflater = <RawInflater as InflateBackend>::create()?;
+    let mut inflater = <ActiveInflater as InflateBackend>::create()?;
     let mut member_output = 0_u32;
     let verify_external_crc = !config.raw_crc32_list.is_empty();
     let mut external_crc = Crc32::new();

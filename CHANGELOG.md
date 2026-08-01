@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-01
+
+### Added
+
+- Optional **`isal`** feature on `rapidgzip-core` and `rapidgzip-rust-cli`:
+  sequential inflate uses Intel ISA-L (`IsalInflater` as `ActiveInflater`) for
+  a faster single-thread path when a shared `libisal` is available.
+  - Default builds remain **zlib-rs** only (no system library required).
+  - Build: install `libisal-dev` (or a prefix with `lib/libisal.so`) and set
+    `ISAL_INSTALL_PREFIX` if needed; runtime may need `LD_LIBRARY_PATH`.
+  - `InflateFlush::Block` (keep_index / analyze) still uses zlib-rs inside the
+    ISA-L backend (ISA-L has no zlib-compatible `Z_BLOCK` contract).
+  - Prefetch / `tmp_out` drain quirks mapped to zlib-compatible consume and
+    `STREAM_END` semantics (refund at `INPUT_DONE`/`FINISH`; only `FINISH` is
+    stream end).
+- Fair re-bench snapshot vs C++ rapidgzip 0.16 ISA-L with Rust `--features isal`
+  ([benchmarks/RESULTS-SNAPSHOT.md](benchmarks/RESULTS-SNAPSHOT.md)): P=1 thrpt
+  geometric mean about **1.35×** vs C++ on the synthetic fair corpora; P=1 RSS
+  remains far lower than the C++ Python entrypoint.
+
+### Known residual
+
+- Without `isal`, P=1 and small / low-thread marker budgets stay zlib-rs-limited.
+- **No compression** (decoder-only).
+- Random-access indexes remain **gzip/BGZF-oriented** (not raw DEFLATE).
+
 ## [0.2.0] - 2026-08-01
 
 First **feature-complete** release of `rapidgzip-core` and `rapidgzip-rust-cli`.
@@ -77,20 +103,11 @@ relative to that stub: dependents must use `0.2` (or path/git), not
   resolution no longer collide with the incomplete crates.io **0.1.0** stub
   when packaging `rapidgzip-rust-cli`.
 
-### Known residual
+### Known residual (as of 0.2.0)
 
 Architectural / product gaps **not** shipped in 0.2.0:
 
-- **No real ISA-L** (or other second inflate backend); inflate is **zlib-rs**
-  only. That is the remaining **architectural** inflate gap. A crate-private
-  `InflateBackend` trait already covers sequential gzip/zlib/raw,
-  `stream_decode`, `--analyze` (`Block` flush), BGZF `Finish`, independent-
-  member workers (`inflate_capped`), multi-stream zlib index/workers,
-  estimated-path residual continue / `inflate_tail` (`inflate_capped`), and
-  seek / indexed_decode via `inflate_into_slice`. Unsafe `z::inflate` is
-  confined to `inflate_backend.rs`; lifecycle ABI to `RawInflater` (see
-  [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md) coverage table and
-  [ARCHITECTURE.md](ARCHITECTURE.md) / [SAFETY.md](SAFETY.md)).
+- **No ISA-L** in this tag (added optionally in **0.2.1**); inflate is zlib-rs.
 - **P=1** and small / low-thread marker budgets remain zlib-rs-limited (ordinary
   single-member gzip, single-stream zlib, and raw stay sequential for
   `decoder_threads` 1–3 and for streams below ~2× grid amortization).

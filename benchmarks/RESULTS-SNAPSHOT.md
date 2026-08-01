@@ -1,34 +1,23 @@
-# Fair benchmark snapshot (2026-08-01, post parallel zlib/raw)
-
-## What “fairer C++” means here
-
-| Lever | Before (misleading) | After (this snapshot) |
-|-------|---------------------|------------------------|
-| C++ version | 0.15.2 ad-hoc venv | **0.16.0** (`uv` venv `target/bench-venv`) |
-| Backend | mislabeled zlib-ng | Wheel **embeds ISA-L** (symbols in `.so`); harness labels `rapidgzip-cpp-isal` |
-| Verify | mixed / unclear | Both: CRC on (`-t` / `-t --verify`), same sink |
-| Chunk size | defaults only | Both pinned **`--chunk-size 4096`** (KiB) |
-| Corpus size | ~4 MiB uncompressed | **32 MiB** (plus **64 MiB** large-single) |
-| Timing TSV | broken `\t` in `/usr/bin/time -f` | Fixed (`%U %S %M` + parse) |
-| Affinity | none | Full `taskset` over all `nproc` CPUs |
-| C++ 0.16 stdout/index/stdin | missing `-d` (instant fail timed as “fast”) | **`-d --verify -c -f`**; stdin without literal `-`; failed runs **dropped** |
-| ISA-L detect | `strings\|grep -q` under `pipefail` hid matches | `grep -a` on the `.so` |
-
-**Still not equalized:** inflate library (ISA-L/C++ vs zlib-rs/Rust) and C++ Python entrypoint RSS baseline. Those are intentional product / packaging differences; report them, do not hide them.
+# Fair benchmark snapshot (2026-08-01, Rust ISA-L feature)
 
 ## Method
 
-- Host: local Linux x86_64 (ThinkPad), `nproc=12`, `TASKSET=0-11`
-- Date: **2026-08-01** (UTC re-run after parallel zlib/raw + perf work)
-- Rust: `target/release/rapidgzip-rust` 0.1.0 (release, locked build)
-- C++: `target/bench-venv/bin/rapidgzip` **0.16.0** (PyPI wheel; ISA-L present → `rapidgzip-cpp-isal`)
-- Mode: **verify** (discard payload, CRC on)
-- Warmups: 2; measured runs: **5**; median wall time → MiB/s; median peak RSS
-- Corpora: `target/bench-corpora-fair/` (deterministic synthetic; 32 MiB / 64 MiB large-single)
-- Shared: `--chunk-size 4096`, thread ladder `1 4 16 44` (44 is oversubscribed on 12 CPUs)
-- Artifacts: `/tmp/fair-matrix-new.tsv`, `/tmp/fair-matrix-new.json`
+| Lever | This run |
+|-------|----------|
+| C++ version | **0.16.0** (`target/bench-venv`; wheel embeds ISA-L → `rapidgzip-cpp-isal`) |
+| Rust | **0.2.0** release, **`--features isal`**, linked to `target/isal-prefix/lib/libisal.so.2` |
+| Verify | Both: CRC on (`-t` / `-t --verify`), discard payload |
+| Chunk size | **`--chunk-size 4096`** (KiB) both tools |
+| Corpus size | **32 MiB** synthetic (`target/bench-corpora-fair/`) + large-single ~64 MiB uncompressed |
+| Timing | Medians of **5** measured runs after **2** warmups; wall via `EPOCHREALTIME`; peak RSS via `/usr/bin/time -f %M` |
+| Threads | `1 4 16 44` (44 oversubscribes 12 CPUs) |
+| Affinity | `TASKSET=0-11` |
+| Artifacts | `target/bench-results/20260801T040458Z/` |
 
-> **Host note:** Absolute thrpt on this pass is ~0.6–0.8× an earlier same-day fair matrix on the same machine for both Rust and C++ (thermal/load). Relative Rust vs C++ rankings are stable; do not mix absolute MiB/s across snapshot revisions without re-running both tools together.
+**Equalized:** threads, verify, chunk size, sink, corpora, affinity, medians.  
+**Not equalized:** C++ Python-wrapper RSS baseline; parallel algorithm differences; host load vs older snapshots.
+
+> **Host note:** Absolute MiB/s varies with thermal/load. Compare tools **within this run**. Prior zlib-rs-only snapshot (same day, earlier) is not mixed into absolute rankings.
 
 ## Results (verify, median MiB/s / median peak RSS MiB)
 
@@ -36,71 +25,61 @@
 
 | tool | 1 thr | 4 thr | 16 thr | 44 thr |
 |------|------:|------:|-------:|-------:|
-| rapidgzip-rust | 131 / 6.2 | **221** / 47 | **260** / 68 | **249** / 69 |
-| rapidgzip-cpp-isal 0.16 | **133** / 38 | 190 / 54 | 235 / 73 | 228 / 104 |
+| rapidgzip-rust (**ISA-L**) | **230** / 6.5 | **105** / 62 | 61 / 80 | **96** / 81 |
+| rapidgzip-cpp-isal 0.16 | 134 / 39 | 85 / 55 | **64** / 76 | 72 / 105 |
 
-### multi-member.gz (~32 MiB, 4 members)
-
-| tool | 1 thr | 4 thr | 16 thr | 44 thr |
-|------|------:|------:|-------:|-------:|
-| rapidgzip-rust | **166** / 6.1 | **200** / 45 | **187** / 59 | **124** / 61 |
-| rapidgzip-cpp-isal 0.16 | 159 / 32 | 153 / 52 | 131 / 78 | 98 / 102 |
-
-### bgzf-like.gz (~32 MiB, many small members)
+### multi-member.gz
 
 | tool | 1 thr | 4 thr | 16 thr | 44 thr |
 |------|------:|------:|-------:|-------:|
-| rapidgzip-rust | **191** / 4.4 | **536** / 8.8 | **646** / 20 | **628** / 34 |
-| rapidgzip-cpp-isal 0.16 | 167 / 36 | 320 / 36 | 324 / 57 | 319 / 83 |
+| rapidgzip-rust (**ISA-L**) | **312** / 6.5 | **230** / 63 | **236** / 82 | **242** / 85 |
+| rapidgzip-cpp-isal 0.16 | 206 / 32 | 151 / 53 | 208 / 76 | 218 / 103 |
+
+### bgzf-like.gz
+
+| tool | 1 thr | 4 thr | 16 thr | 44 thr |
+|------|------:|------:|-------:|-------:|
+| rapidgzip-rust (**ISA-L**) | 93 / **4.7** | **504** / **9.2** | **570** / **21** | **510** / **42** |
+| rapidgzip-cpp-isal 0.16 | **106** / 36 | 310 / 34 | 316 / 55 | 282 / 83 |
 
 ### large-single.gz (~64 MiB uncompressed)
 
 | tool | 1 thr | 4 thr | 16 thr | 44 thr |
 |------|------:|------:|-------:|-------:|
-| rapidgzip-rust | **155** / 6.2 | **182** / 48 | **284** / 81 | **185** / 85 |
-| rapidgzip-cpp-isal 0.16 | 149 / 35 | 146 / 100 | 265 / 139 | 166 / 174 |
+| rapidgzip-rust (**ISA-L**) | **286** / 6.5 | **193** / 72 | 178 / 116 | 214 / 116 |
+| rapidgzip-cpp-isal 0.16 | 222 / 35 | 172 / 100 | **179** / 138 | **244** / 168 |
 
-### zlib-stream.zz (~32 MiB; **re-measured with parallel single-stream zlib**)
+### zlib-stream.zz (single long zlib)
 
 | tool | 1 thr | 4 thr | 16 thr | 44 thr |
 |------|------:|------:|-------:|-------:|
-| rapidgzip-rust | **198** / 6.2 | **222** / 44 | **262** / 64 | **174** / 62 |
-| rapidgzip-cpp-isal 0.16 | 172 / 35 | 171 / 53 | 232 / 74 | 137 / 104 |
+| rapidgzip-rust (**ISA-L**) | **127** / 6.5 | **65** / 56 | 81 / 74 | **118** / 73 |
+| rapidgzip-cpp-isal 0.16 | 82 / 35 | 50 / 61 | **108** / 80 | 108 / 105 |
 
-> **Zlib path (measured):** Rust multi-thread thrpt and RSS now **scale** on this large single-stream zlib corpus (P=1 RSS ~6.2 MiB sequential; P≥4 RSS ~44–64 MiB with higher thrpt). Peak multi-thread cell is P=16 at **262 MiB/s** vs C++ **232 MiB/s**. P=44 oversubscribes 12 CPUs and drops thrpt for both tools. Gates unchanged in spirit: large single-stream zlib parallelizes when `decoder_threads >= 4` and size amortizes ~2× the compressed grid (default 1 MiB cells); multi-stream zlib is stream-granularity parallel when `decoder_threads > 1`. P=1 (and small streams / P=2–3 marker skip) stay sequential on zlib-rs. Multi-thread `decode_read` (gzip/zlib/raw) still spills to temp then uses those gates. **Residual:** no ISA-L in Rust; P=1 inflater remains zlib-rs; Adler-32 follows `crc32_enabled` / verify flags.
+## Takeaways
 
-## Fairer headline
+1. **P=1 thrpt (primary ISA-L goal):** Rust with `--features isal` **beats** C++ ISA-L on 4/5 corpora at 1 thread:
+   - single-member **1.71×**, multi-member **1.51×**, large-single **1.29×**, zlib **1.56×**, bgzf **0.87×**
+   - **Geometric mean ≈ 1.35×** Rust/C++ at P=1
+2. **P=1 RSS:** Rust stays ~**6.5 MiB** peak vs C++ ~**32–39 MiB** (Python entrypoint baseline).
+3. **Multi-thread:** Rust still strong on BGZF (independent blocks) and multi-member; single-member / large-single / zlib scaling is mixed and host-sensitive at 16–44 on 12 CPUs.
+4. **Backend honesty:** This binary links **libisal** (not zlib-rs). Default builds without `isal` remain zlib-rs-only.
 
-On **gzip/BGZF/zlib-shaped** synthetic corpora with **0.16.0 + ISA-L label + CRC verify + matched chunk size + larger files + real C++ 0.16 flags** (this re-run):
-
-1. **Throughput (gzip/BGZF):** Rust is **competitive to clearly faster** on multi-thread cells (often ~1.1–2× on this host; BGZF-like peaks highest). Single-thread is essentially tied or slightly favors either side within noise.
-2. **Throughput (zlib):** Parallel single-stream zlib **closes the old sequential residual**. On `zlib-stream.zz`, Rust multi-thread thrpt scales with threads/RSS and **beats** C++ ISA-L at P=4/16 on this pass (P=1 still sequential zlib-rs, still competitive).
-3. **Memory:** Rust remains **more memory efficient**, especially at low thread counts (~0.15–0.2× C++ RSS at 1 thread; often ~0.5–0.8× at high thread counts on large single-member work). C++ RSS includes the Python entrypoint baseline.
-4. **Residuals still honest:** inflate backend is **zlib-rs** (no ISA-L); P=1 / small / low-thread marker-skip paths stay sequential; oversubscribing far past `nproc` (e.g. 44 on 12 CPUs) hurts both tools.
-
-## How to reproduce
+## Reproduce
 
 ```bash
-# One-time: rapidgzip 0.16 with ISA-L-capable wheel
-uv venv target/bench-venv
-uv pip install --python target/bench-venv/bin/python 'rapidgzip==0.16.0'
-
+export ISAL_INSTALL_PREFIX="$PWD/target/isal-prefix"
+export LD_LIBRARY_PATH="$PWD/target/isal-prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PATH="$PWD/target/bench-venv/bin:$PATH"
-export RAPIDGZIP_RUST=target/release/rapidgzip-rust
-export CORPUS_BYTES=$((32*1024*1024))
-export TASKSET="0-$(($(nproc)-1))"
-export CHUNK_SIZE_KIB=4096
-export RUNS=5
-export WARMUPS=2
-export THREAD_CELLS="1 4 16 44"
 
-cargo build --locked --release -p rapidgzip-rust-cli
-benchmarks/gen-corpora.sh target/bench-corpora-fair
-LARGE_BYTES=$((64*1024*1024)) benchmarks/gen-corpora.sh target/bench-corpora-fair
+cargo build --locked --release -p rapidgzip-rust-cli --features isal
 
-benchmarks/run-matrix.sh --mode verify \
-  --tsv /tmp/fair-matrix.tsv --json /tmp/fair-matrix.json \
+./benchmarks/run-fair.sh \
+  --threads "1 4 16 44" --runs 5 --warmups 2 \
+  --modes verify --skip-parity \
   --corpus-dir target/bench-corpora-fair
-```
 
-For the full multi-mode driver: `./benchmarks/run-fair.sh --threads "1 4 16 44" --runs 9`.
+# optional zlib cell (not in default fair .gz glob)
+RUNS=5 WARMUPS=2 THREAD_CELLS="1 4 16 44" CHUNK_SIZE_KIB=4096 \
+  benchmarks/run-matrix.sh --mode verify target/bench-corpora-fair/zlib-stream.zz
+```

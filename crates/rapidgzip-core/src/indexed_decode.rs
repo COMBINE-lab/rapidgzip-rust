@@ -11,11 +11,11 @@
 //! not always available. Correctness is guaranteed by producing the exact byte
 //! ranges described by the index checkpoints.
 
-use crate::backend::{Output, RawInflater};
+use crate::backend::{Output, prepare_inflater_at_bit_offset};
 use crate::config::Config;
 use crate::gzip::{SourceCursor, parse_member_header};
 use crate::index::{GzipIndex, INDEXED_GZIP_WINDOW_SIZE, IndexError, StoredWindow};
-use crate::inflate_backend::{InflateBackend, InflateFlush, status as inflate_status};
+use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateFlush, status as inflate_status};
 use crate::parallel::Window;
 use crate::{DecodeError, DecodeReport, DeflateErrorKind, ReadAt};
 use crossbeam_deque::{Injector, Steal};
@@ -271,7 +271,7 @@ fn inflate_segment<R: ReadAt + ?Sized>(
     };
 
     let (mut inflater, mut compressed_byte) =
-        RawInflater::prepare_at_bit_offset(start_bit, &window, source, page_size, true)?;
+        prepare_inflater_at_bit_offset::<ActiveInflater, _>(start_bit, &window, source, page_size, true)?;
 
     let exact = need;
     let mut out: Vec<u8> = match exact {
@@ -360,7 +360,7 @@ fn inflate_segment<R: ReadAt + ?Sized>(
                 // Next gzip member: parse header and start raw inflate with empty window.
                 let header = parse_member_header(&mut cursor, false)?;
                 debug_assert_eq!(header.deflate_start, cursor.position());
-                inflater = <RawInflater as InflateBackend>::create()?;
+                inflater = <ActiveInflater as InflateBackend>::create()?;
                 let empty = Window::empty();
                 InflateBackend::set_dictionary(
                     &mut inflater,

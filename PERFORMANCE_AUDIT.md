@@ -64,15 +64,14 @@ Shipped in-tree after a wall-clock + code profile on 128 MiB synthetic corpora
     loops can recover capacity on the `Decoder::reader` / `open` path as well.
     Default `emit_reusable` (no free-list) still returns zero-capacity vecs.
 
-Not done (architectural residual only): **faster single-thread inflater** —
-zlib-rs multi-symbol / match-copy improvements and/or a **real ISA-L second
-backend** behind an explicit feature (stub `isal` feature only; **no**
-`isal-sys` dependency is declared yet — host autoreconf / system lib often
-missing). **No alternate `InflateBackend` implementor ships.**
+Optional **faster single-thread inflater**: feature **`isal`** wires Intel
+ISA-L (`IsalInflater` in `isal_backend.rs`) as `ActiveInflater`. Default
+builds stay zlib-rs-only (no `libisal` required). Build with a system or
+prefix shared library (`ISAL_INSTALL_PREFIX`, `LD_LIBRARY_PATH` at runtime).
+Block-accurate flush still uses zlib-rs inside the ISA-L backend.
 
 `InflateBackend` coverage today (`crates/rapidgzip-core/src/inflate_backend.rs`,
-monomorphized to zlib-rs `RawInflater` only — zero intended thrpt cost vs
-direct calls):
+monomorphized to `ActiveInflater` — zlib-rs by default, ISA-L with `isal`):
 
 | Path | Trait surface used |
 |------|--------------------|
@@ -87,7 +86,7 @@ direct calls):
 | Estimated `inflate_tail` (`Z_BLOCK` walk) | `create` / `reset` / `prime` / `set_dictionary` / `inflate_capped` (`Block`; `unused_bits` / `at_block_end` / `last_block`) |
 | Seek sessions + indexed segment decode | source `prepare_at_bit_offset` + `create` / `set_dictionary` / `inflate_into_slice` (fixed caller `out` slices) |
 
-**Unsafe inflate ABI inventory** (grep `z::inflate*` under
+**Unsafe inflate ABI inventory** (grep `z::inflate*` / `isal_inflate*` under
 `crates/rapidgzip-core/src`):
 
 - **`z::inflate` only** in `inflate_backend.rs` (`RawInflater` implementor of
@@ -98,14 +97,16 @@ direct calls):
 - **Lifecycle only** on `RawInflater` in `backend.rs`: `inflateInit2_`,
   `inflateReset`, `inflatePrime`, `inflateSetDictionary`, `inflateEnd`.
   Trait `create` / `reset` / `prime` / `set_dictionary` thin-wrap those.
+- **ISA-L** (`isal` feature): `isal_inflate*` only in `isal_backend.rs`.
 
-The only remaining **architectural** inflate gap is a **real ISA-L (or other)
-second `InflateBackend` implementor** — not more call-site migration.
+Default product residual without `isal`: P=1 and small / low-thread budgets
+remain zlib-rs-limited. With `isal`, sequential paths use ISA-L; re-bench for
+P=1 vs C++ rapidgzip/ISA-L as needed.
 
 Shipped parallel paths and format coverage are listed in
 [CHANGELOG.md](CHANGELOG.md); intentional sequential product gates (P=1 stream
-`decode_read`, P=1–3 marker skip, small streams under ~2× grid amortization)
-are not unfinished work.
+`decode_read` without `isal`, P=1–3 marker skip, small streams under ~2× grid
+amortization) are not unfinished work.
 
 ## Current conclusion
 

@@ -3,7 +3,7 @@ use crate::config::{Config, Format};
 use crate::crc32::Crc32;
 use crate::gzip::{MemberHeader, SourceCursor, parse_member_header};
 use crate::index::IndexBuilder;
-use crate::inflate_backend::{InflateBackend, InflateFlush, status as inflate_status};
+use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateFlush, status as inflate_status};
 use crate::parallel::adaptive::AdaptiveConcurrency;
 use crate::parallel::deflate::{
     ChunkOutput, Error as NativeError, InitialHistory, ResolvedParts, decode_to_estimated_boundary,
@@ -209,60 +209,60 @@ impl RawInflater {
         }
     }
 
-    /// Prepares raw inflate at an absolute compressed bit offset with history.
-    ///
-    /// Returns the compressed **byte** cursor position from which subsequent
-    /// inflate input must be read (past any mid-byte primed bits).
-    ///
-    /// When `skip_gzip_header` is true, `window` is empty, and `start_bit` is
-    /// byte-aligned on a gzip/BGZF member header, inflate begins at the DEFLATE
-    /// payload. htslib `.gzi` / BGZI indexes store block (header) starts; the
-    /// seek and `decode_with_index` paths pass `true`. Parallel marker fallback
-    /// must pass `false` so mid-stream `1f 8b` bytes are never misread as
-    /// headers. Non-empty windows never skip a header.
-    ///
-    /// Inflate setup (create / mid-byte prime / dictionary) goes through
-    /// [`InflateBackend::prepare_at_bit_offset`] so alternate backends share
-    /// the same resume contract.
-    pub(crate) fn prepare_at_bit_offset<R: ReadAt + ?Sized>(
-        start_bit: u64,
-        window: &Window,
-        source: &R,
-        page_size: usize,
-        skip_gzip_header: bool,
-    ) -> Result<(Self, u64), DecodeError> {
-        let mut cursor = SourceCursor::new(source, page_size)?;
-        let mut byte_offset = start_bit / 8;
-        let mut effective_bit = start_bit;
+}
+
+/// Prepares an [`InflateBackend`] at an absolute compressed bit offset with history.
+///
+/// Returns the compressed **byte** cursor position from which subsequent
+/// inflate input must be read (past any mid-byte primed bits).
+///
+/// When `skip_gzip_header` is true, `window` is empty, and `start_bit` is
+/// byte-aligned on a gzip/BGZF member header, inflate begins at the DEFLATE
+/// payload. htslib `.gzi` / BGZI indexes store block (header) starts; the
+/// seek and `decode_with_index` paths pass `true`. Parallel marker fallback
+/// must pass `false` so mid-stream `1f 8b` bytes are never misread as
+/// headers. Non-empty windows never skip a header.
+pub(crate) fn prepare_inflater_at_bit_offset<I, R>(
+    start_bit: u64,
+    window: &Window,
+    source: &R,
+    page_size: usize,
+    skip_gzip_header: bool,
+) -> Result<(I, u64), DecodeError>
+where
+    I: InflateBackend,
+    R: ReadAt + ?Sized,
+{
+    let mut cursor = SourceCursor::new(source, page_size)?;
+    let mut byte_offset = start_bit / 8;
+    let mut effective_bit = start_bit;
+    cursor.seek(byte_offset)?;
+
+    if skip_gzip_header
+        && window.as_slice().is_empty()
+        && start_bit.is_multiple_of(8)
+        && !cursor.at_end()
+    {
+        // Peek for gzip magic; always restore the cursor so a miss leaves
+        // the offset as a raw DEFLATE bit position.
+        let is_gzip_magic = matches!(cursor.read_exact::<2>(byte_offset), Ok([0x1f, 0x8b]));
         cursor.seek(byte_offset)?;
-
-        if skip_gzip_header
-            && window.as_slice().is_empty()
-            && start_bit.is_multiple_of(8)
-            && !cursor.at_end()
-        {
-            // Peek for gzip magic; always restore the cursor so a miss leaves
-            // the offset as a raw DEFLATE bit position.
-            let is_gzip_magic = matches!(cursor.read_exact::<2>(byte_offset), Ok([0x1f, 0x8b]));
+        if is_gzip_magic {
+            let header = parse_member_header(&mut cursor, false)?;
+            byte_offset = header.deflate_start;
+            effective_bit = header.deflate_start.saturating_mul(8);
             cursor.seek(byte_offset)?;
-            if is_gzip_magic {
-                let header = parse_member_header(&mut cursor, false)?;
-                byte_offset = header.deflate_start;
-                effective_bit = header.deflate_start.saturating_mul(8);
-                cursor.seek(byte_offset)?;
-            }
         }
-
-        let skipped_bits = (effective_bit % 8) as u8;
-        let first_byte = if skipped_bits != 0 {
-            cursor.read_exact::<1>(byte_offset)?[0]
-        } else {
-            0
-        };
-        let inflater =
-            <Self as InflateBackend>::prepare_at_bit_offset(first_byte, effective_bit, window)?;
-        Ok((inflater, cursor.position()))
     }
+
+    let skipped_bits = (effective_bit % 8) as u8;
+    let first_byte = if skipped_bits != 0 {
+        cursor.read_exact::<1>(byte_offset)?[0]
+    } else {
+        0
+    };
+    let inflater = I::prepare_at_bit_offset(first_byte, effective_bit, window)?;
+    Ok((inflater, cursor.position()))
 }
 
 impl Drop for RawInflater {
@@ -395,7 +395,7 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    decode_raw_deflate_sequential_with::<R, O, RawInflater>(source, config, cancelled, output)
+    decode_raw_deflate_sequential_with::<R, O, ActiveInflater>(source, config, cancelled, output)
 }
 
 /// Generic sequential raw DEFLATE path over [`InflateBackend`].
@@ -681,7 +681,7 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    decode_zlib_sequential_from_with::<R, O, RawInflater>(source, config, cancelled, output, state)
+    decode_zlib_sequential_from_with::<R, O, ActiveInflater>(source, config, cancelled, output, state)
 }
 
 /// Generic sequential zlib path over [`InflateBackend`].
@@ -934,7 +934,7 @@ fn index_zlib_streams_from<R: ReadAt + ?Sized>(
     let discard_cap = config.decoded_chunk_size.clamp(8 * 1024, 64 * 1024);
     let mut discard = Vec::with_capacity(discard_cap);
     // Reuse one inflater across multi-stream zlib indexing (empty window per stream).
-    let mut inflater = <RawInflater as InflateBackend>::create()?;
+    let mut inflater = <ActiveInflater as InflateBackend>::create()?;
 
     while !cursor.at_end() {
         if cancelled.load(Ordering::Relaxed) {
@@ -1053,7 +1053,7 @@ fn decode_zlib_stream_into<R: ReadAt + ?Sized>(
     cancelled: &AtomicBool,
     compressed: &mut Vec<u8>,
     output: &mut Vec<u8>,
-    inflater: &mut RawInflater,
+    inflater: &mut ActiveInflater,
 ) -> Result<usize, DecodeError> {
     let output_start = output.len();
     let mut input_offset = range.deflate_start;
@@ -1350,7 +1350,7 @@ where
                     decoded_scratch.clear();
                     let result = (|| {
                         if inflater.is_none() {
-                            inflater = Some(<RawInflater as InflateBackend>::create()?);
+                            inflater = Some(<ActiveInflater as InflateBackend>::create()?);
                         }
                         let inflater = inflater
                             .as_mut()
@@ -1903,7 +1903,7 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    decode_members_sequential_with::<R, O, RawInflater>(
+    decode_members_sequential_with::<R, O, ActiveInflater>(
         source,
         config,
         cancelled,
@@ -2461,7 +2461,7 @@ fn inflate_independent_member_into<R: ReadAt + ?Sized>(
     member_number: u64,
     header: MemberHeader,
     compressed_size: u64,
-    inflater: &mut RawInflater,
+    inflater: &mut ActiveInflater,
     compressed: &mut Vec<u8>,
     decoded: &mut Vec<u8>,
 ) -> Result<u64, DecodeError> {
@@ -2671,7 +2671,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
     stopped: &AtomicBool,
     compressed_size: u64,
     task: IndependentMemberTask,
-    inflater: &mut RawInflater,
+    inflater: &mut ActiveInflater,
     compressed: &mut Vec<u8>,
     sender: &mpsc::SyncSender<IndependentResult>,
 ) -> bool {
@@ -2906,7 +2906,7 @@ where
                         }
                     };
                     if inflater.is_none() {
-                        match <RawInflater as InflateBackend>::create() {
+                        match <ActiveInflater as InflateBackend>::create() {
                             Ok(new_inflater) => inflater = Some(new_inflater),
                             Err(error) => {
                                 let candidate_count = task.headers().len();
@@ -3215,7 +3215,7 @@ where
 {
     // Mid-stream resume (prime + dictionary) via inherent ReadAt helper, which
     // builds the stream through [`InflateBackend::prepare_at_bit_offset`].
-    let (mut inflater, resume_byte) = RawInflater::prepare_at_bit_offset(
+    let (mut inflater, resume_byte) = prepare_inflater_at_bit_offset::<ActiveInflater, _>(
         start_bit,
         window,
         source,
@@ -3604,7 +3604,7 @@ fn inflate_tail(
     window: &Window,
     maximum_output: usize,
     exact_stop: bool,
-    inflater: &mut Option<RawInflater>,
+    inflater: &mut Option<ActiveInflater>,
     output: &mut Vec<u8>,
 ) -> Result<BackendTail, NativeError> {
     // Estimated-path tail continue: mid-stream bit resume through
@@ -3614,7 +3614,7 @@ fn inflate_tail(
     // reuses one zlib stream across candidates.
     if inflater.is_none() {
         *inflater = Some(
-            <RawInflater as InflateBackend>::create().map_err(|_| NativeError::InvalidSymbol)?,
+            <ActiveInflater as InflateBackend>::create().map_err(|_| NativeError::InvalidSymbol)?,
         );
     }
     let inflater = inflater
@@ -3736,7 +3736,7 @@ fn run_estimated_task<R: ReadAt + ?Sized>(
     bytes: &mut Vec<u8>,
     marked_scratch: &mut Vec<Symbol>,
     clean_scratch: &mut Vec<u8>,
-    tail_inflater: &mut Option<RawInflater>,
+    tail_inflater: &mut Option<ActiveInflater>,
 ) -> Result<crate::parallel::deflate::Chunk, NativeError> {
     let byte_start = task.search_start_bit / 8;
     let byte_end = task.read_end_bit.div_ceil(8);
@@ -5344,7 +5344,7 @@ fn decode_bgzf_block_into<R: ReadAt + ?Sized>(
     member: u64,
     compressed: &mut Vec<u8>,
     output: &mut Vec<u8>,
-    inflater: &mut RawInflater,
+    inflater: &mut ActiveInflater,
     crc32_enabled: bool,
 ) -> Result<usize, DecodeError> {
     const MAX_BGZF_OUTPUT: usize = 64 * 1024;
@@ -5541,7 +5541,7 @@ where
                     }
                     let result = (|| {
                         if inflater.is_none() {
-                            inflater = Some(<RawInflater as InflateBackend>::create()?);
+                            inflater = Some(<ActiveInflater as InflateBackend>::create()?);
                         }
                         let inflater = inflater
                             .as_mut()

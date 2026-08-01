@@ -14,16 +14,18 @@ categories = ["compression", "filesystem"]
 
 [features]
 default = []
-# Future optional ISA-L sequential inflater. Not enabled and no `isal-sys`
-# dependency is declared: many hosts lack autoreconf / system ISA-L, and
-# build would fail. When wired, sequential paths already go through
-# `inflate_backend::InflateBackend` (generic monomorphization; zlib-rs only today).
-# isal = ["dep:isal-sys"]
+# Optional ISA-L raw-inflate backend (`IsalInflater` via `InflateBackend`).
+# Requires a system or prefix-installed shared `libisal` (e.g. Ubuntu
+# `libisal-dev`). Set `ISAL_INSTALL_PREFIX` to a prefix with `lib/libisal.so`
+# if the library is not on the default linker path. Does **not** build ISA-L
+# from source (avoids autoreconf). Default builds remain zlib-rs only.
+isal = ["dep:isal-sys"]
 
 [dependencies]
 crossbeam-deque.workspace = true
 libz-rs-sys.workspace = true
 tempfile.workspace = true
+isal-sys = { version = "0.5.3", optional = true, default-features = false, features = ["use-system-isal", "shared"] }
 
 [dev-dependencies]
 paraseq.workspace = true

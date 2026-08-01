@@ -56,15 +56,16 @@ Positional routes after format resolution:
    trailer and no random-access index (`keep_index` rejected at build time);
    optional whole-stream CRC via `raw_crc32_list`.
 1. Standard zlib-rs raw inflate is the authoritative gzip fallback and the
-   single-thread gzip path. Paths that go through the crate-private
-   `InflateBackend` trait (generic, monomorphized to zlib-rs `RawInflater`
-   today — see `inflate_backend.rs` and the commented `isal` feature stub;
-   **no real ISA-L second backend is wired**):
+   default single-thread gzip path. Paths that go through the crate-private
+   `InflateBackend` trait (generic, monomorphized to `ActiveInflater` — zlib-rs
+   `RawInflater` by default, or ISA-L `IsalInflater` with the optional `isal`
+   feature; see `inflate_backend.rs` / `isal_backend.rs`):
    - sequential positional multi-member gzip, sequential zlib, sequential raw
      DEFLATE, and streaming gzip/zlib/raw via `stream_decode` (`create` /
      `reset` / trait `inflate`);
    - structure analysis (`Decoder::analyze` / CLI `--analyze`) with
-     `InflateFlush::Block` (block spans + `last_block`);
+     `InflateFlush::Block` (block spans + `last_block`; ISA-L backend delegates
+     Block flush to an internal zlib-rs inflater);
    - parallel BGZF one-shot block inflate via trait `inflate`
      (`InflateFlush::Finish`);
    - parallel independent-member workers: trait `create`/`reset`/
@@ -77,8 +78,7 @@ Positional routes after format resolution:
      `prepare_at_bit_offset`): estimated-path setup uses trait
      `prime`/`set_dictionary`, and source-backed seeks /
      `inflate_from_block` build streams via
-     `InflateBackend::prepare_at_bit_offset` (zlib-rs `RawInflater` inherent
-     helpers still own ReadAt/header skip);
+     `prepare_inflater_at_bit_offset` (generic over `I: InflateBackend`);
    - estimated-path residual continue (`inflate_from_block`) and
      `inflate_tail` via trait `inflate_capped` (`NoFlush` / `Block`;
      block-end bit state from `InflateStep`);
@@ -87,12 +87,10 @@ Positional routes after format resolution:
      trait `create`/`set_dictionary`).
 
    All sequential/block inflate call sites go through `InflateBackend`
-   (monomorphized to `RawInflater`). Raw `z::inflate` lives **only** in the
-   trait implementor in `inflate_backend.rs`; zlib lifecycle
-   (`inflateInit2_` / `Reset` / `Prime` / `SetDictionary` / `End`) lives in
-   `RawInflater` inherent methods. **No real ISA-L second backend is wired** —
-   that is the remaining architectural inflate gap, not further call-site
-   migration.
+   (monomorphized to `ActiveInflater`). Raw `z::inflate` lives in the zlib-rs
+   implementor in `inflate_backend.rs`; ISA-L `isal_inflate` lives in
+   `isal_backend.rs`. Build the `isal` feature only when a shared `libisal` is
+   available (`ISAL_INSTALL_PREFIX` / system packages).
 2. A fully stored gzip stream is indexed from its exact block headers and
    copied by ordered worker tasks.
 3. A consistently formed BGZF stream is indexed from `BC/BSIZE` and its

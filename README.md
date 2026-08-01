@@ -253,14 +253,16 @@ and optional background prefetch of further windows (see
     `decoder_threads >= 4` and compressed size is at least about two grid cells
     (`2 × compressed_chunk_size`; default 1 MiB cells → ~2 MiB). Optional
     whole-stream check via `raw_crc32_list`.
-  - **P=1–3** and **small streams** stay on sequential zlib-rs raw inflate.
-- Residual: ISA-L / a faster single-thread inflater is not shipped (P=1 still
-  zlib-rs); small streams and marker budgets of 1–3 threads stay sequential for
-  ordinary single-member gzip, single-stream zlib, and raw DEFLATE; random-access
-  indexes remain gzip/BGZF-oriented. Multi-thread `decode_read` / CLI stdin
-  spills to a **temp file** (secure temp-dir defaults, deleted on drop) rather
-  than keeping the full archive only in RAM; single-thread paths stay pure
-  streaming.
+  - **P=1–3** and **small streams** stay on sequential raw inflate (zlib-rs by
+    default; optional `isal` feature swaps in ISA-L for P=1 throughput).
+- Residual: default builds use zlib-rs only. Optional **`isal`** feature wires
+  Intel ISA-L as the sequential inflater (system/prefix `libisal`; see core
+  crate features). Small streams and marker budgets of 1–3 threads stay
+  sequential for ordinary single-member gzip, single-stream zlib, and raw
+  DEFLATE; random-access indexes remain gzip/BGZF-oriented. Multi-thread
+  `decode_read` / CLI stdin spills to a **temp file** (secure temp-dir defaults,
+  deleted on drop) rather than keeping the full archive only in RAM; single-
+  thread paths stay pure streaming.
 - Concatenated members, empty members, optional gzip headers, BGZF data, and
   the conventional BGZF EOF member are supported.
 - Bytes resembling a gzip header inside DEFLATE data are never trusted as a

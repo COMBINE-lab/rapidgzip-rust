@@ -2,6 +2,9 @@
 /target/
 /debug/
 
+# Local package downloads (do not commit)
+*.deb
+
 # Project benchmark and profiling outputs
 /benchmark-results/
 /perf.data
@@ -15,3 +18,7 @@
 
 # RustRover / IntelliJ project settings
 # .idea/
+
+# Local ISA-L install prefix (system or extracted debs)
+.isal-prefix/
+target/isal-prefix/

@@ -9,7 +9,6 @@
 //! Supports gzip (including BGZF), zlib (RFC 1950), and raw DEFLATE (RFC 1951
 //! via explicit [`Format::RawDeflate`]; never auto-selected).
 
-use crate::backend::RawInflater;
 use crate::config::Format;
 use crate::crc32::Crc32;
 use crate::gzip::{SourceCursor, parse_member_header};
@@ -466,7 +465,7 @@ fn analyze_raw_deflate<R: ReadAt + ?Sized>(
     debug_assert_eq!(deflate_start, 0);
 
     let walk =
-        walk_deflate_blocks::<_, _, RawInflater>(source, &mut cursor, deflate_start, |_| Ok(()))?;
+        walk_deflate_blocks::<_, _, crate::inflate_backend::ActiveInflater>(source, &mut cursor, deflate_start, |_| Ok(()))?;
 
     // Single stream must consume the entire source (no trailer, no concat).
     if !cursor.at_end() {
@@ -509,7 +508,7 @@ fn analyze_gzip_member<R: ReadAt + ?Sized>(
 
     let mut crc = Crc32::new();
     let walk =
-        walk_deflate_blocks::<_, _, RawInflater>(source, cursor, header.deflate_start, |chunk| {
+        walk_deflate_blocks::<_, _, crate::inflate_backend::ActiveInflater>(source, cursor, header.deflate_start, |chunk| {
             if crc32_enabled {
                 crc.update(chunk);
             }
@@ -569,7 +568,7 @@ fn analyze_zlib_stream<R: ReadAt + ?Sized>(
 
     let mut adler = Adler32::new();
     let walk =
-        walk_deflate_blocks::<_, _, RawInflater>(source, cursor, header.deflate_start, |chunk| {
+        walk_deflate_blocks::<_, _, crate::inflate_backend::ActiveInflater>(source, cursor, header.deflate_start, |chunk| {
             if crc32_enabled {
                 adler.update(chunk);
             }

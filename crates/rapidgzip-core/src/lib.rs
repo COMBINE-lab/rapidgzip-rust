@@ -118,6 +118,8 @@ mod gzip;
 mod index;
 mod indexed_decode;
 mod inflate_backend;
+#[cfg(feature = "isal")]
+mod isal_backend;
 mod read_at;
 mod reader;
 mod seek;

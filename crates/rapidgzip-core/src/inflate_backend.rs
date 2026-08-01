@@ -1,12 +1,12 @@
 //! Crate-private sequential raw-inflate backend abstraction.
 //!
 //! Sequential and block-oriented paths talk to inflate through [`InflateBackend`]
-//! so a future optional second implementation (e.g. ISA-L) can be monomorphized
-//! in without changing call sites. Today only zlib-rs [`RawInflater`] implements
-//! the trait; no alternate dependency is wired (host tooling / system lib).
+//! so alternate implementations can be monomorphized in without changing call
+//! sites. Default builds use zlib-rs [`RawInflater`]. With the `isal` feature,
+//! [`ActiveInflater`] is ISA-L's [`crate::isal_backend::IsalInflater`].
 //!
-//! Prefer generics (`I: InflateBackend`) over `dyn` so the default zlib-rs path
-//! stays zero-cost relative to direct `RawInflater` use.
+//! Prefer generics (`I: InflateBackend`) over `dyn` so the hot path stays
+//! zero-cost relative to a concrete inflater type.
 
 use crate::backend::RawInflater;
 use crate::error::DecodeError;
@@ -323,6 +323,16 @@ impl InflateBackend for RawInflater {
         RawInflater::message(self)
     }
 }
+
+/// Compile-time inflater used by monomorphized decode paths.
+///
+/// With `--features isal`, this is ISA-L; otherwise zlib-rs [`RawInflater`].
+#[cfg(feature = "isal")]
+pub(crate) type ActiveInflater = crate::isal_backend::IsalInflater;
+
+/// Compile-time inflater used by monomorphized decode paths (zlib-rs default).
+#[cfg(not(feature = "isal"))]
+pub(crate) type ActiveInflater = RawInflater;
 
 /// zlib status aliases used by sequential match arms (backend-agnostic names).
 pub(crate) mod status {

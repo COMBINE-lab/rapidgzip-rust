@@ -33,8 +33,13 @@ no `dyn`; no extra unsafe beyond the same zlib-rs contracts):
 `inflateSetDictionary`, `inflateEnd`) lives only in `RawInflater` inherent
 methods in `backend.rs`. Call sites in sequential, stream, analyze, BGZF,
 independent-member, multi-stream zlib, estimated residual, seek, and
-indexed_decode paths use the trait surface only. **No real ISA-L (or other
-second) backend is linked** — only the zlib-rs implementor exists.
+indexed_decode paths use the trait surface only.
+
+With the optional **`isal`** feature, `ActiveInflater` is `IsalInflater`
+(`isal_backend.rs`): raw inflate goes through `isal_inflate` /
+`isal_inflate_init` / `reset` / `set_dict` (system or prefix `libisal` via
+`isal-sys`). `InflateFlush::Block` still uses an internal zlib-rs
+`RawInflater`. Default builds without `isal` link only zlib-rs.
 
 - `inflateInit2_` receives a live, uniquely borrowed `z_stream`, the matching
   Rust structure size, zlib-rs's static version string, and raw-window value

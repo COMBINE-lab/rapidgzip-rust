@@ -20,13 +20,13 @@
 //! When the index was built with line offsets, [`IndexedReader::seek_to_line`]
 //! supports 1-based line seeks (gztool/rapidgzip style).
 
-use crate::backend::RawInflater;
+use crate::backend::prepare_inflater_at_bit_offset;
 use crate::config::Config;
 use crate::gzip::{SourceCursor, parse_member_header};
 use crate::index::{
     GzipIndex, INDEXED_GZIP_WINDOW_SIZE, IndexError, StoredWindow, WindowCompression,
 };
-use crate::inflate_backend::{InflateBackend, InflateFlush, status as inflate_status};
+use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateFlush, status as inflate_status};
 use crate::parallel::Window;
 use crate::{DecodeError, DeflateErrorKind, ReadAt};
 use std::cmp::min;
@@ -130,7 +130,7 @@ pub struct IndexedReader<R: ReadAt + 'static> {
 
 /// Live raw-inflate state after a successful seek/setup.
 struct InflateSession {
-    inflater: RawInflater,
+    inflater: ActiveInflater,
     /// Absolute compressed **byte** offset for the next inflate input.
     compressed_byte: u64,
     /// Absolute uncompressed offset of the next byte the inflater will emit.
@@ -751,7 +751,7 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
         }
 
         let window = self.window_for_bit_offset(start_bit)?;
-        let (inflater, compressed_byte) = RawInflater::prepare_at_bit_offset(
+        let (inflater, compressed_byte) = prepare_inflater_at_bit_offset::<ActiveInflater, _>(
             start_bit,
             &window,
             self.source.as_ref(),
@@ -891,7 +891,7 @@ impl<R: ReadAt + 'static> IndexedReader<R> {
                     // Next gzip member: parse header and start raw inflate with empty window.
                     let header = parse_member_header(&mut cursor, false)?;
                     debug_assert_eq!(header.deflate_start, cursor.position());
-                    let mut inflater = <RawInflater as InflateBackend>::create()?;
+                    let mut inflater = <ActiveInflater as InflateBackend>::create()?;
                     let empty = Window::empty();
                     InflateBackend::set_dictionary(
                         &mut inflater,
@@ -1492,7 +1492,7 @@ fn decode_window_independent<R: ReadAt + ?Sized>(
 
     let window = window_from_stored_cached(index.window_for(start_bit), start_bit, expand_cache)?;
     let (mut inflater, mut compressed_byte) =
-        RawInflater::prepare_at_bit_offset(start_bit, &window, source, page_size, true)?;
+        prepare_inflater_at_bit_offset::<ActiveInflater, _>(start_bit, &window, source, page_size, true)?;
 
     let mut uncompressed_pos = checkpoint_u;
 
@@ -1550,7 +1550,7 @@ fn decode_window_independent<R: ReadAt + ?Sized>(
 /// error occurs. Zero is returned only when the inflate session is exhausted.
 fn inflate_into<R: ReadAt + ?Sized>(
     source: &R,
-    inflater: &mut RawInflater,
+    inflater: &mut ActiveInflater,
     compressed_byte: &mut u64,
     uncompressed_pos: &mut u64,
     out: &mut [u8],
@@ -1606,7 +1606,7 @@ fn inflate_into<R: ReadAt + ?Sized>(
 
                 let header = parse_member_header(&mut cursor, false)?;
                 debug_assert_eq!(header.deflate_start, cursor.position());
-                *inflater = <RawInflater as InflateBackend>::create()?;
+                *inflater = <ActiveInflater as InflateBackend>::create()?;
                 let empty = Window::empty();
                 InflateBackend::set_dictionary(
                     inflater,
