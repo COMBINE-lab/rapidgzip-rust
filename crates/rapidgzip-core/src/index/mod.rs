@@ -6,10 +6,12 @@
 
 mod gzi;
 mod gzidx;
+mod gztool;
 mod native;
 mod window_codec;
 
 pub use gzidx::{decode_bit_offset, encode_bit_offset};
+pub use gztool::WithLines;
 pub(crate) use window_codec::{zlib_compress_window, zlib_decompress_window};
 
 use std::borrow::Cow;
@@ -279,6 +281,30 @@ impl GzipIndex {
     /// compressed size.
     pub fn read_gzi(reader: &mut impl Read, archive_size: Option<u64>) -> Result<Self, IndexError> {
         gzi::read_gzi(reader, archive_size)
+    }
+
+    /// Writes this index in gztool format.
+    ///
+    /// [`WithLines::Yes`] writes version 1 with per-point line counters;
+    /// [`WithLines::No`] writes version 0 and omits them. Windows are stored
+    /// zlib-compressed, as gztool does.
+    pub fn write_gztool(
+        &self,
+        writer: &mut impl Write,
+        lines: WithLines,
+    ) -> Result<(), IndexError> {
+        gztool::write_gztool(self, writer, lines)
+    }
+
+    /// Reads a complete gztool index of either version.
+    ///
+    /// gztool does not record the compressed archive size, so `archive_size`,
+    /// when supplied, is recorded as the compressed size.
+    pub fn read_gztool(
+        reader: &mut impl Read,
+        archive_size: Option<u64>,
+    ) -> Result<Self, IndexError> {
+        gztool::read_gztool(reader, archive_size)
     }
 
     /// Checks the index invariants.
