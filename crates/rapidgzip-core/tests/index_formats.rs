@@ -164,3 +164,118 @@ fn native_rejects_an_unknown_version() {
         IndexError::UnsupportedVersion(2)
     );
 }
+
+#[test]
+fn zran_bit_packing_round_trips() {
+    use rapidgzip_core::index::{decode_bit_offset, encode_bit_offset};
+
+    for offset in [0u64, 1, 7, 8, 9, 4095, 4096, 8 * 4096 + 3] {
+        let (byte_offset, bits) = encode_bit_offset(offset);
+        assert_eq!(decode_bit_offset(byte_offset, bits), Ok(offset));
+    }
+
+    // Byte-aligned offsets store a zero bits field.
+    assert_eq!(encode_bit_offset(64), (8, 0));
+    // Three bits into byte 4096 stores the next byte with five bits remaining.
+    assert_eq!(encode_bit_offset(8 * 4096 + 3), (4097, 5));
+}
+
+#[test]
+fn zran_bit_packing_rejects_denormal_values() {
+    use rapidgzip_core::index::decode_bit_offset;
+
+    assert!(decode_bit_offset(0, 3).is_err());
+    assert!(decode_bit_offset(10, 8).is_err());
+}
+
+#[test]
+fn gzidx_round_trips() {
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index.write_gzidx(&mut bytes).expect("write");
+    let restored = GzipIndex::read_gzidx(&mut bytes.as_slice(), Some(1_000_000)).expect("read");
+
+    // GZIDX has no line counters, so only the two offsets survive.
+    let expected: Vec<_> = index
+        .checkpoints()
+        .iter()
+        .map(|point| {
+            (
+                point.compressed_offset_in_bits,
+                point.uncompressed_offset_in_bytes,
+            )
+        })
+        .collect();
+    let actual: Vec<_> = restored
+        .checkpoints()
+        .iter()
+        .map(|point| {
+            (
+                point.compressed_offset_in_bits,
+                point.uncompressed_offset_in_bytes,
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+    assert!(
+        restored
+            .checkpoints()
+            .iter()
+            .all(|point| point.line_offset == 0)
+    );
+    assert_same_windows(&index, &restored);
+}
+
+#[test]
+fn gzidx_rejects_a_mismatched_archive_size() {
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index.write_gzidx(&mut bytes).expect("write");
+    assert_eq!(
+        GzipIndex::read_gzidx(&mut bytes.as_slice(), Some(42)).unwrap_err(),
+        IndexError::ArchiveSizeMismatch {
+            index_size: 1_000_000,
+            archive_size: 42,
+        }
+    );
+}
+
+#[test]
+fn gzidx_rejects_a_foreign_window_size() {
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index.write_gzidx(&mut bytes).expect("write");
+    // magic(5) version(1) flags(1) compressed(8) uncompressed(8) spacing(4)
+    // puts the window size at offset 27.
+    bytes[27..31].copy_from_slice(&4096u32.to_le_bytes());
+    assert_eq!(
+        GzipIndex::read_gzidx(&mut bytes.as_slice(), None).unwrap_err(),
+        IndexError::InvalidWindowSize(4096)
+    );
+}
+
+#[test]
+fn gzidx_rejects_a_hostile_checkpoint_count() {
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index.write_gzidx(&mut bytes).expect("write");
+    // The checkpoint count follows the window size at offset 31.
+    bytes[31..35].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+        GzipIndex::read_gzidx(&mut bytes.as_slice(), None),
+        Err(IndexError::ExcessiveLength { .. })
+    ));
+}
+
+#[test]
+fn gzidx_rejects_truncation_at_every_prefix() {
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index.write_gzidx(&mut bytes).expect("write");
+    for length in 1..bytes.len() {
+        assert!(
+            GzipIndex::read_gzidx(&mut &bytes[..length], None).is_err(),
+            "prefix of {length} bytes was accepted"
+        );
+    }
+}

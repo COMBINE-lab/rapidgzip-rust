@@ -4,9 +4,11 @@
 //! validates it, and reads and writes the supported on-disk formats. Using an
 //! index for random access lives in [`crate::indexed`].
 
+mod gzidx;
 mod native;
 mod window_codec;
 
+pub use gzidx::{decode_bit_offset, encode_bit_offset};
 pub(crate) use window_codec::{zlib_compress_window, zlib_decompress_window};
 
 use std::borrow::Cow;
@@ -239,6 +241,24 @@ impl GzipIndex {
     /// Reads an index written by [`Self::write_native`].
     pub fn read_native(reader: &mut impl Read) -> Result<Self, IndexError> {
         native::read_native(reader)
+    }
+
+    /// Writes this index in indexed_gzip `GZIDX` version 1 format.
+    ///
+    /// Every non-empty window is written as exactly [`WINDOW_SIZE`] bytes.
+    pub fn write_gzidx(&self, writer: &mut impl Write) -> Result<(), IndexError> {
+        gzidx::write_gzidx(self, writer)
+    }
+
+    /// Reads an indexed_gzip `GZIDX` index, accepting versions 0 and 1.
+    ///
+    /// When `archive_size` is `Some`, it must equal the compressed size stored
+    /// in the index header.
+    pub fn read_gzidx(
+        reader: &mut impl Read,
+        archive_size: Option<u64>,
+    ) -> Result<Self, IndexError> {
+        gzidx::read_gzidx(reader, archive_size)
     }
 
     /// Checks the index invariants.
