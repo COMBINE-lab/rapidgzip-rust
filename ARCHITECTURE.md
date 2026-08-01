@@ -148,6 +148,40 @@ BGZF workers decode eight independently framed blocks per task directly into
 one aggregate output allocation, verify every block's CRC32 and ISIZE, and
 reuse their initialized zlib-rs stream with `inflateReset`.
 
+## Random-access index
+
+`index/` holds the index data model and the on-disk formats and knows nothing
+about decoding, so every format is testable against synthetic indexes. A
+checkpoint pairs a compressed bit offset with a decompressed byte offset and,
+unless it sits where no history is needed, the 32 KiB predecessor window that
+must become the inflate dictionary before resuming there. Windows are held
+zlib-compressed in memory by default, which matters once a large file
+accumulates thousands of them.
+
+Decode paths do not build the index themselves. They offer checkpoints to
+`RuntimeState`, which is already shared with every worker, and `IndexBuilder`
+orders, deduplicates, and thins the offers when the decode finishes. Offers may
+therefore arrive in any order, which is what lets concurrent workers contribute
+without coordination.
+
+What each path can offer differs. The estimated-grid path offers every chunk
+start together with the resolved predecessor window, so its checkpoints are
+interior points, usually not byte aligned. The BGZF path offers every non-empty
+block start with no window, reading each block's ISIZE footer for the
+decompressed offset, which is why a BGZF index exports as a complete htslib
+`.gzi`. The sequential and streaming paths offer member starts only: zlib does
+not report DEFLATE block boundaries, so a forward-only source yields a coarse
+but valid index.
+
+`indexed/` consumes an index. `IndexedReader` picks the last checkpoint at or
+before the target, primes the inflater with the straddled bits when the
+checkpoint is not byte aligned, installs the window, and discards output up to
+the target. A checkpoint with no window is not assumed to be a member start:
+indexed_gzip records its first point after the gzip header, so the reader
+checks for the magic bytes and skips a header only when one is there. Expanded
+windows are cached in a byte-bounded LRU so nearby seeks do not re-inflate the
+same history.
+
 ## Scheduling and memory
 
 The BGZF, stored, dense-member, and native paths use a

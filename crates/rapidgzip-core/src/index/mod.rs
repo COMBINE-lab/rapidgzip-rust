@@ -2,7 +2,7 @@
 //!
 //! This module is independent of the decoder: it defines the index data model,
 //! validates it, and reads and writes the supported on-disk formats. Using an
-//! index for random access lives in [`crate::indexed`].
+//! index for random access lives in [`IndexedReader`](crate::IndexedReader).
 
 mod build;
 mod gzi;

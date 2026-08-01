@@ -191,6 +191,36 @@ pipe. Dropping a streaming [`DecoderReader`] before end of output cancels but
 does not wait for the background thread, so a producer that stalls without
 closing cannot block the drop.
 
+## Random access
+
+Building an index during a decode costs one predecessor window per checkpoint
+and makes later reads seekable:
+
+```rust
+use rapidgzip_core::{Decoder, IndexedReader};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+
+let decoder = Decoder::builder().build_index(true).build()?;
+let mut reader = decoder.open("reads.fastq.gz")?;
+io::copy(&mut reader, &mut io::sink())?;
+let index = reader.finish()?.index.expect("index requested");
+index.write_native(&mut File::create("reads.fastq.gz.idx")?)?;
+
+let mut random = IndexedReader::new(File::open("reads.fastq.gz")?, index)?;
+random.seek(SeekFrom::Start(4_000_000_000))?;
+let mut buffer = [0u8; 4096];
+random.read_exact(&mut buffer)?;
+```
+
+Indexes read and write four formats: the crate's own versioned format, the
+indexed_gzip `GZIDX` format, the htslib BGZF `.gzi` format, and gztool's. An
+index written here is usable by `bgzip -b`, `gztool -b`, and
+`indexed_gzip.IndexedGzipFile.import_index`, and indexes written by those tools
+are usable here. A BGZF index records every block, so it exports as a complete
+`.gzi`; an index built from a non-seekable source records member starts only,
+because the zlib backend does not expose DEFLATE block boundaries.
+
 ## Command-line installation and use
 
 Install the CLI package with:

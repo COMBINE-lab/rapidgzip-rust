@@ -2,9 +2,10 @@
 //!
 //! `rapidgzip-core` decodes single-member gzip, concatenated gzip, and BGZF.
 //! It follows rapidgzip's marker/window algorithm for parallel decoding of
-//! ordinary DEFLATE streams and uses zlib-rs as its inflate backend. Encoding,
-//! index persistence, and decoded-output seeking are outside this crate's
-//! current scope.
+//! ordinary DEFLATE streams and uses zlib-rs as its inflate backend. It also
+//! builds random-access indexes while decoding, reads and writes them in four
+//! formats, and seeks decompressed output through them. Encoding is outside
+//! this crate's scope.
 //!
 //! # Output interfaces
 //!
@@ -33,6 +34,48 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Random access
+//!
+//! [`DecoderBuilder::build_index`] collects a [`GzipIndex`] during an ordinary
+//! decode. The index pairs compressed bit offsets with decompressed byte
+//! offsets and the 32 KiB of history needed to resume there, so a later
+//! [`IndexedReader`] can seek without decoding everything before the target.
+//!
+//! ```no_run
+//! use rapidgzip_core::{Decoder, IndexedReader};
+//! use std::fs::File;
+//! use std::io::{self, Read, Seek, SeekFrom};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let decoder = Decoder::builder().build_index(true).build()?;
+//! let mut reader = decoder.open("reads.fastq.gz")?;
+//! io::copy(&mut reader, &mut io::sink())?;
+//! let index = reader.finish()?.index.expect("index requested");
+//!
+//! index.write_native(&mut File::create("reads.fastq.gz.idx")?)?;
+//!
+//! let mut random = IndexedReader::new(File::open("reads.fastq.gz")?, index)?;
+//! random.seek(SeekFrom::Start(4_000_000_000))?;
+//! let mut buffer = [0u8; 4096];
+//! random.read_exact(&mut buffer)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Indexes persist in the crate's own versioned format
+//! ([`GzipIndex::write_native`]), in indexed_gzip `GZIDX`
+//! ([`GzipIndex::write_gzidx`]), in htslib BGZF `.gzi`
+//! ([`GzipIndex::write_gzi`]), and in gztool's format
+//! ([`GzipIndex::write_gztool`]). All four import as well, so indexes written
+//! by those tools work here and the reverse holds.
+//!
+//! Which checkpoints an index holds depends on the path that decoded the
+//! input. The parallel path records interior points at its chunk boundaries,
+//! spaced by [`DecoderBuilder::index_spacing`]. BGZF records every block. The
+//! sequential and streaming paths record member starts only, because the zlib
+//! backend does not expose DEFLATE block boundaries; an index built from
+//! standard input is therefore coarse but valid.
 //!
 //! # Verification and errors
 //!

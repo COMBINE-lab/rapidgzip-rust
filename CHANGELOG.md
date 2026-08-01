@@ -7,6 +7,16 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Random-access indexing. `DecoderBuilder::build_index` collects a `GzipIndex`
+  during an ordinary decode and returns it in `DecodeReport::index`.
+  `DecoderBuilder::index_spacing` and `DecoderBuilder::compress_index_windows`
+  tune checkpoint density and resident memory.
+- `IndexedReader`, a `Read + Seek` view over compressed input that resumes at
+  the nearest checkpoint instead of decoding from the start.
+- Index persistence in four formats, importing and exporting: the crate's own
+  versioned format, indexed_gzip `GZIDX`, htslib BGZF `.gzi`, and gztool.
+  Interoperability with all three tools is covered by tests.
+
 - Decoding of non-seekable compressed input through `Decoder::decode_stream`
   and `Decoder::stream_reader`, which accept any `std::io::Read` and mirror
   `Decoder::decode` and `Decoder::reader`. `Decoder::open` now routes a path
