@@ -6,7 +6,7 @@
 
 use super::{IndexError, WINDOW_SIZE};
 use libz_rs_sys as z;
-use std::ffi::c_int;
+use std::ffi::{c_int, c_ulong};
 
 /// Compression level used for stored windows, matching gztool.
 const LEVEL: c_int = 9;
@@ -38,9 +38,12 @@ pub(crate) fn zlib_compress_window(bytes: &[u8]) -> Result<Vec<u8>, IndexError> 
     let guard = DeflateGuard(&mut stream);
 
     // `deflateBound` is an upper bound for compressing the whole input in one
-    // pass, so a single `Z_FINISH` call always has room.
+    // pass, so a single `Z_FINISH` call always has room. Its argument is a
+    // `c_ulong`, which is 32 bits on Windows and 64 elsewhere, and a window is
+    // far below either limit.
+    let source_length = c_ulong::try_from(bytes.len()).unwrap_or(c_ulong::MAX);
     // SAFETY: the stream was initialized above and is uniquely borrowed here.
-    let bound = unsafe { z::deflateBound(guard.0, bytes.len() as u64) } as usize;
+    let bound = unsafe { z::deflateBound(guard.0, source_length) } as usize;
     let mut output = vec![0u8; bound.max(64)];
 
     guard.0.next_in = bytes.as_ptr();

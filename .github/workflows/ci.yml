@@ -59,7 +59,7 @@ jobs:
         run: python3 -m pip install --user indexed_gzip
       - name: Build gztool
         run: |
-          git clone --depth 1 --branch v1.7.2 https://github.com/circulosmeos/gztool.git /tmp/gztool
+          git clone --depth 1 --branch v1.8.2 https://github.com/circulosmeos/gztool.git /tmp/gztool
           cc -O2 -std=gnu11 -o /usr/local/bin/gztool /tmp/gztool/gztool.c -lz -lm
       - run: bgzip --version && gztool -h | head -1 && python3 -c "import indexed_gzip"
       - run: cargo test -p rapidgzip-core --test index_interop --locked -- --ignored --nocapture
