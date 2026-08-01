@@ -746,7 +746,7 @@ fn merged_count(references: &[WindowReference]) -> u64 {
         return 0;
     }
     let mut sorted: Vec<WindowReference> = references.to_vec();
-    sorted.sort_by_key(|entry| entry.distance);
+    sorted.sort_by_key(|entry| (entry.distance, entry.length));
     let mut current = 0_usize;
     for index in 1..sorted.len() {
         if sorted[current].distance + sorted[current].length >= sorted[index].distance {

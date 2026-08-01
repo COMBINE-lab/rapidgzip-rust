@@ -188,12 +188,6 @@ impl Histogram {
         }
     }
 
-    /// Returns how many values landed in the histogram.
-    #[must_use]
-    pub fn count(&self) -> u64 {
-        self.bins.iter().sum()
-    }
-
     fn bin_center(&self, index: usize) -> f64 {
         self.minimum + (self.maximum - self.minimum) / self.bins.len() as f64 * (index as f64 + 0.5)
     }
@@ -317,13 +311,13 @@ mod tests {
     fn a_narrow_integer_range_shrinks_the_bin_count() {
         let histogram = Histogram::integers(&[3, 4, 5], 8, "");
         assert_eq!(histogram.bins.len(), 3);
-        assert_eq!(histogram.count(), 3);
+        assert_eq!(histogram.bins.iter().sum::<u64>(), 3);
     }
 
     #[test]
     fn every_equal_value_lands_in_one_bin() {
         let histogram = Histogram::integers(&[7, 7, 7, 7], 8, "");
-        assert_eq!(histogram.count(), 4);
+        assert_eq!(histogram.bins.iter().sum::<u64>(), 4);
         assert_eq!(histogram.bins.iter().filter(|&&bin| bin > 0).count(), 1);
     }
 

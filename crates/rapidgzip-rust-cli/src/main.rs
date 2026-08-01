@@ -7,6 +7,7 @@
 //! here, and three options are accepted no-ops because this crate has no
 //! behaviour to attach to them.
 
+mod analyze_report;
 mod attributions;
 mod cxx_format;
 mod index;
@@ -25,7 +26,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Container framing, mirroring [`Format`] on the command line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -100,6 +101,10 @@ struct Arguments {
     /// Verify the complete input without retaining output.
     #[arg(short = 't', long = "test", action = ArgAction::SetTrue)]
     test: bool,
+
+    /// Print the internal structure: streams, blocks, and their statistics.
+    #[arg(long = "analyze", action = ArgAction::SetTrue)]
+    analyze: bool,
 
     /// Print the decompressed size in bytes.
     #[arg(long = "count", action = ArgAction::SetTrue)]
@@ -283,6 +288,35 @@ fn run_ranges(
     Ok(())
 }
 
+/// Walks the input and prints its structure.
+fn run_analyze(arguments: &Arguments, source: Source) -> Result<(), Box<dyn std::error::Error>> {
+    let Source::Positional(file, _) = source else {
+        return Err(
+            "--analyze needs a seekable input, since it reads the whole stream into memory              and walks it; standard input cannot be used"
+                .into(),
+        );
+    };
+    let decoder = build_decoder(arguments, false, false)?;
+    let started = Instant::now();
+    let analysis = decoder.analyze(&file)?;
+    let elapsed = started.elapsed();
+
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    analyze_report::write_report(
+        &mut output,
+        &analysis,
+        analyze_report::Timings {
+            // The walk does not separate header parsing from symbol decoding,
+            // so the whole measured time is attributed to the decode.
+            read_dynamic_header: Duration::ZERO,
+            read_data: elapsed,
+        },
+    )?;
+    output.flush()?;
+    Ok(())
+}
+
 /// Decodes `path` once to collect an index for random access.
 fn build_index_for(
     arguments: &Arguments,
@@ -339,6 +373,10 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let input = arguments.input.clone().expect("required by clap");
     let source = open_source(&input)?;
     let name = source.display_name();
+
+    if arguments.analyze {
+        return run_analyze(&arguments, source);
+    }
 
     if let Some(specification) = arguments.ranges.clone() {
         return run_ranges(&arguments, source, &specification, volume);
