@@ -10,7 +10,7 @@ There is no unsafe public API and no manual `Send` or `Sync` implementation.
 
 ## zlib-rs ABI adapter
 
-`backend.rs` contains a private RAII wrapper around `libz-rs-sys`.
+`inflate.rs` contains a private RAII wrapper around `libz-rs-sys`.
 
 - `inflateInit2_` receives a live, uniquely borrowed `z_stream`, the matching
   Rust structure size, zlib-rs's static version string, and raw-window value
@@ -41,6 +41,29 @@ the spare capacity remaining beneath its per-member output bound. It exposes
 exactly the initialized byte count reported by zlib-rs, verifies that the
 stream reached `Z_STREAM_END`, and authenticates CRC32 and ISIZE before the
 coordinator can emit the buffer.
+
+## ISA-L ABI adapter
+
+`isal_backend.rs` compiles only under the `isal` feature and holds all of that
+backend's unsafe code.
+
+- `inflate_state` is allocated through `Box::new_uninit`, zeroed with
+  `ptr::write_bytes`, then handed to `isal_inflate_init`, which writes every
+  scalar field. Zeroing first covers the scratch buffers that `init`
+  deliberately leaves alone because it sets their lengths to zero, so
+  `assume_init` observes no uninitialized byte.
+- Every `isal_inflate` call sets `next_in/avail_in` to a live immutable slice
+  and `next_out/avail_out` to the spare capacity of a uniquely owned `Vec<u8>`.
+  Neither allocation moves during the call. The C signature takes a mutable
+  input pointer, which ISA-L does not write through. Consumed and produced
+  lengths come only from the reduced `avail_*` fields, and `Vec::set_len`
+  exposes exactly the produced count, which cannot exceed the supplied
+  capacity.
+- `isal_inflate_reset` receives the same uniquely owned initialized state
+  between complete streams and is never called concurrently with
+  `isal_inflate`.
+- The state owns no allocation of its own, so there is no teardown call and no
+  `Drop` implementation to get wrong.
 
 ## SIMD gzip-header scan
 

@@ -162,6 +162,30 @@ The formal remaining gate is at least 95% of ISA-L-enabled rapidgzip in the
 one-worker FASTQ cell while preserving at least 100% geometric mean across all
 four budgets, correctness, the streaming API, and memory behavior.
 
+## In-tree ISA-L backend, 2026-08-01
+
+The `isal` feature makes the comparison direct rather than cross-project: the
+same crate, the same corpus, the same harness, one backend swapped underneath.
+`crates/rapidgzip-bench/benches/inflate_backend.rs` decodes a 16 MiB
+semi-structured log corpus single-threaded, once through each backend, compared
+through criterion baselines.
+
+On an Apple M-series machine against Homebrew isa-l 2.32.1:
+
+| Path | zlib-rs | ISA-L | Change |
+| --- | --- | --- | --- |
+| sequential gzip | 1.49 GiB/s | 1.24 GiB/s | +20.3% time |
+| raw DEFLATE | 1.56 GiB/s | 1.29 GiB/s | +20.2% time |
+
+ISA-L loses on both, consistently and well outside the noise (p < 0.05, and the
+confidence intervals do not overlap). This measures AArch64 only. The `isal` CI
+job runs the same two benchmarks on x86-64, where ISA-L's assembly decoder is
+strongest and where the cross-project comparison above found it ahead; its logs
+carry the current number.
+
+The finding does not change the default either way. The feature exists so the
+comparison can be made per machine and per workload, and it stays off.
+
 ## Does ISA-L support NEON?
 
 Yes, with an important qualification: the ISA-L fork vendored by rapidgzip has

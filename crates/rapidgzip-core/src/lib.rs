@@ -96,6 +96,23 @@
 //! backend does not expose DEFLATE block boundaries; an index built from
 //! standard input is therefore coarse but valid.
 //!
+//! # Inflate backends
+//!
+//! Raw inflate runs on zlib-rs. The optional `isal` feature replaces it with
+//! Intel's ISA-L on the paths that decode a whole stream from its start: the
+//! sequential gzip loop, the single-stream zlib and raw DEFLATE loop, and BGZF
+//! blocks.
+//!
+//! The parallel marker/window path and [`IndexedReader`] stay on zlib-rs
+//! whether or not the feature is on. Both resume at arbitrary bit offsets,
+//! which needs `inflatePrime`, and the parallel path finds DEFLATE block
+//! boundaries through zlib's `Z_BLOCK` contract. ISA-L exposes neither.
+//!
+//! The feature is off by default and links a system `libisal`: `libisal-dev`
+//! on Debian and Ubuntu, `isa-l` on Homebrew, or a prefix named by
+//! `ISAL_INSTALL_PREFIX`. Whether it is worth enabling is a measurement, not a
+//! given; see `README.md`.
+//!
 //! # Verification and errors
 //!
 //! Every member is accepted only after an actual final DEFLATE block and a

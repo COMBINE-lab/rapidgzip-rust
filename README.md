@@ -320,6 +320,39 @@ measurements rather than treating these results as a universal speed claim:
 - [PERFORMANCE_AUDIT.md] records the ISA-L comparison and optimization audit.
 - [CHANGELOG.md] summarizes each published release.
 
+## Optional ISA-L inflate backend
+
+Raw inflate runs on zlib-rs. The `isal` feature of `rapidgzip-core` replaces it
+with Intel's ISA-L on the paths that decode a whole stream from its start:
+sequential gzip members, single-stream zlib and raw DEFLATE, and BGZF blocks.
+The parallel marker/window path and `IndexedReader` stay on zlib-rs either way,
+because both resume at arbitrary bit offsets and the parallel path needs zlib's
+`Z_BLOCK` contract, neither of which ISA-L exposes.
+
+The feature is off by default and links a system library rather than building
+one: `libisal-dev` on Debian and Ubuntu, `isa-l` on Homebrew, or a prefix named
+by `ISAL_INSTALL_PREFIX`.
+
+```console
+cargo add rapidgzip-core --features isal
+```
+
+Whether it is worth enabling is a measurement. On an Apple M-series machine
+with isa-l 2.32.1, ISA-L was **20% slower** than zlib-rs on both benchmarked
+paths, at 1.24 GiB/s against 1.49 GiB/s for sequential gzip and 1.29 GiB/s
+against 1.56 GiB/s for raw DEFLATE, over a 16 MiB semi-structured log corpus.
+The x86-64 comparison, where ISA-L's assembly decoder is strongest, is run by
+the `isal` CI job on every push; read its logs for the current number. The
+feature stays off by default regardless.
+
+Reproduce it locally with two runs, since the backend is a compile-time choice:
+
+```console
+cargo bench -p rapidgzip-bench --bench inflate_backend -- --save-baseline zlib-rs
+cargo bench -p rapidgzip-bench --bench inflate_backend \
+  --features rapidgzip-core/isal -- --baseline zlib-rs
+```
+
 ## Platform and compatibility policy
 
 - Rust edition: 2024
@@ -327,7 +360,8 @@ measurements rather than treating these results as a universal speed claim:
 - First-class positional file sources: Unix and Windows
 - SIMD: runtime-dispatched x86-64 AVX2/SSE4.1 where applicable, baseline NEON
   on AArch64, and scalar fallbacks
-- Inflate backend: zlib-rs through `libz-rs-sys`
+- Inflate backend: zlib-rs through `libz-rs-sys`, with ISA-L available on the
+  whole-stream paths behind the off-by-default `isal` feature
 
 The `0.1.x` series should be treated as an evolving initial API. Correct gzip
 decoding, member verification, and the `Read + Send` contract are foundational;

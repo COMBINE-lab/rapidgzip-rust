@@ -7,6 +7,15 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- An optional ISA-L raw-inflate backend, behind the off-by-default `isal`
+  feature of `rapidgzip-core`. It replaces zlib-rs on the paths that decode a
+  whole stream from its start: sequential gzip members, single-stream zlib and
+  raw DEFLATE, and BGZF blocks. The parallel marker/window path and
+  `IndexedReader` stay on zlib-rs either way, since both resume at arbitrary
+  bit offsets and the parallel path needs zlib's `Z_BLOCK` contract. The
+  feature links a system `libisal` rather than building one. Default builds are
+  unchanged in dependencies and behaviour. Whether ISA-L is faster is a
+  measurement; `README.md` reports it.
 - zlib (RFC 1950) and raw DEFLATE (RFC 1951) decoding, selected through
   `DecoderBuilder::format`. `Format::Auto`, the default, detects gzip against
   zlib; raw DEFLATE must be requested. Both containers decode sequentially, in

@@ -28,7 +28,7 @@
 - [x] **4. CI job**
   A job installing `libisal-dev` and running the suite with `--features isal`.
 
-- [ ] **5. Benchmark and documentation**
+- [x] **5. Benchmark and documentation**
   A criterion benchmark comparing the backends on the same corpus, plus crate
   docs, `ARCHITECTURE.md`, `README.md`, and `CHANGELOG.md`. The measured
   numbers go in the pull request.

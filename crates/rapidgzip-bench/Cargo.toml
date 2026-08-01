@@ -14,10 +14,15 @@ rapidgzip-core.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+libz-rs-sys.workspace = true
 paraseq.workspace = true
 
 [[bench]]
 name = "decode"
+harness = false
+
+[[bench]]
+name = "inflate_backend"
 harness = false
 
 [lints]

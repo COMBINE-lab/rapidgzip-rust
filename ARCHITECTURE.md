@@ -55,6 +55,37 @@ validated against the initial window, without consuming it, before any
 coordinator is spawned. The runtime is then configured with a single worker so
 `DecoderStats` and `DecodeReport` report the concurrency actually in use.
 
+## Inflate backends
+
+Raw inflate sits behind one crate-internal trait, `InflateBackend`, with three
+operations: create, reset, and inflate a buffer into the spare capacity of an
+output vector. Its result is an enum, `Progress`, `StreamEnd`, or `Blocked`,
+rather than a zlib status code, so an implementation that does not speak zlib's
+numbering does not have to fake one. A type alias, `ActiveInflater`, picks the
+implementation at compile time: zlib-rs by default, ISA-L under the `isal`
+feature. Because the alias is a concrete type, the default build compiles to
+what it compiled to before the trait existed.
+
+Only the paths that decode a whole stream from its start go through the alias:
+sequential gzip members, the single-stream zlib and raw DEFLATE loop, and BGZF
+blocks. The marker/window path and `IndexedReader` name `RawInflater`
+directly. Both resume at arbitrary bit offsets, which needs `inflatePrime`, and
+the marker path locates DEFLATE block boundaries through zlib's `Z_BLOCK`
+contract. ISA-L exposes neither, so it must not be reachable from them, and the
+split is enforced by the type rather than by convention.
+
+The trait carries no dictionary call for the same reason. Every stream the
+pluggable paths inflate starts at its own beginning, with no predecessor
+history; installing a window belongs to the paths that resume mid-stream, and
+those keep the concrete type.
+
+Two properties of ISA-L shape its implementation. `inflate_state` embeds a
+64 KiB scratch buffer, so it is boxed rather than held inline. More
+importantly, ISA-L reads ahead into a bit buffer, so at the end of a stream it
+has consumed input the stream does not own; whole bytes still in that buffer
+are given back, or the gzip footer and the next member would be read from the
+wrong offset.
+
 ## Marker/window algorithm
 
 The implementation follows rapidgzip 0.16.0 at upstream commit

@@ -83,6 +83,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libisal-dev
       - run: cargo clippy -p rapidgzip-core --all-targets --features isal --locked -- -D warnings
       - run: cargo test -p rapidgzip-core --all-targets --features isal --locked
+      # The backend is a compile-time choice, so comparing means two runs. This
+      # is the only x86-64 measurement available to the project, which develops
+      # on AArch64, and it is where ISA-L is supposed to win. Shared runners are
+      # noisy, so read the sign and rough size, not the exact percentage.
+      - run: cargo bench -p rapidgzip-bench --bench inflate_backend --locked -- --quick --save-baseline zlib-rs
+      - run: cargo bench -p rapidgzip-bench --bench inflate_backend --features rapidgzip-core/isal --locked -- --quick --baseline zlib-rs
 
   msrv:
     runs-on: ubuntu-latest

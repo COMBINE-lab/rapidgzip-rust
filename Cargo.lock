@@ -825,6 +825,7 @@ name = "rapidgzip-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "libz-rs-sys",
  "paraseq",
  "rapidgzip-core",
 ]
