@@ -1,12 +1,12 @@
-use crate::backend::{DirectOutput, decode_source};
-use crate::gzip::validate_initial_header;
+use crate::backend::{DirectOutput, decode_source, decode_stream};
+use crate::gzip::{StreamCursor, validate_initial_header, validate_initial_stream_header};
 use crate::reader;
 use crate::runtime::RuntimeState;
 use crate::{DecodeError, DecodeReport, DecoderReader, ReadAt};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -205,12 +205,108 @@ impl Decoder {
         reader::spawn(source, self.config.clone())
     }
 
+    /// Decodes and verifies all gzip members from a non-seekable source.
+    ///
+    /// This is the push interface for input that cannot be read positionally,
+    /// such as standard input, a FIFO, a process substitution, or a socket. It
+    /// mirrors [`Decoder::decode`], including the writer being used only by the
+    /// calling thread.
+    ///
+    /// Verification is identical to [`Decoder::decode`]: a member is accepted
+    /// only after a real final DEFLATE block whose CRC32 and ISIZE both match,
+    /// trailing non-gzip bytes are an error, and [`DecoderBuilder::output_limit`]
+    /// still fails before emitting bytes past the limit. The source is read once
+    /// in order, so decoding is single-threaded regardless of
+    /// [`DecoderBuilder::decoder_threads`], and the returned report's
+    /// `decoder_threads` is `1`.
+    ///
+    /// Input memory is bounded by one [`DecoderBuilder::input_page_size`]
+    /// window; nothing is spooled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first framing, DEFLATE, verification, input, or output-limit
+    /// failure. On error, `output` can contain a verified prefix; writes are not
+    /// rolled back.
+    pub fn decode_stream<R, W>(
+        &self,
+        source: R,
+        output: &mut W,
+    ) -> Result<DecodeReport, DecodeError>
+    where
+        R: Read,
+        W: Write,
+    {
+        let cancelled = AtomicBool::new(false);
+        let mut sink = DirectOutput::new(output);
+        let runtime = RuntimeState::new(1);
+        let mut cursor = StreamCursor::new(source, self.config.input_page_size);
+        validate_initial_stream_header(&mut cursor)?;
+        decode_stream(&mut cursor, &self.config, &cancelled, &mut sink, &runtime)
+    }
+
+    /// Starts decoding an owned non-seekable source and returns `Read + Send`
+    /// decompressed output.
+    ///
+    /// This is the pull counterpart to [`Decoder::decode_stream`] and mirrors
+    /// [`Decoder::reader`], returning the same [`DecoderReader`] so it can still
+    /// be handed to a parser as `Box<dyn Read + Send>`.
+    ///
+    /// The gzip magic and as much of the first member header as the initial
+    /// input window holds are validated before the background coordinator is
+    /// spawned. Later failures are returned as [`std::io::Error`] values by
+    /// [`std::io::Read`], or as [`DecodeError`] by [`DecoderReader::finish`].
+    ///
+    /// [`DecoderReader::stats`] reports [`crate::DecoderPath::Sequential`] with
+    /// a single configured worker, because the four parallel paths all require
+    /// positional reads. Dropping the reader before end of output cancels
+    /// without waiting for the coordinator, so a stalled producer cannot block
+    /// the drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input failure, or a framing failure detectable in the first
+    /// input window.
+    pub fn stream_reader<R>(&self, source: R) -> Result<DecoderReader, DecodeError>
+    where
+        R: Read + Send + 'static,
+    {
+        reader::spawn_stream(source, self.config.clone())
+    }
+
     /// Opens a compressed file and returns a `Read + Send` decompressed stream.
     ///
-    /// The file is owned by the returned reader and accessed positionally.
+    /// A regular file is owned by the returned reader and accessed positionally
+    /// through every decode path. A path that cannot be read positionally, such
+    /// as a FIFO, a character device, or a socket, is routed to
+    /// [`Decoder::stream_reader`] instead and decoded sequentially with the same
+    /// verification. Such a path previously failed, so no successful call
+    /// changes behaviour.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input failure, or a framing failure detected before the
+    /// background coordinator is spawned.
     pub fn open<P: AsRef<Path>>(&self, path: P) -> Result<DecoderReader, DecodeError> {
-        let file = File::open(path).map_err(|error| DecodeError::input_io(0, error))?;
-        self.reader(file)
+        let mut file = File::open(path).map_err(|error| DecodeError::input_io(0, error))?;
+        if supports_positional_reads(&mut file) {
+            self.reader(file)
+        } else {
+            self.stream_reader(file)
+        }
+    }
+}
+
+/// Reports whether an opened file can serve the positional decode paths.
+///
+/// A regular file always can. Anything else is probed with a seek, which keeps
+/// block devices on the parallel paths while sending pipes, terminals, and
+/// sockets to the sequential streaming path.
+fn supports_positional_reads(file: &mut File) -> bool {
+    match file.metadata() {
+        Ok(metadata) if metadata.file_type().is_file() => true,
+        Ok(_) => file.stream_position().is_ok(),
+        Err(_) => false,
     }
 }
 

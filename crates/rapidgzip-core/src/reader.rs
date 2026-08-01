@@ -1,5 +1,6 @@
-use crate::backend::{Output, decode_source};
+use crate::backend::{Output, decode_source, decode_stream};
 use crate::config::Config;
+use crate::gzip::{StreamCursor, validate_initial_stream_header};
 use crate::runtime::{AuxiliaryKind, RuntimeState};
 use crate::{DecodeError, DecodeReport, DecoderHandle, DecoderStats, ReadAt, WorkerLimitError};
 use std::io::{self, IoSliceMut, Read};
@@ -68,9 +69,15 @@ enum Terminal {
 /// [`DecodeReport`] available through [`DecoderReader::report`]. A decoding
 /// failure is returned as an [`io::Error`] whose source is a [`DecodeError`].
 ///
-/// Dropping this value cancels and joins the background pipeline. It does not
-/// verify unread compressed data; use [`DecoderReader::finish`] to discard
-/// unread output while still verifying the complete stream.
+/// Dropping this value cancels the background pipeline. It does not verify
+/// unread compressed data; use [`DecoderReader::finish`] to discard unread
+/// output while still verifying the complete stream.
+///
+/// A reader over a positional source also joins the pipeline on drop. A reader
+/// over a non-seekable source does not, because its coordinator can be blocked
+/// in a read against a producer that never writes again, and a drop must not be
+/// able to block forever. That coordinator observes the cancellation and exits
+/// at its next read or send boundary.
 #[must_use]
 pub struct DecoderReader {
     receiver: Option<Receiver<Message>>,
@@ -80,15 +87,31 @@ pub struct DecoderReader {
     current: Vec<u8>,
     current_offset: usize,
     terminal: Terminal,
+    join_on_drop: bool,
 }
 
-pub(crate) fn spawn<R>(source: R, config: Config) -> Result<DecoderReader, DecodeError>
+/// Launches a coordinator thread around `decode` and wires it to the reader.
+///
+/// `configured_workers` seeds the runtime's immutable worker maximum, and
+/// `join_on_drop` selects whether dropping the reader waits for the coordinator.
+fn spawn_coordinator<F>(
+    decode: F,
+    in_flight_chunks: usize,
+    configured_workers: usize,
+    join_on_drop: bool,
+) -> Result<DecoderReader, DecodeError>
 where
-    R: ReadAt + 'static,
+    F: FnOnce(
+            &AtomicBool,
+            &mut ChannelOutput,
+            &Arc<RuntimeState>,
+        ) -> Result<DecodeReport, DecodeError>
+        + Send
+        + 'static,
 {
-    let (sender, receiver) = mpsc::sync_channel(config.in_flight_chunks);
+    let (sender, receiver) = mpsc::sync_channel(in_flight_chunks);
     let cancelled = Arc::new(AtomicBool::new(false));
-    let runtime = RuntimeState::new(config.decoder_threads);
+    let runtime = RuntimeState::new(configured_workers);
     let handle = DecoderHandle::new(Arc::clone(&runtime));
     let worker_cancelled = Arc::clone(&cancelled);
     let worker_runtime = Arc::clone(&runtime);
@@ -101,13 +124,7 @@ where
                 cancelled: Arc::clone(&worker_cancelled),
                 runtime: Arc::clone(&worker_runtime),
             };
-            let terminal = match decode_source(
-                &source,
-                &config,
-                &worker_cancelled,
-                &mut output,
-                &worker_runtime,
-            ) {
+            let terminal = match decode(&worker_cancelled, &mut output, &worker_runtime) {
                 Ok(report) => {
                     worker_runtime.set_member_count(report.member_count);
                     Message::Finished(report)
@@ -127,7 +144,50 @@ where
         current: Vec::new(),
         current_offset: 0,
         terminal: Terminal::Open,
+        join_on_drop,
     })
+}
+
+pub(crate) fn spawn<R>(source: R, config: Config) -> Result<DecoderReader, DecodeError>
+where
+    R: ReadAt + 'static,
+{
+    let in_flight_chunks = config.in_flight_chunks;
+    let configured_workers = config.decoder_threads;
+    spawn_coordinator(
+        move |cancelled, output, runtime| {
+            decode_source(&source, &config, cancelled, output, runtime)
+        },
+        in_flight_chunks,
+        configured_workers,
+        true,
+    )
+}
+
+/// Spawns a coordinator that decodes a non-seekable source sequentially.
+///
+/// The initial header is validated on the calling thread, before anything is
+/// spawned, so obviously wrong input is reported by the constructor rather than
+/// by the first read.
+///
+/// The runtime is configured with a single worker because the sequential path
+/// is the only one a forward-only source can reach, so the telemetry reports
+/// the concurrency actually in use rather than the builder's thread count.
+pub(crate) fn spawn_stream<R>(source: R, config: Config) -> Result<DecoderReader, DecodeError>
+where
+    R: Read + Send + 'static,
+{
+    let mut cursor = StreamCursor::new(source, config.input_page_size);
+    validate_initial_stream_header(&mut cursor)?;
+    let in_flight_chunks = config.in_flight_chunks;
+    spawn_coordinator(
+        move |cancelled, output, runtime| {
+            decode_stream(&mut cursor, &config, cancelled, output, runtime)
+        },
+        in_flight_chunks,
+        1,
+        false,
+    )
 }
 
 impl DecoderReader {
@@ -292,7 +352,15 @@ impl Drop for DecoderReader {
         self.cancelled.store(true, Ordering::Relaxed);
         self.handle.state.mark_terminal();
         self.receiver.take();
-        let _ = self.join_worker();
+        if self.join_on_drop {
+            let _ = self.join_worker();
+        } else {
+            // A non-seekable coordinator can be parked inside a read against a
+            // producer that never writes again, so joining here could block
+            // forever. Cancellation is already visible and the closed receiver
+            // fails its next send, so it exits without further help.
+            self.worker.take();
+        }
     }
 }
 

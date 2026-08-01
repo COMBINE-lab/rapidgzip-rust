@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::crc32::Crc32;
-use crate::gzip::{MemberHeader, SourceCursor, parse_member_header};
+use crate::gzip::{InputCursor, MemberHeader, SourceCursor, StreamCursor, parse_member_header};
 use crate::parallel::Window;
 use crate::parallel::adaptive::AdaptiveConcurrency;
 use crate::parallel::deflate::{
@@ -13,7 +13,7 @@ use crossbeam_deque::{Injector, Steal};
 use libz_rs_sys as z;
 use std::collections::BTreeMap;
 use std::ffi::CStr;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
@@ -581,7 +581,45 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    decode_members_sequential(source, config, cancelled, output, 0, 0, 0, runtime)
+    let mut cursor = SourceCursor::new(source, config.input_page_size)?;
+    decode_members_sequential(
+        &mut cursor,
+        config,
+        cancelled,
+        output,
+        0,
+        0,
+        config.decoder_threads,
+        runtime,
+    )
+}
+
+/// Decodes a complete gzip stream from a non-seekable source.
+///
+/// Non-seekable input can only be read forward once, which rules out every
+/// index-first path in [`decode_source`]. It therefore always runs the
+/// sequential path, which needs nothing but forward reads and is already the
+/// authoritative decoder the parallel paths fall back to. Framing, footer
+/// verification, trailing-garbage detection, and the output limit are the same
+/// code as for a positional source; only the cursor differs.
+///
+/// The cursor is supplied by the caller so that the initial header can be
+/// validated before a background coordinator is spawned, matching what
+/// `Decoder::reader` does for a positional source.
+pub(crate) fn decode_stream<R, O>(
+    cursor: &mut StreamCursor<R>,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    runtime: &Arc<RuntimeState>,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: Read,
+    O: Output,
+{
+    runtime.set_path(DecoderPath::Sequential);
+    runtime.set_adaptive_target(1);
+    decode_members_sequential(cursor, config, cancelled, output, 0, 0, 1, runtime)
 }
 
 /// Decodes complete members beginning at a known member boundary.
@@ -590,30 +628,30 @@ where
 /// sequence inside DEFLATE happened to look like a gzip header. Previously
 /// emitted members remain valid, so resuming from the first uncommitted task
 /// avoids both duplicate output and trusting the speculative candidate index.
+///
+/// The cursor is supplied by the caller, already positioned at the boundary to
+/// resume from, so this drives both positional and non-seekable input.
 #[allow(clippy::too_many_arguments)]
-fn decode_members_sequential<R, O>(
-    source: &R,
+fn decode_members_sequential<C, O>(
+    cursor: &mut C,
     config: &Config,
     cancelled: &AtomicBool,
     output: &mut O,
-    start_offset: u64,
     mut total_output: u64,
     mut member_count: u64,
+    decoder_threads: usize,
     runtime: &Arc<RuntimeState>,
 ) -> Result<DecodeReport, DecodeError>
 where
-    R: ReadAt + ?Sized,
+    C: InputCursor,
     O: Output,
 {
-    let mut cursor = SourceCursor::new(source, config.input_page_size)?;
-    cursor.seek(start_offset)?;
-
-    while !cursor.at_end() {
+    while !cursor.is_at_end()? {
         if cancelled.load(Ordering::Relaxed) {
             return Err(DecodeError::Cancelled);
         }
 
-        let header = parse_member_header(&mut cursor, member_count == 0)?;
+        let header = parse_member_header(&mut *cursor, member_count == 0)?;
         debug_assert!(header.start <= header.deflate_start);
         debug_assert_eq!(header.deflate_start, cursor.position());
         let _observed_bgzf_size = header.bgzf_block_size;
@@ -626,15 +664,14 @@ where
             if cancelled.load(Ordering::Relaxed) {
                 return Err(DecodeError::Cancelled);
             }
-            if cursor.at_end() {
-                return Err(DecodeError::InvalidDeflate {
-                    bit_offset: cursor.position().saturating_mul(8),
-                    reason: DeflateErrorKind::Truncated,
-                });
-            }
-
             let (input_pointer, input_length) = {
                 let input = cursor.available()?;
+                if input.is_empty() {
+                    return Err(DecodeError::InvalidDeflate {
+                        bit_offset: cursor.position().saturating_mul(8),
+                        reason: DeflateErrorKind::Truncated,
+                    });
+                }
                 (input.as_ptr(), input.len().min(u32::MAX as usize))
             };
             if decoded.capacity() < config.decoded_chunk_size {
@@ -650,8 +687,10 @@ where
 
             // SAFETY:
             // - `inflater.stream` was initialized and is uniquely borrowed.
-            // - `next_in/avail_in` describe the current immutable cursor page,
-            //   which is not moved or mutated until this call returns.
+            // - `next_in/avail_in` describe the cursor's current readable
+            //   window. Neither cursor implementation moves or mutates that
+            //   window outside `available`, which is not called again until
+            //   after this call returns.
             // - `next_out/avail_out` describe the uniquely owned spare
             //   capacity of `decoded`. The backend reports how many bytes it
             //   initialized before that length is exposed below.
@@ -755,24 +794,13 @@ where
         });
     }
 
-    let final_length = source
-        .len()
-        .map_err(|error| DecodeError::input_io(cursor.position(), error))?;
-    if final_length != cursor.length() {
-        return Err(DecodeError::input_io(
-            cursor.position(),
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "compressed source length changed during decoding",
-            ),
-        ));
-    }
+    cursor.verify_source_unchanged()?;
 
     Ok(DecodeReport {
         compressed_bytes: cursor.position(),
         decompressed_bytes: total_output,
         member_count,
-        decoder_threads: config.decoder_threads,
+        decoder_threads,
     })
 }
 
@@ -1837,14 +1865,16 @@ where
     stopped.store(true, Ordering::Relaxed);
 
     if let IndependentOutcome::SequentialFallback { offset } = outcome {
+        let mut cursor = SourceCursor::new(source, config.input_page_size)?;
+        cursor.seek(offset)?;
         return decode_members_sequential(
-            source,
+            &mut cursor,
             config,
             cancelled,
             output,
-            offset,
             total_output,
             member_count,
+            config.decoder_threads,
             runtime,
         );
     }
@@ -3671,8 +3701,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES, MemberAccounting, MemberHeader, SourceCursor,
-        Window, batch_independent_headers, find_gzip_magic, find_gzip_magic_scalar,
+        INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES, InputCursor, MemberAccounting, MemberHeader,
+        SourceCursor, Window, batch_independent_headers, find_gzip_magic, find_gzip_magic_scalar,
         independent_member_task_candidate_limit, inflate_tail, validate_footer,
     };
 
