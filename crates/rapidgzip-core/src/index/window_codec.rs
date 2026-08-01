@@ -35,7 +35,7 @@ pub(crate) fn zlib_compress_window(bytes: &[u8]) -> Result<Vec<u8>, IndexError> 
     if status != z::Z_OK {
         return Err(IndexError::WindowCodec("deflate initialization failed"));
     }
-    let mut guard = DeflateGuard(&mut stream);
+    let guard = DeflateGuard(&mut stream);
 
     // `deflateBound` is an upper bound for compressing the whole input in one
     // pass, so a single `Z_FINISH` call always has room.
@@ -82,7 +82,7 @@ pub(crate) fn zlib_decompress_window(payload: &[u8]) -> Result<Vec<u8>, IndexErr
     if status != z::Z_OK {
         return Err(IndexError::WindowCodec("inflate initialization failed"));
     }
-    let mut guard = InflateGuard(&mut stream);
+    let guard = InflateGuard(&mut stream);
 
     // One extra byte of room detects payloads that expand past a full window.
     let mut output = vec![0u8; WINDOW_SIZE + 1];

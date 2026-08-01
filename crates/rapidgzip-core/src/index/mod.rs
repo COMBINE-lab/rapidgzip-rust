@@ -4,6 +4,7 @@
 //! validates it, and reads and writes the supported on-disk formats. Using an
 //! index for random access lives in [`crate::indexed`].
 
+mod native;
 mod window_codec;
 
 pub(crate) use window_codec::{zlib_compress_window, zlib_decompress_window};
@@ -116,7 +117,6 @@ impl StoredWindow {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn payload(&self) -> &[u8] {
         &self.payload
     }
@@ -226,6 +226,19 @@ impl GzipIndex {
         position
             .checked_sub(1)
             .map(|index| &self.checkpoints[index])
+    }
+
+    /// Writes this index in the crate's native versioned format.
+    ///
+    /// The native format is the only one that round-trips every field,
+    /// including line offsets and compressed window payloads.
+    pub fn write_native(&self, writer: &mut impl Write) -> Result<(), IndexError> {
+        native::write_native(self, writer)
+    }
+
+    /// Reads an index written by [`Self::write_native`].
+    pub fn read_native(reader: &mut impl Read) -> Result<Self, IndexError> {
+        native::read_native(reader)
     }
 
     /// Checks the index invariants.
@@ -422,7 +435,6 @@ pub(crate) fn read_exact_bytes(
     reader.read_exact(buffer).map_err(IndexError::io)
 }
 
-#[allow(dead_code)]
 pub(crate) fn read_u8(reader: &mut impl Read) -> Result<u8, IndexError> {
     let mut byte = [0u8; 1];
     read_exact_bytes(reader, &mut byte)?;
