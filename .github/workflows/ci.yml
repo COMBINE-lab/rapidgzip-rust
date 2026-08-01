@@ -35,6 +35,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets --locked
 
+  aarch64:
+    # Exercise the AArch64 build and baseline NEON dispatch on native hardware.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: rustc --version --verbose
+      - run: cargo test --workspace --all-targets --locked
+
   msrv:
     runs-on: ubuntu-latest
     steps:

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Prepare, validate, tag, and publish a rapidgzip-rust workspace release.
+# Prepare, validate, tag, publish, and announce a rapidgzip-rust release.
 #
 # A dry run restores Cargo.toml and Cargo.lock before exiting. A real release
 # pushes its commit and tag before uploading the publishable workspace crates,
-# so the source referenced by crates.io is already available upstream.
+# so the source referenced by crates.io is already available upstream. After
+# successful crate uploads, it creates the matching GitHub release from the
+# version's CHANGELOG.md section.
 
 set -euo pipefail
 
@@ -79,6 +81,10 @@ if [[ ! -f Cargo.toml || ! -f Cargo.lock ]]; then
     echo "error: Cargo.toml and Cargo.lock must exist at the repository root" >&2
     exit 1
 fi
+if [[ ! -f CHANGELOG.md ]]; then
+    echo "error: CHANGELOG.md must exist at the repository root" >&2
+    exit 1
+fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
     echo "error: the working tree must be clean before preparing a release" >&2
@@ -114,6 +120,34 @@ if [[ -z "$current_version" ]]; then
 fi
 if git rev-parse --verify --quiet "refs/tags/v$version" >/dev/null; then
     echo "error: tag v$version already exists" >&2
+    exit 1
+fi
+
+release_heading="## [$version]"
+release_notes=$(
+    awk -v heading="$release_heading" '
+        /^## \[/ {
+            if (found) {
+                exit
+            }
+            if (index($0, heading) == 1) {
+                found = 1
+                next
+            }
+        }
+        found { print }
+        END {
+            if (!found) {
+                exit 1
+            }
+        }
+    ' CHANGELOG.md
+) || {
+    echo "error: CHANGELOG.md has no release section beginning with $release_heading" >&2
+    exit 1
+}
+if [[ -z "$release_notes" ]]; then
+    echo "error: the $release_heading changelog section is empty" >&2
     exit 1
 fi
 
@@ -197,6 +231,20 @@ if [[ "$dry_run" == true ]]; then
     exit 0
 fi
 
+if ! command -v gh >/dev/null 2>&1; then
+    echo "error: the GitHub CLI (gh) is required to create the release" >&2
+    exit 1
+fi
+if ! gh auth status >/dev/null 2>&1; then
+    echo "error: GitHub CLI authentication is required; run gh auth login" >&2
+    exit 1
+fi
+cargo_credentials="${CARGO_HOME:-$HOME/.cargo}/credentials.toml"
+if [[ -z "${CARGO_REGISTRY_TOKEN:-}" && ! -s "$cargo_credentials" ]]; then
+    echo "error: crates.io authentication is required; run cargo login" >&2
+    exit 1
+fi
+
 if [[ "$assume_yes" == false ]]; then
     echo
     if [[ "$version_changed" == true ]]; then
@@ -204,7 +252,7 @@ if [[ "$assume_yes" == false ]]; then
     else
         echo "The checks passed. This will tag the current commit as v$version, push it to origin,"
     fi
-    echo "and publish the workspace crates to crates.io."
+    echo "publish the workspace crates to crates.io, and create the GitHub release."
     read -r -p "Continue? [y/N] " reply
     if [[ ! "$reply" =~ ^[Yy]$ ]]; then
         echo "Release cancelled; restoring version files."
@@ -223,5 +271,9 @@ trap - ERR
 
 git push origin main "v$version"
 cargo publish --workspace --locked
+gh release create "v$version" \
+    --verify-tag \
+    --title "rapidgzip-rust v$version" \
+    --notes "$release_notes"
 
-echo "Published rapidgzip-rust v$version."
+echo "Published rapidgzip-rust v$version and created its GitHub release."

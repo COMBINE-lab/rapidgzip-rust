@@ -15,14 +15,14 @@ The project provides:
 - both a push API over `std::io::Write` and an owned `std::io::Read + Send`
   stream suitable for parsers such as [paraseq].
 
-This is currently a release candidate for the initial `0.1.0` crates.io
-publication. The project intentionally does not yet provide compression,
+The initial `0.1.0` release focuses on correct, high-throughput streaming
+decoding. The project intentionally does not yet provide compression,
 random-access indexes, seeking in decoded output, or non-seekable compressed
 input.
 
 ## Library installation
 
-Once published, add the decoder to a Rust project with:
+Add the decoder to a Rust project with:
 
 ```console
 cargo add rapidgzip-core
@@ -190,6 +190,7 @@ measurements rather than treating these results as a universal speed claim:
 - [BENCHMARKING.md] records corpora, commands, versions, thread counts, hashes,
   throughput, and memory measurements.
 - [PERFORMANCE_AUDIT.md] records the ISA-L comparison and optimization audit.
+- [CHANGELOG.md] summarizes each published release.
 
 ## Platform and compatibility policy
 
@@ -229,9 +230,11 @@ scripts/bump_and_publish.sh --dry-run 0.1.0
 
 Omitting `--dry-run` updates the workspace version, repeats formatting, lint,
 test, documentation, and package checks, creates and pushes a release commit
-and annotated tag, and publishes the crates to crates.io. The script requires a
-clean `main` branch and asks for confirmation before external changes;
-`--yes` is available for an intentional unattended release.
+and annotated tag, publishes the crates to crates.io, and creates a GitHub
+release from that version's changelog section. The script requires a clean
+`main` branch plus Cargo and GitHub authentication, and asks for confirmation
+before external changes; `--yes` is available for an intentional unattended
+release.
 
 ## License
 
@@ -247,6 +250,7 @@ MIT. See [LICENSE-BSD-3-CLAUSE] and [LICENSE-MIT].
 [`ReadAt`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/trait.ReadAt.html
 [ARCHITECTURE.md]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/ARCHITECTURE.md
 [BENCHMARKING.md]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/BENCHMARKING.md
+[CHANGELOG.md]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/CHANGELOG.md
 [LICENSE-BSD-3-CLAUSE]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/LICENSE-BSD-3-CLAUSE
 [LICENSE-MIT]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/LICENSE-MIT
 [PERFORMANCE_AUDIT.md]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/PERFORMANCE_AUDIT.md
