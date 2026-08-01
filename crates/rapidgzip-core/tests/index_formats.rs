@@ -390,3 +390,108 @@ fn gzi_rejects_truncation_at_every_prefix() {
         );
     }
 }
+
+#[test]
+fn gztool_round_trips_without_lines() {
+    use rapidgzip_core::index::WithLines;
+
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index
+        .write_gztool(&mut bytes, WithLines::No)
+        .expect("write");
+    assert_eq!(&bytes[..8], &[0u8; 8]);
+    assert_eq!(&bytes[8..16], b"gzipindx");
+
+    let restored = GzipIndex::read_gztool(&mut bytes.as_slice(), Some(1_000_000)).expect("read");
+    assert_eq!(restored.total_line_count, None);
+    assert!(
+        restored
+            .checkpoints()
+            .iter()
+            .all(|point| point.line_offset == 0)
+    );
+    assert_same_windows(&index, &restored);
+    assert_eq!(
+        restored.uncompressed_size_in_bytes,
+        index.uncompressed_size_in_bytes
+    );
+}
+
+#[test]
+fn gztool_round_trips_with_lines() {
+    use rapidgzip_core::index::WithLines;
+
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index
+        .write_gztool(&mut bytes, WithLines::Yes)
+        .expect("write");
+    assert_eq!(&bytes[8..16], b"gzipindX");
+
+    let restored = GzipIndex::read_gztool(&mut bytes.as_slice(), Some(1_000_000)).expect("read");
+    assert_eq!(restored.checkpoints(), index.checkpoints());
+    assert_eq!(restored.total_line_count, Some(1234));
+    assert_same_windows(&index, &restored);
+}
+
+#[test]
+fn gztool_rejects_an_incomplete_index() {
+    use rapidgzip_core::index::WithLines;
+
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index
+        .write_gztool(&mut bytes, WithLines::No)
+        .expect("write");
+    // `size` follows `have` after the 16-byte header.
+    bytes[24..32].copy_from_slice(&99u64.to_be_bytes());
+    assert_eq!(
+        GzipIndex::read_gztool(&mut bytes.as_slice(), None).unwrap_err(),
+        IndexError::InvalidCheckpoint("gztool index is incomplete")
+    );
+}
+
+#[test]
+fn gztool_rejects_an_excessive_window_length() {
+    use rapidgzip_core::index::WithLines;
+
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index
+        .write_gztool(&mut bytes, WithLines::No)
+        .expect("write");
+    // First point: header(16) + have(8) + size(8) + out(8) + in(8) + bits(4).
+    let length_at = 16 + 8 + 8 + 8 + 8 + 4;
+    bytes[length_at..length_at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(matches!(
+        GzipIndex::read_gztool(&mut bytes.as_slice(), None),
+        Err(IndexError::ExcessiveLength { .. })
+    ));
+}
+
+#[test]
+fn gztool_rejects_bad_magic() {
+    let bytes = vec![0u8; 64];
+    assert!(matches!(
+        GzipIndex::read_gztool(&mut bytes.as_slice(), None),
+        Err(IndexError::BadMagic { .. })
+    ));
+}
+
+#[test]
+fn gztool_rejects_truncation_at_every_prefix() {
+    use rapidgzip_core::index::WithLines;
+
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index
+        .write_gztool(&mut bytes, WithLines::Yes)
+        .expect("write");
+    for length in 1..bytes.len() {
+        assert!(
+            GzipIndex::read_gztool(&mut &bytes[..length], None).is_err(),
+            "prefix of {length} bytes was accepted"
+        );
+    }
+}
