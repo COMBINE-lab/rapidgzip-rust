@@ -85,6 +85,7 @@ mod config;
 mod crc32;
 mod error;
 mod gzip;
+mod inflate;
 mod read_at;
 mod reader;
 mod runtime;

@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::crc32::Crc32;
 use crate::gzip::{InputCursor, MemberHeader, SourceCursor, StreamCursor, parse_member_header};
+use crate::inflate::RawInflater;
 use crate::parallel::Window;
 use crate::parallel::adaptive::AdaptiveConcurrency;
 use crate::parallel::deflate::{
@@ -12,9 +13,7 @@ use crate::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ReadAt};
 use crossbeam_deque::{Injector, Steal};
 use libz_rs_sys as z;
 use std::collections::BTreeMap;
-use std::ffi::CStr;
 use std::io::{Read, Write};
-use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -53,81 +52,6 @@ impl<W: Write> Output for DirectOutput<'_, W> {
             .map_err(DecodeError::output_io)?;
         chunk.clear();
         Ok(chunk)
-    }
-}
-
-/// RAII wrapper around zlib-rs's zlib-compatible raw-inflate ABI.
-struct RawInflater {
-    stream: z::z_stream,
-    initialized: bool,
-}
-
-impl RawInflater {
-    fn new() -> Result<Self, DecodeError> {
-        let mut result = Self {
-            stream: z::z_stream::default(),
-            initialized: false,
-        };
-
-        // SAFETY:
-        // - `result.stream` is a live, uniquely borrowed `z_stream`.
-        // - `zlibVersion` returns a static NUL-terminated version string.
-        // - the structure size matches the exact Rust ABI type passed.
-        // - `-15` requests raw DEFLATE with a 32 KiB window.
-        let status = unsafe {
-            z::inflateInit2_(
-                &mut result.stream,
-                -15,
-                z::zlibVersion(),
-                size_of::<z::z_stream>() as i32,
-            )
-        };
-        if status != z::Z_OK {
-            return Err(DecodeError::InvalidDeflate {
-                bit_offset: 0,
-                reason: DeflateErrorKind::BackendStatus(status),
-            });
-        }
-        result.initialized = true;
-        Ok(result)
-    }
-
-    fn message(&self) -> Option<String> {
-        if self.stream.msg.is_null() {
-            return None;
-        }
-        // SAFETY: while the initialized zlib stream is live, zlib owns `msg`
-        // as a valid NUL-terminated diagnostic string or leaves it null.
-        Some(
-            unsafe { CStr::from_ptr(self.stream.msg) }
-                .to_string_lossy()
-                .into_owned(),
-        )
-    }
-
-    fn reset(&mut self, bit_offset: u64) -> Result<(), DecodeError> {
-        // SAFETY: this wrapper owns a successfully initialized stream and
-        // holds its unique mutable borrow. `inflateReset` retains the raw
-        // window mode selected by `inflateInit2_`.
-        let status = unsafe { z::inflateReset(&mut self.stream) };
-        if status == z::Z_OK {
-            Ok(())
-        } else {
-            Err(DecodeError::InvalidDeflate {
-                bit_offset,
-                reason: DeflateErrorKind::BackendStatus(status),
-            })
-        }
-    }
-}
-
-impl Drop for RawInflater {
-    fn drop(&mut self) {
-        if self.initialized {
-            // SAFETY: this wrapper calls `inflateEnd` exactly once for the
-            // successfully initialized, uniquely owned stream.
-            let _ = unsafe { z::inflateEnd(&mut self.stream) };
-        }
     }
 }
 
@@ -1935,47 +1859,6 @@ fn read_range_reuse<R: ReadAt + ?Sized>(
         filled += read;
     }
     Ok(())
-}
-
-impl RawInflater {
-    fn prime(&mut self, bits: u8, value: u8, bit_offset: u64) -> Result<(), DecodeError> {
-        // SAFETY: the stream is initialized and uniquely borrowed. zlib accepts
-        // at most 16 low-order bits before the first inflate call; this wrapper
-        // supplies at most the seven unread bits from one source byte.
-        let status =
-            unsafe { z::inflatePrime(&mut self.stream, i32::from(bits), i32::from(value)) };
-        if status == z::Z_OK {
-            Ok(())
-        } else {
-            Err(DecodeError::InvalidDeflate {
-                bit_offset,
-                reason: DeflateErrorKind::BackendStatus(status),
-            })
-        }
-    }
-
-    fn set_dictionary(&mut self, window: &Window, bit_offset: u64) -> Result<(), DecodeError> {
-        if window.as_slice().is_empty() {
-            return Ok(());
-        }
-        // SAFETY: `window` remains immutably borrowed for the call, and its
-        // slice is no larger than DEFLATE's 32 KiB history limit.
-        let status = unsafe {
-            z::inflateSetDictionary(
-                &mut self.stream,
-                window.as_slice().as_ptr(),
-                window.as_slice().len() as u32,
-            )
-        };
-        if status == z::Z_OK {
-            Ok(())
-        } else {
-            Err(DecodeError::InvalidDeflate {
-                bit_offset,
-                reason: DeflateErrorKind::BackendStatus(status),
-            })
-        }
-    }
 }
 
 struct MemberAccounting {
