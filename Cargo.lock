@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "rapidgzip-bench"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "criterion",
  "paraseq",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "rapidgzip-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crossbeam-deque",
  "isal-sys",
@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "rapidgzip-rust-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "rapidgzip-core",

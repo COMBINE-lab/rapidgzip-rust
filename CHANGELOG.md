@@ -5,29 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2] - 2026-08-01
 
 ### Changed
 
 - `raw_crc32_list`: fail-closed — more than one CRC value is rejected at
   `DecoderBuilder::build` (single whole-stream CRC only).
-- ISA-L backend (`isal` feature): lazy zlib-rs `Block` fallback; pending
-  prime/dictionary so NoFlush seek resume does not allocate zlib-rs.
-- ISA-L backend: `InflateFlush::Finish` multi-steps `isal_inflate` until
-  STREAM_END (or hard error / stall / `max_produce` / spare exhaustion) so
-  BGZF one-shot members that leave data in `tmp_out` after `INPUT_DONE`
-  complete in a single public call. `NoFlush` remains single-step.
-- ISA-L perf: skip full ~87 KiB `inflate_state` zero on create (`isal_inflate_init`
-  only); use ISA-L `crc32_gzip_refl` for gzip CRC when `isal` is enabled;
-  BGZF with `decoder_threads == 1` (or a single task) runs an inline sequential
-  block path without worker/channel reordering.
-- CI: optional Ubuntu `isal` job with `libisal-dev` (`cargo test` /
-  `clippy` / CLI check with `--features isal`).
+- ISA-L backend (`isal` feature):
+  - Lazy zlib-rs `Block` fallback; pending prime/dictionary so NoFlush seek
+    resume does not allocate zlib-rs.
+  - `InflateFlush::Finish` multi-steps `isal_inflate` until STREAM_END (or hard
+    error / stall / `max_produce` / spare exhaustion) so BGZF one-shots that
+    leave data in `tmp_out` after `INPUT_DONE` complete in one public call.
+    `NoFlush` remains single-step.
+  - Skip full ~87 KiB `inflate_state` zero on create (`isal_inflate_init` only);
+    use ISA-L `crc32_gzip_refl` for gzip CRC when `isal` is enabled; BGZF with
+    `decoder_threads == 1` (or a single task) runs inline without worker/channel
+    reordering.
+- CLI version reports `+isal` when built with the feature (e.g. `0.2.2+isal`).
+- Fair harness labels linked ISA-L builds as `rapidgzip-rust-isal` (symbol/`ldd`
+  detect) in `run-matrix.sh` / `parity-compare.sh`.
+- CI: optional Ubuntu `isal` job with `libisal-dev`.
 
 ### Docs
 
 - Fair bench snapshot and residual notes for optional ISA-L; monomorphization
   docs use `ActiveInflater` (zlib-rs default, ISA-L with `isal`).
+
+### Known residual
+
+- Without `isal`, P=1 and small / low-thread marker budgets stay zlib-rs-limited.
+- **No compression** (decoder-only).
+- Random-access indexes remain **gzip/BGZF-oriented** (not raw DEFLATE).
 
 ## [0.2.1] - 2026-08-01
 
