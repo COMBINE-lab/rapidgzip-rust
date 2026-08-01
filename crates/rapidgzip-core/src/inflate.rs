@@ -7,6 +7,7 @@
 //! [`RawInflater::set_dictionary`] or [`RawInflater::set_dictionary_bytes`]
 //! for the predecessor window.
 
+use crate::inflate_backend::{InflateBackend, InflateOutcome, InflateStep};
 use crate::parallel::Window;
 use crate::{DecodeError, DeflateErrorKind};
 use libz_rs_sys as z;
@@ -168,5 +169,93 @@ impl Drop for RawInflater {
             // successfully initialized, uniquely owned stream.
             let _ = unsafe { z::inflateEnd(&mut self.stream) };
         }
+    }
+}
+
+impl InflateBackend for RawInflater {
+    fn new() -> Result<Self, DecodeError> {
+        Self::new()
+    }
+
+    fn reset(&mut self, bit_offset: u64) -> Result<(), DecodeError> {
+        Self::reset(self, bit_offset)
+    }
+
+    fn set_dictionary(&mut self, window: &[u8], bit_offset: u64) -> Result<(), DecodeError> {
+        self.set_dictionary_bytes(window, bit_offset)
+    }
+
+    fn inflate(
+        &mut self,
+        input: &[u8],
+        output: &mut Vec<u8>,
+        finish: bool,
+    ) -> Result<InflateStep, DecodeError> {
+        let start = output.len();
+        let spare = output.spare_capacity_mut();
+        let output_length = spare.len().min(u32::MAX as usize);
+        let input_length = input.len().min(u32::MAX as usize);
+
+        self.stream.next_in = input.as_ptr();
+        self.stream.avail_in = input_length as u32;
+        self.stream.next_out = spare.as_mut_ptr().cast::<u8>();
+        self.stream.avail_out = output_length as u32;
+        let input_before = self.stream.avail_in;
+        let output_before = self.stream.avail_out;
+
+        let flush = if finish { z::Z_FINISH } else { z::Z_NO_FLUSH };
+        // SAFETY:
+        // - the stream is initialized and uniquely borrowed for this call;
+        // - `next_in` covers `input`, which stays live and unmoved;
+        // - `next_out` covers only the uniquely owned spare capacity of
+        //   `output`, whose length is extended below by exactly the count
+        //   zlib reports as initialized.
+        let status = unsafe { z::inflate(&mut self.stream, flush) };
+
+        let consumed = (input_before - self.stream.avail_in) as usize;
+        let produced = (output_before - self.stream.avail_out) as usize;
+        // SAFETY: zlib initialized exactly `produced` bytes of the spare
+        // capacity supplied above and cannot report more than that capacity.
+        unsafe { output.set_len(start + produced) };
+
+        let outcome = match status {
+            z::Z_STREAM_END => InflateOutcome::StreamEnd,
+            z::Z_OK => InflateOutcome::Progress,
+            z::Z_BUF_ERROR => {
+                if consumed > 0 || produced > 0 {
+                    InflateOutcome::Progress
+                } else {
+                    InflateOutcome::Blocked
+                }
+            }
+            z::Z_NEED_DICT => {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: 0,
+                    reason: DeflateErrorKind::UnexpectedDictionary,
+                });
+            }
+            z::Z_DATA_ERROR => {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: 0,
+                    reason: DeflateErrorKind::InvalidData,
+                });
+            }
+            other => {
+                return Err(DecodeError::InvalidDeflate {
+                    bit_offset: 0,
+                    reason: DeflateErrorKind::BackendStatus(other),
+                });
+            }
+        };
+
+        Ok(InflateStep {
+            outcome,
+            consumed,
+            produced,
+        })
+    }
+
+    fn message(&self) -> Option<String> {
+        Self::message(self)
     }
 }

@@ -150,6 +150,7 @@ mod format;
 mod gzip;
 mod indexed;
 mod inflate;
+mod inflate_backend;
 mod read_at;
 mod reader;
 mod runtime;

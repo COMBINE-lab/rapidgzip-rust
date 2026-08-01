@@ -4,6 +4,7 @@ use crate::crc32::Crc32;
 use crate::gzip::{InputCursor, MemberHeader, SourceCursor, StreamCursor, parse_member_header};
 use crate::index::Checkpoint;
 use crate::inflate::RawInflater;
+use crate::inflate_backend::{ActiveInflater, InflateBackend, InflateOutcome};
 use crate::parallel::Window;
 use crate::parallel::adaptive::AdaptiveConcurrency;
 use crate::parallel::deflate::{
@@ -3515,7 +3516,7 @@ fn decode_bgzf_block_into<R: ReadAt + ?Sized>(
     member: u64,
     compressed: &mut Vec<u8>,
     output: &mut Vec<u8>,
-    inflater: &mut RawInflater,
+    inflater: &mut ActiveInflater,
 ) -> Result<(), DecodeError> {
     const MAX_BGZF_OUTPUT: usize = 64 * 1024;
     let compressed_length =
@@ -3561,39 +3562,27 @@ fn decode_bgzf_block_into<R: ReadAt + ?Sized>(
 
     inflater.reset(range.deflate_start.saturating_mul(8))?;
     let old_length = output.len();
-    let writable = decoded_length.saturating_add(1);
-    output.reserve(writable);
-    let spare = output.spare_capacity_mut();
-    inflater.stream.next_in = payload.as_ptr();
-    inflater.stream.avail_in = payload.len() as u32;
-    inflater.stream.next_out = spare.as_mut_ptr().cast::<u8>();
-    inflater.stream.avail_out = writable as u32;
-    let input_before = inflater.stream.avail_in;
-    let output_before = inflater.stream.avail_out;
-
-    // SAFETY: `payload` remains live for the call and fits BGZF's 64 KiB
-    // compressed-block bound. `output.reserve` provided at least `writable`
-    // bytes of valid uninitialized spare capacity, exactly matching
-    // `avail_out`; zlib writes them before Rust observes them.
-    let status = unsafe { z::inflate(&mut inflater.stream, z::Z_FINISH) };
-    let consumed =
-        usize::try_from(input_before - inflater.stream.avail_in).expect("zlib uInt fits usize");
-    let produced =
-        usize::try_from(output_before - inflater.stream.avail_out).expect("zlib uInt fits usize");
-    if status != z::Z_STREAM_END || consumed != payload.len() || produced != decoded_length {
+    // One spare byte beyond the declared size detects a block that decodes to
+    // more than its footer claims.
+    output.reserve(decoded_length.saturating_add(1));
+    let step = inflater.inflate(payload, output, true).map_err(|error| {
+        if let DecodeError::InvalidDeflate { reason, .. } = error {
+            DecodeError::InvalidDeflate {
+                bit_offset: range.deflate_start.saturating_mul(8),
+                reason,
+            }
+        } else {
+            error
+        }
+    })?;
+    if step.outcome != InflateOutcome::StreamEnd
+        || step.consumed != payload.len()
+        || step.produced != decoded_length
+    {
         return Err(DecodeError::InvalidDeflate {
             bit_offset: range.deflate_start.saturating_mul(8),
-            reason: if status == z::Z_DATA_ERROR {
-                DeflateErrorKind::InvalidData
-            } else {
-                DeflateErrorKind::BackendStatus(status)
-            },
+            reason: DeflateErrorKind::InvalidData,
         });
-    }
-    // SAFETY: zlib reported `produced` bytes written through `next_out`, and
-    // that pointer covered `writable` bytes in this vector's spare capacity.
-    unsafe {
-        output.set_len(old_length + produced);
     }
     let mut crc = Crc32::new();
     crc.update(&output[old_length..]);
@@ -3703,7 +3692,7 @@ fn spawn_bgzf_worker<'scope, 'env: 'scope, R>(
                 let _busy = adaptive_workers.runtime.begin_task();
                 (|| {
                     if inflater.is_none() {
-                        inflater = Some(RawInflater::new()?);
+                        inflater = Some(ActiveInflater::new()?);
                     }
                     let inflater = inflater
                         .as_mut()

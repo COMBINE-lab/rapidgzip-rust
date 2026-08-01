@@ -8,12 +8,12 @@
 
 ## Steps
 
-- [ ] **1. Backend trait and the zlib-rs implementation**
+- [x] **1. Backend trait and the zlib-rs implementation**
   `inflate_backend.rs` with `InflateBackend`, `InflateStep`, `InflateOutcome`,
   implemented by the existing `RawInflater`.
   Verify: `cargo test -p rapidgzip-core --lib`.
 
-- [ ] **2. Switch the whole-stream call sites**
+- [x] **2. Switch the whole-stream call sites**
   Sequential gzip members, single-stream zlib and raw DEFLATE, and BGZF blocks
   go through `ActiveInflater`. The marker/window path and `IndexedReader` stay
   on `RawInflater`, with a comment saying why.

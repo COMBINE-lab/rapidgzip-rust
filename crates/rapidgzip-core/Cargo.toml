@@ -12,6 +12,14 @@ documentation = "https://docs.rs/rapidgzip-core"
 keywords = ["gzip", "deflate", "parallel", "bgzf", "fastq"]
 categories = ["compression", "filesystem"]
 
+[features]
+default = []
+# Optional ISA-L raw-inflate backend for the whole-stream decode paths.
+# Requires a system `libisal` (`libisal-dev` on Debian and Ubuntu, `isa-l` on
+# Homebrew), or `ISAL_INSTALL_PREFIX` pointing at a prefix that contains it.
+# Default builds stay on zlib-rs.
+isal = []
+
 [dependencies]
 crossbeam-deque.workspace = true
 libz-rs-sys.workspace = true
