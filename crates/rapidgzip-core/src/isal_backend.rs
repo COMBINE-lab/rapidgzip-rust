@@ -310,12 +310,18 @@ impl IsalInflater {
 
 impl InflateBackend for IsalInflater {
     fn create() -> Result<Self, DecodeError> {
-        // Zero then init so temporary buffers start clean.
-        // SAFETY: `inflate_state` is a C POD; zeroed then fully initialized by
-        // `isal_inflate_init` before any other use.
-        let mut state = Box::new(unsafe { std::mem::zeroed::<inflate_state>() });
-        // SAFETY: state is a valid, exclusively owned inflate_state.
-        unsafe { isal_inflate_init(&mut *state) };
+        // `inflate_state` is ~87 KiB (large tmp_out history). `isal_inflate_init`
+        // sets every field the library subsequently reads and zeros
+        // tmp_out_valid/processed, so full `mem::zeroed` is unnecessary cost on
+        // create (many short-lived inflaters on dense multi-member / BGZF paths).
+        // SAFETY: `isal_inflate_init` fully initializes the struct's control
+        // fields; history/tmp bytes are only consumed within the valid ranges
+        // it tracks (starts empty).
+        let mut state = unsafe {
+            let mut uninit = Box::<inflate_state>::new_uninit();
+            isal_inflate_init(uninit.as_mut_ptr());
+            uninit.assume_init()
+        };
         state.crc_flag = ISAL_DEFLATE;
         Ok(Self {
             state,

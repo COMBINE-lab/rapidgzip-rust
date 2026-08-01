@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   STREAM_END (or hard error / stall / `max_produce` / spare exhaustion) so
   BGZF one-shot members that leave data in `tmp_out` after `INPUT_DONE`
   complete in a single public call. `NoFlush` remains single-step.
+- ISA-L perf: skip full ~87 KiB `inflate_state` zero on create (`isal_inflate_init`
+  only); use ISA-L `crc32_gzip_refl` for gzip CRC when `isal` is enabled;
+  BGZF with `decoder_threads == 1` (or a single task) runs an inline sequential
+  block path without worker/channel reordering.
 - CI: optional Ubuntu `isal` job with `libisal-dev` (`cargo test` /
   `clippy` / CLI check with `--features isal`).
 

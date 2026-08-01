@@ -5454,6 +5454,74 @@ fn send_bgzf_result(
     }
 }
 
+/// Single-thread / single-task BGZF decode: same block semantics as the
+/// parallel path without worker threads or reordering channels.
+fn decode_bgzf_sequential<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    ranges: &[BgzfRange],
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    let mut compressed = Vec::new();
+    let mut decoded = Vec::with_capacity((64 * 1024).min(config.decoded_chunk_size));
+    let mut inflater = <ActiveInflater as InflateBackend>::create()?;
+    let mut total_output = 0_u64;
+    let mut index_builder = new_index_builder(config);
+    let crc32_enabled = config.crc32_enabled;
+
+    for (range_index, &range) in ranges.iter().enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(DecodeError::Cancelled);
+        }
+        decoded.clear();
+        if decoded.capacity() < 64 * 1024 {
+            decoded.reserve(64 * 1024 - decoded.capacity());
+        }
+        let produced = decode_bgzf_block_into(
+            source,
+            range,
+            range_index as u64,
+            &mut compressed,
+            &mut decoded,
+            &mut inflater,
+            crc32_enabled,
+        )?;
+        debug_assert_eq!(produced, decoded.len());
+        let new_total =
+            total_output
+                .checked_add(produced as u64)
+                .ok_or(DecodeError::OutputLimitExceeded {
+                    limit: config.output_limit.unwrap_or(u64::MAX),
+                })?;
+        if config.output_limit.is_some_and(|limit| new_total > limit) {
+            return Err(DecodeError::OutputLimitExceeded {
+                limit: config.output_limit.expect("checked as some"),
+            });
+        }
+        total_output = new_total;
+        // Empty window at each BGZF block start (independent members).
+        index_builder.force_checkpoint(range.deflate_start.saturating_mul(8), true);
+        index_builder.push_output(&decoded);
+        decoded = output.emit_reusable(decoded)?;
+    }
+
+    let compressed_bytes = source
+        .len()
+        .map_err(|error| DecodeError::input_io(0, error))?;
+    Ok(finish_report(
+        config,
+        compressed_bytes,
+        total_output,
+        ranges.len() as u64,
+        index_builder,
+    ))
+}
+
 fn decode_bgzf_parallel<R, O>(
     source: &R,
     config: &Config,
@@ -5468,6 +5536,12 @@ where
     const BLOCKS_PER_TASK: usize = 8;
     let task_count = ranges.len().div_ceil(BLOCKS_PER_TASK);
     let worker_count = config.decoder_threads.min(task_count);
+    // P=1 (or a single task): skip thread/channel reordering overhead. Still
+    // uses the BGZF block decoder (Finish + ISIZE) rather than generic
+    // multi-member sequential inflate.
+    if worker_count <= 1 {
+        return decode_bgzf_sequential(source, config, cancelled, output, ranges);
+    }
     let task_queue = Arc::new(Injector::new());
     let stopped = Arc::new(AtomicBool::new(false));
     let available_tasks = Arc::new(AtomicUsize::new(0));

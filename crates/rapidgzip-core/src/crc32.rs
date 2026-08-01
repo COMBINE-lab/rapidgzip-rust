@@ -1,7 +1,15 @@
 use crate::DecodeError;
 
-/// Incremental IEEE CRC32 used by gzip.
+/// Incremental IEEE CRC32 used by gzip (reflected / gzip trailer convention).
 pub(crate) struct Crc32(u32);
+
+#[cfg(feature = "isal")]
+// Linked via the `isal` feature (same `libisal` as inflate). Prefer ISA-L's
+// PCLMUL path for verify-on decode; same reflected IEEE poly as zlib/gzip
+// (check value for "123456789" is still 0xCBF4_3926).
+unsafe extern "C" {
+    fn crc32_gzip_refl(init_crc: u32, buf: *const u8, len: u64) -> u32;
+}
 
 impl Crc32 {
     pub(crate) const fn new() -> Self {
@@ -9,11 +17,20 @@ impl Crc32 {
     }
 
     pub(crate) fn update(&mut self, bytes: &[u8]) {
-        // SAFETY: `bytes.as_ptr()` and `bytes.len()` describe one live,
-        // immutable allocation for the duration of the call. `crc32_z`
-        // performs runtime dispatch to zlib-rs's PCLMUL/ACLE implementations
-        // when supported and otherwise uses its portable braid routine.
-        self.0 = unsafe { libz_rs_sys::crc32_z(self.0.into(), bytes.as_ptr(), bytes.len()) as u32 };
+        #[cfg(feature = "isal")]
+        {
+            // SAFETY: `bytes` is a live immutable slice for the call; ISA-L
+            // only reads `len` bytes from `buf`. Same reflected IEEE poly as
+            // gzip trailers / zlib `crc32`.
+            self.0 = unsafe { crc32_gzip_refl(self.0, bytes.as_ptr(), bytes.len() as u64) };
+        }
+        #[cfg(not(feature = "isal"))]
+        {
+            // SAFETY: `bytes` is a live immutable slice for the call.
+            // zlib-rs runtime dispatch (PCLMUL/ACLE or portable braid).
+            self.0 =
+                unsafe { libz_rs_sys::crc32_z(self.0.into(), bytes.as_ptr(), bytes.len()) as u32 };
+        }
     }
 
     pub(crate) const fn finish(&self) -> u32 {
