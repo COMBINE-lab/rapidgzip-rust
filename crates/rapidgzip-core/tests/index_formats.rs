@@ -1,31 +1,42 @@
 //! On-disk index format round-trips and rejection tests.
 
 use rapidgzip_core::index::WINDOW_SIZE;
-use rapidgzip_core::{Checkpoint, GzipIndex, IndexError, StoredWindow};
+use rapidgzip_core::{
+    Checkpoint, CheckpointKind, GzipIndex, IndexError, IndexKind, IndexReadOptions, StoredWindow,
+};
 
 /// An index with a member-boundary point and an interior point whose
 /// compressed offset is deliberately not byte aligned.
 fn sample_index() -> GzipIndex {
     let mut index = GzipIndex::new();
-    index.compressed_size_in_bytes = 1_000_000;
-    index.uncompressed_size_in_bytes = 8_000_000;
-    index.checkpoint_spacing_in_bytes = 4 * 1024 * 1024;
-    index.push(
-        Checkpoint {
-            compressed_offset_in_bits: 0,
-            uncompressed_offset_in_bytes: 0,
-            line_offset: 0,
-        },
-        StoredWindow::empty(),
-    );
-    index.push(
-        Checkpoint {
-            compressed_offset_in_bits: 8 * 4096 + 3,
-            uncompressed_offset_in_bytes: 4 * 1024 * 1024,
-            line_offset: 1234,
-        },
-        StoredWindow::from_raw(vec![0xa5u8; WINDOW_SIZE]),
-    );
+    index.set_compressed_size(Some(1_000_000));
+    index.set_uncompressed_size(Some(8_000_000));
+    index.set_checkpoint_spacing(Some(4 * 1024 * 1024));
+    index.set_total_line_count(Some(1234));
+    index
+        .push(
+            Checkpoint {
+                compressed_offset_in_bits: 80,
+                uncompressed_offset_in_bytes: 0,
+                kind: CheckpointKind::MemberDeflate {
+                    header_offset_in_bytes: 0,
+                },
+                line_offset: Some(0),
+            },
+            StoredWindow::empty(),
+        )
+        .expect("first checkpoint");
+    index
+        .push(
+            Checkpoint {
+                compressed_offset_in_bits: 8 * 4096 + 3,
+                uncompressed_offset_in_bytes: 4 * 1024 * 1024,
+                kind: CheckpointKind::DeflateBlock,
+                line_offset: Some(1234),
+            },
+            StoredWindow::from_raw(vec![0xa5u8; WINDOW_SIZE]).expect("window"),
+        )
+        .expect("interior checkpoint");
     index
 }
 
@@ -50,14 +61,8 @@ fn assert_same_windows(left: &GzipIndex, right: &GzipIndex) {
 
 fn assert_same_index(left: &GzipIndex, right: &GzipIndex) {
     assert_eq!(left.checkpoints(), right.checkpoints());
-    assert_eq!(
-        left.compressed_size_in_bytes,
-        right.compressed_size_in_bytes
-    );
-    assert_eq!(
-        left.uncompressed_size_in_bytes,
-        right.uncompressed_size_in_bytes
-    );
+    assert_eq!(left.compressed_size(), right.compressed_size());
+    assert_eq!(left.uncompressed_size(), right.uncompressed_size());
     assert_same_windows(left, right);
 }
 
@@ -68,33 +73,37 @@ fn native_round_trips() {
     index.write_native(&mut bytes).expect("write");
     let restored = GzipIndex::read_native(&mut bytes.as_slice()).expect("read");
     assert_same_index(&index, &restored);
-    assert_eq!(
-        restored.checkpoint_spacing_in_bytes,
-        index.checkpoint_spacing_in_bytes
-    );
+    assert_eq!(restored.checkpoint_spacing(), index.checkpoint_spacing());
 }
 
 #[test]
 fn native_round_trips_compressed_windows() {
     let mut index = GzipIndex::new();
-    index.compressed_size_in_bytes = 4096;
-    index.uncompressed_size_in_bytes = 1 << 20;
-    index.push(
-        Checkpoint {
-            compressed_offset_in_bits: 0,
-            uncompressed_offset_in_bytes: 0,
-            line_offset: 0,
-        },
-        StoredWindow::empty(),
-    );
-    index.push(
-        Checkpoint {
-            compressed_offset_in_bits: 1000,
-            uncompressed_offset_in_bytes: 65536,
-            line_offset: 0,
-        },
-        StoredWindow::from_raw_maybe_compress(vec![0x3cu8; WINDOW_SIZE], true).expect("compress"),
-    );
+    index.set_compressed_size(Some(4096));
+    index.set_uncompressed_size(Some(1 << 20));
+    index
+        .push(
+            Checkpoint {
+                compressed_offset_in_bits: 0,
+                uncompressed_offset_in_bytes: 0,
+                kind: CheckpointKind::MemberHeader,
+                line_offset: None,
+            },
+            StoredWindow::empty(),
+        )
+        .expect("origin");
+    index
+        .push(
+            Checkpoint {
+                compressed_offset_in_bits: 1000,
+                uncompressed_offset_in_bytes: 65536,
+                kind: CheckpointKind::DeflateBlock,
+                line_offset: None,
+            },
+            StoredWindow::from_raw_maybe_compress(vec![0x3cu8; WINDOW_SIZE], true)
+                .expect("compress"),
+        )
+        .expect("interior checkpoint");
 
     let mut bytes = Vec::new();
     index.write_native(&mut bytes).expect("write");
@@ -166,6 +175,50 @@ fn native_rejects_an_unknown_version() {
 }
 
 #[test]
+fn native_rejects_unknown_flags_and_caller_bounded_counts() {
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index.write_native(&mut bytes).expect("write");
+
+    let mut unknown_flags = bytes.clone();
+    unknown_flags[10..12].copy_from_slice(&0x8000_u16.to_le_bytes());
+    assert!(matches!(
+        GzipIndex::read_native(&mut unknown_flags.as_slice()),
+        Err(IndexError::UnsupportedFlags { flags: 0x8000 })
+    ));
+
+    let options = IndexReadOptions {
+        max_checkpoints: 1,
+        ..IndexReadOptions::default()
+    };
+    assert!(matches!(
+        GzipIndex::read_native_with_options(&mut bytes.as_slice(), options),
+        Err(IndexError::ExcessiveLength {
+            what: "checkpoint count",
+            value: 2
+        })
+    ));
+}
+
+#[test]
+fn native_applies_the_per_window_payload_limit_before_allocation() {
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index.write_native(&mut bytes).expect("write");
+    let options = IndexReadOptions {
+        max_window_payload_bytes: 1024,
+        ..IndexReadOptions::default()
+    };
+    assert!(matches!(
+        GzipIndex::read_native_with_options(&mut bytes.as_slice(), options),
+        Err(IndexError::ExcessiveLength {
+            what: "window payload length",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn zran_bit_packing_round_trips() {
     use rapidgzip_core::index::{decode_bit_offset, encode_bit_offset};
 
@@ -221,7 +274,7 @@ fn gzidx_round_trips() {
         restored
             .checkpoints()
             .iter()
-            .all(|point| point.line_offset == 0)
+            .all(|point| point.line_offset.is_none())
     );
     assert_same_windows(&index, &restored);
 }
@@ -268,6 +321,28 @@ fn gzidx_rejects_a_hostile_checkpoint_count() {
 }
 
 #[test]
+fn gzidx_rejects_unknown_header_and_checkpoint_flags() {
+    let index = sample_index();
+    let mut bytes = Vec::new();
+    index.write_gzidx(&mut bytes).expect("write");
+
+    let mut header_flags = bytes.clone();
+    header_flags[6] = 1;
+    assert!(matches!(
+        GzipIndex::read_gzidx(&mut header_flags.as_slice(), None),
+        Err(IndexError::UnsupportedFlags { flags: 1 })
+    ));
+
+    let mut point_flags = bytes;
+    // Header is 35 bytes; the first version-1 point's data flag is byte 52.
+    point_flags[52] = 2;
+    assert_eq!(
+        GzipIndex::read_gzidx(&mut point_flags.as_slice(), None).unwrap_err(),
+        IndexError::InvalidCheckpoint("GZIDX window flag is not zero or one")
+    );
+}
+
+#[test]
 fn gzidx_rejects_truncation_at_every_prefix() {
     let index = sample_index();
     let mut bytes = Vec::new();
@@ -283,17 +358,21 @@ fn gzidx_rejects_truncation_at_every_prefix() {
 /// Three independent BGZF-style block starts, none needing a window.
 fn bgzf_style_index() -> GzipIndex {
     let mut index = GzipIndex::new();
-    index.compressed_size_in_bytes = 300;
-    index.uncompressed_size_in_bytes = 3000;
+    index.set_kind(IndexKind::Bgzf);
+    index.set_compressed_size(Some(300));
+    index.set_uncompressed_size(Some(3000));
     for block in 0..3u64 {
-        index.push(
-            Checkpoint {
-                compressed_offset_in_bits: block * 8 * 100,
-                uncompressed_offset_in_bytes: block * 1000,
-                line_offset: 0,
-            },
-            StoredWindow::empty(),
-        );
+        index
+            .push(
+                Checkpoint {
+                    compressed_offset_in_bits: block * 8 * 100,
+                    uncompressed_offset_in_bytes: block * 1000,
+                    kind: CheckpointKind::MemberHeader,
+                    line_offset: None,
+                },
+                StoredWindow::empty(),
+            )
+            .expect("BGZF checkpoint");
     }
     index
 }
@@ -309,12 +388,13 @@ fn gzi_round_trips_block_starts_and_skips_the_origin() {
 
     let restored = GzipIndex::read_gzi(&mut bytes.as_slice(), Some(300)).expect("read");
     assert_eq!(restored.checkpoints(), index.checkpoints());
-    assert_eq!(restored.uncompressed_size_in_bytes, u64::MAX);
+    assert_eq!(restored.uncompressed_size(), None);
 }
 
 #[test]
 fn gzi_round_trips_an_empty_index() {
-    let index = GzipIndex::new();
+    let mut index = GzipIndex::new();
+    index.set_kind(IndexKind::Bgzf);
     let mut bytes = Vec::new();
     index.write_gzi(&mut bytes).expect("write");
     assert_eq!(bytes.len(), 8);
@@ -324,47 +404,56 @@ fn gzi_round_trips_an_empty_index() {
 }
 
 #[test]
-fn gzi_refuses_checkpoints_that_need_a_window() {
+fn gzi_refuses_interior_deflate_checkpoints() {
     let mut index = bgzf_style_index();
-    index.push(
-        Checkpoint {
-            compressed_offset_in_bits: 8 * 250,
-            uncompressed_offset_in_bytes: 4000,
-            line_offset: 0,
-        },
-        StoredWindow::from_raw(vec![3u8; WINDOW_SIZE]),
-    );
+    index
+        .push(
+            Checkpoint {
+                compressed_offset_in_bits: 8 * 250,
+                uncompressed_offset_in_bytes: 2500,
+                kind: CheckpointKind::DeflateBlock,
+                line_offset: None,
+            },
+            StoredWindow::from_raw(vec![3u8; WINDOW_SIZE]).expect("window"),
+        )
+        .expect("interior point");
     let mut bytes = Vec::new();
     assert_eq!(
         index.write_gzi(&mut bytes).unwrap_err(),
-        IndexError::InvalidCheckpoint("BGZF index cannot store a predecessor window")
+        IndexError::InvalidCheckpoint("BGZF index requires member-boundary checkpoints")
     );
 }
 
 #[test]
 fn gzi_refuses_unaligned_offsets() {
     let mut index = GzipIndex::new();
-    index.compressed_size_in_bytes = 300;
-    index.push(
-        Checkpoint {
-            compressed_offset_in_bits: 0,
-            uncompressed_offset_in_bytes: 0,
-            line_offset: 0,
-        },
-        StoredWindow::empty(),
-    );
-    index.push(
-        Checkpoint {
-            compressed_offset_in_bits: 8 * 100 + 1,
-            uncompressed_offset_in_bytes: 1000,
-            line_offset: 0,
-        },
-        StoredWindow::empty(),
-    );
-    let mut bytes = Vec::new();
+    index.set_kind(IndexKind::Bgzf);
+    index.set_compressed_size(Some(300));
+    index
+        .push(
+            Checkpoint {
+                compressed_offset_in_bits: 0,
+                uncompressed_offset_in_bytes: 0,
+                kind: CheckpointKind::MemberHeader,
+                line_offset: None,
+            },
+            StoredWindow::empty(),
+        )
+        .expect("origin");
+    let error = index
+        .push(
+            Checkpoint {
+                compressed_offset_in_bits: 8 * 100 + 1,
+                uncompressed_offset_in_bytes: 1000,
+                kind: CheckpointKind::MemberHeader,
+                line_offset: None,
+            },
+            StoredWindow::empty(),
+        )
+        .expect_err("unaligned member checkpoint");
     assert_eq!(
-        index.write_gzi(&mut bytes).unwrap_err(),
-        IndexError::InvalidCheckpoint("BGZF index requires byte-aligned compressed offsets")
+        error,
+        IndexError::InvalidCheckpoint("member-header checkpoint is not byte aligned")
     );
 }
 
@@ -404,18 +493,15 @@ fn gztool_round_trips_without_lines() {
     assert_eq!(&bytes[8..16], b"gzipindx");
 
     let restored = GzipIndex::read_gztool(&mut bytes.as_slice(), Some(1_000_000)).expect("read");
-    assert_eq!(restored.total_line_count, None);
+    assert_eq!(restored.total_line_count(), None);
     assert!(
         restored
             .checkpoints()
             .iter()
-            .all(|point| point.line_offset == 0)
+            .all(|point| point.line_offset.is_none())
     );
     assert_same_windows(&index, &restored);
-    assert_eq!(
-        restored.uncompressed_size_in_bytes,
-        index.uncompressed_size_in_bytes
-    );
+    assert_eq!(restored.uncompressed_size(), index.uncompressed_size());
 }
 
 #[test]
@@ -430,8 +516,30 @@ fn gztool_round_trips_with_lines() {
     assert_eq!(&bytes[8..16], b"gzipindX");
 
     let restored = GzipIndex::read_gztool(&mut bytes.as_slice(), Some(1_000_000)).expect("read");
-    assert_eq!(restored.checkpoints(), index.checkpoints());
-    assert_eq!(restored.total_line_count, Some(1234));
+    let restored_fields: Vec<_> = restored
+        .checkpoints()
+        .iter()
+        .map(|point| {
+            (
+                point.compressed_offset_in_bits,
+                point.uncompressed_offset_in_bytes,
+                point.line_offset,
+            )
+        })
+        .collect();
+    let expected_fields: Vec<_> = index
+        .checkpoints()
+        .iter()
+        .map(|point| {
+            (
+                point.compressed_offset_in_bits,
+                point.uncompressed_offset_in_bytes,
+                point.line_offset,
+            )
+        })
+        .collect();
+    assert_eq!(restored_fields, expected_fields);
+    assert_eq!(restored.total_line_count(), Some(1234));
     assert_same_windows(&index, &restored);
 }
 

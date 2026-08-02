@@ -1,15 +1,17 @@
 //! Random-access gzip index types and on-disk formats.
 //!
 //! This module is independent of the decoder: it defines the index data model,
-//! validates it, and reads and writes the supported on-disk formats. Using an
-//! index for random access lives in [`crate::indexed`].
+//! validates it, and reads and writes the supported on-disk formats. Use an
+//! index for random access with [`crate::IndexedReader`].
 
+mod build;
 mod gzi;
 mod gzidx;
 mod gztool;
 mod native;
 mod window_codec;
 
+pub(crate) use build::IndexCollector;
 pub use gzidx::{decode_bit_offset, encode_bit_offset};
 pub use gztool::WithLines;
 pub(crate) use window_codec::{zlib_compress_window, zlib_decompress_window};
@@ -19,24 +21,111 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read, Write};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 /// DEFLATE history size, in bytes, required at a resume point.
 pub const WINDOW_SIZE: usize = 32768;
 
+/// Provenance of the compressed source described by an index.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum IndexKind {
+    /// Ordinary gzip, including concatenated gzip members.
+    #[default]
+    Gzip,
+    /// A stream proven to consist entirely of BGZF blocks.
+    Bgzf,
+}
+
+/// How inflation resumes at a checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CheckpointKind {
+    /// The offset points at the gzip magic bytes of a complete member.
+    MemberHeader,
+    /// The offset points at raw DEFLATE immediately after a known member
+    /// header. Keeping the header offset permits full verification while
+    /// retaining compatibility with raw-DEFLATE index formats.
+    MemberDeflate {
+        /// Absolute byte offset of the gzip member header.
+        header_offset_in_bytes: u64,
+    },
+    /// The offset points at the first bit of a raw DEFLATE block.
+    DeflateBlock,
+}
+
+/// How predecessor windows are retained while an index is built.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum WindowStorage {
+    /// Retain each 32 KiB window verbatim.
+    Raw,
+    /// Retain the zlib-compressed form when it is smaller.
+    #[default]
+    Zlib,
+}
+
+/// Options for collecting a random-access index during a decode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IndexOptions {
+    /// Target distance between retained interior checkpoints.
+    pub checkpoint_spacing: NonZeroU64,
+    /// In-memory representation of retained predecessor windows.
+    pub window_storage: WindowStorage,
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self {
+            checkpoint_spacing: NonZeroU64::new(4 * 1024 * 1024).expect("four MiB is non-zero"),
+            window_storage: WindowStorage::Zlib,
+        }
+    }
+}
+
+/// Allocation limits applied while parsing an untrusted index file.
+///
+/// The defaults permit more than four million checkpoints while preventing a
+/// small hostile header from requesting an effectively unbounded allocation.
+/// Applications opening exceptionally large trusted indexes can raise these
+/// limits explicitly with the `read_*_with_options` methods.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IndexReadOptions {
+    /// Maximum number of checkpoint records.
+    pub max_checkpoints: usize,
+    /// Maximum sum of stored predecessor-window payload bytes.
+    pub max_window_bytes: u64,
+    /// Maximum bytes in one stored predecessor-window payload.
+    pub max_window_payload_bytes: usize,
+}
+
+impl Default for IndexReadOptions {
+    fn default() -> Self {
+        Self {
+            max_checkpoints: 4 * 1024 * 1024,
+            max_window_bytes: 512 * 1024 * 1024,
+            max_window_payload_bytes: 64 * 1024,
+        }
+    }
+}
+
 /// A random-access point into a gzip stream.
 ///
 /// The compressed position is a bit offset because a DEFLATE block boundary is
-/// not generally byte aligned. Resuming there requires the predecessor window
-/// stored alongside the checkpoint, unless that window is empty.
+/// not generally byte aligned. [`CheckpointKind`] says whether the offset is a
+/// gzip member header, a known member's raw payload, or an interior DEFLATE
+/// block, so a reader never has to infer framing from compressed bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Checkpoint {
     /// Absolute compressed bit offset from the start of the source.
     pub compressed_offset_in_bits: u64,
     /// Absolute decompressed byte offset across all members.
     pub uncompressed_offset_in_bytes: u64,
-    /// Number of lines preceding this point, zero when unknown.
-    pub line_offset: u64,
+    /// How a decoder resumes at this compressed position.
+    pub kind: CheckpointKind,
+    /// Number of lines preceding this point, when supplied by the index.
+    pub line_offset: Option<u64>,
 }
 
 /// Predecessor history for a checkpoint.
@@ -61,13 +150,19 @@ impl StoredWindow {
         }
     }
 
-    /// Stores `bytes` as raw, uncompressed history.
-    #[must_use]
-    pub fn from_raw(bytes: impl Into<Vec<u8>>) -> Self {
-        Self {
-            payload: bytes.into(),
+    /// Stores exactly one raw DEFLATE history window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::InvalidWindowSize`] unless `bytes` contains
+    /// exactly [`WINDOW_SIZE`] bytes.
+    pub fn from_raw(bytes: impl Into<Vec<u8>>) -> Result<Self, IndexError> {
+        let payload = bytes.into();
+        validate_expanded_window(&payload)?;
+        Ok(Self {
+            payload,
             compressed: false,
-        }
+        })
     }
 
     /// Returns whether this window carries no history.
@@ -90,20 +185,29 @@ impl StoredWindow {
 
     /// Stores `bytes`, optionally zlib-compressed to reduce resident memory.
     ///
-    /// An empty input, or history that does not shrink, is stored raw.
+    /// History that does not shrink is stored raw. The input must contain
+    /// exactly [`WINDOW_SIZE`] bytes.
     pub fn from_raw_maybe_compress(
         bytes: impl Into<Vec<u8>>,
         compress: bool,
     ) -> Result<Self, IndexError> {
         let bytes = bytes.into();
-        if !compress || bytes.is_empty() {
-            return Ok(Self::from_raw(bytes));
+        validate_expanded_window(&bytes)?;
+        if !compress {
+            return Self::from_raw(bytes);
         }
         let payload = zlib_compress_window(&bytes)?;
         if payload.len() >= bytes.len() {
-            return Ok(Self::from_raw(bytes));
+            return Self::from_raw(bytes);
         }
-        Ok(Self::from_compressed(payload))
+        // This payload was produced from the exact-size `bytes` validated
+        // above, so re-inflating it here would duplicate codec work at every
+        // collected checkpoint. Imported payloads still go through the strict
+        // `from_compressed` validation path.
+        Ok(Self {
+            payload,
+            compressed: true,
+        })
     }
 
     /// Returns the window history, expanding it when it is held compressed.
@@ -115,11 +219,13 @@ impl StoredWindow {
         }
     }
 
-    pub(crate) const fn from_compressed(payload: Vec<u8>) -> Self {
-        Self {
+    pub(crate) fn from_compressed(payload: Vec<u8>) -> Result<Self, IndexError> {
+        let expanded = zlib_decompress_window(&payload)?;
+        validate_expanded_window(&expanded)?;
+        Ok(Self {
             payload,
             compressed: true,
-        }
+        })
     }
 
     pub(crate) fn payload(&self) -> &[u8] {
@@ -127,8 +233,17 @@ impl StoredWindow {
     }
 }
 
+fn validate_expanded_window(bytes: &[u8]) -> Result<(), IndexError> {
+    if bytes.len() != WINDOW_SIZE {
+        return Err(IndexError::InvalidWindowSize(
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        ));
+    }
+    Ok(())
+}
+
 /// Predecessor windows keyed by compressed bit offset.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WindowMap {
     windows: HashMap<u64, StoredWindow>,
 }
@@ -165,18 +280,15 @@ impl WindowMap {
 }
 
 /// An in-memory gzip random-access index.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GzipIndex {
     pub(crate) checkpoints: Vec<Checkpoint>,
     pub(crate) windows: WindowMap,
-    /// Compressed source size in bytes, zero when unknown.
-    pub compressed_size_in_bytes: u64,
-    /// Total decompressed size in bytes, [`u64::MAX`] when unknown.
-    pub uncompressed_size_in_bytes: u64,
-    /// Target spacing between checkpoints in decompressed bytes, zero when unknown.
-    pub checkpoint_spacing_in_bytes: u64,
-    /// Total line count when the source index carried one.
-    pub total_line_count: Option<u64>,
+    pub(crate) kind: IndexKind,
+    pub(crate) compressed_size_in_bytes: Option<u64>,
+    pub(crate) uncompressed_size_in_bytes: Option<u64>,
+    pub(crate) checkpoint_spacing_in_bytes: Option<u64>,
+    pub(crate) total_line_count: Option<u64>,
 }
 
 impl GzipIndex {
@@ -186,16 +298,104 @@ impl GzipIndex {
         Self::default()
     }
 
+    /// Returns the source/container provenance recorded by this index.
+    #[must_use]
+    pub const fn kind(&self) -> IndexKind {
+        self.kind
+    }
+
+    /// Records source/container provenance.
+    pub const fn set_kind(&mut self, kind: IndexKind) {
+        self.kind = kind;
+    }
+
+    /// Returns the known compressed source size in bytes.
+    #[must_use]
+    pub const fn compressed_size(&self) -> Option<u64> {
+        self.compressed_size_in_bytes
+    }
+
+    /// Records the compressed source size, or clears it when unknown.
+    pub const fn set_compressed_size(&mut self, size: Option<u64>) {
+        self.compressed_size_in_bytes = size;
+    }
+
+    /// Returns the known total decompressed size in bytes.
+    #[must_use]
+    pub const fn uncompressed_size(&self) -> Option<u64> {
+        self.uncompressed_size_in_bytes
+    }
+
+    /// Records the total decompressed size, or clears it when unknown.
+    pub const fn set_uncompressed_size(&mut self, size: Option<u64>) {
+        self.uncompressed_size_in_bytes = size;
+    }
+
+    /// Returns the target decompressed checkpoint spacing, when recorded.
+    #[must_use]
+    pub const fn checkpoint_spacing(&self) -> Option<u64> {
+        self.checkpoint_spacing_in_bytes
+    }
+
+    /// Records the target decompressed checkpoint spacing.
+    pub const fn set_checkpoint_spacing(&mut self, spacing: Option<u64>) {
+        self.checkpoint_spacing_in_bytes = spacing;
+    }
+
+    /// Returns the total line count carried by the source index.
+    #[must_use]
+    pub const fn total_line_count(&self) -> Option<u64> {
+        self.total_line_count
+    }
+
+    /// Records the total line count, or clears it when unknown.
+    pub const fn set_total_line_count(&mut self, count: Option<u64>) {
+        self.total_line_count = count;
+    }
+
     /// Appends a checkpoint and its predecessor window.
     ///
     /// Ordering is not checked here; call [`Self::validate`] once the index is
     /// complete.
-    pub fn push(&mut self, checkpoint: Checkpoint, window: StoredWindow) {
+    pub fn push(&mut self, checkpoint: Checkpoint, window: StoredWindow) -> Result<(), IndexError> {
+        if matches!(checkpoint.kind, CheckpointKind::MemberHeader) {
+            if !checkpoint.compressed_offset_in_bits.is_multiple_of(8) {
+                return Err(IndexError::InvalidCheckpoint(
+                    "member-header checkpoint is not byte aligned",
+                ));
+            }
+            if !window.is_empty() {
+                return Err(IndexError::InvalidCheckpoint(
+                    "member-header checkpoint carries a predecessor window",
+                ));
+            }
+        }
+        if let CheckpointKind::MemberDeflate {
+            header_offset_in_bytes,
+        } = checkpoint.kind
+        {
+            if !checkpoint.compressed_offset_in_bits.is_multiple_of(8)
+                || header_offset_in_bytes.saturating_mul(8) >= checkpoint.compressed_offset_in_bits
+            {
+                return Err(IndexError::InvalidCheckpoint(
+                    "member-DEFLATE checkpoint has inconsistent header and payload offsets",
+                ));
+            }
+            if !window.is_empty() {
+                return Err(IndexError::InvalidCheckpoint(
+                    "member-DEFLATE checkpoint carries a predecessor window",
+                ));
+            }
+        }
+        if !window.is_empty() {
+            validate_expanded_window(&window.decompressed()?)?;
+        }
         if !window.is_empty() {
             self.windows
                 .insert(checkpoint.compressed_offset_in_bits, window);
         }
         self.checkpoints.push(checkpoint);
+        Ok(())
     }
 
     /// Returns the number of checkpoints.
@@ -243,7 +443,15 @@ impl GzipIndex {
 
     /// Reads an index written by [`Self::write_native`].
     pub fn read_native(reader: &mut impl Read) -> Result<Self, IndexError> {
-        native::read_native(reader)
+        Self::read_native_with_options(reader, IndexReadOptions::default())
+    }
+
+    /// Reads a native index using explicit untrusted-input limits.
+    pub fn read_native_with_options(
+        reader: &mut impl Read,
+        options: IndexReadOptions,
+    ) -> Result<Self, IndexError> {
+        native::read_native(reader, options)
     }
 
     /// Writes this index in indexed_gzip `GZIDX` version 1 format.
@@ -261,7 +469,16 @@ impl GzipIndex {
         reader: &mut impl Read,
         archive_size: Option<u64>,
     ) -> Result<Self, IndexError> {
-        gzidx::read_gzidx(reader, archive_size)
+        Self::read_gzidx_with_options(reader, archive_size, IndexReadOptions::default())
+    }
+
+    /// Reads a GZIDX index using explicit untrusted-input limits.
+    pub fn read_gzidx_with_options(
+        reader: &mut impl Read,
+        archive_size: Option<u64>,
+        options: IndexReadOptions,
+    ) -> Result<Self, IndexError> {
+        gzidx::read_gzidx(reader, archive_size, options)
     }
 
     /// Writes this index in htslib BGZF `.gzi` format.
@@ -276,11 +493,20 @@ impl GzipIndex {
 
     /// Reads an htslib BGZF `.gzi` index.
     ///
-    /// The format does not record the uncompressed size, so the result reports
-    /// [`u64::MAX`] for it. `archive_size`, when supplied, is recorded as the
-    /// compressed size.
+    /// The format does not record the uncompressed size, so the result leaves
+    /// it unknown. `archive_size`, when supplied, is recorded as the compressed
+    /// size.
     pub fn read_gzi(reader: &mut impl Read, archive_size: Option<u64>) -> Result<Self, IndexError> {
-        gzi::read_gzi(reader, archive_size)
+        Self::read_gzi_with_options(reader, archive_size, IndexReadOptions::default())
+    }
+
+    /// Reads a `.gzi` index using explicit untrusted-input limits.
+    pub fn read_gzi_with_options(
+        reader: &mut impl Read,
+        archive_size: Option<u64>,
+        options: IndexReadOptions,
+    ) -> Result<Self, IndexError> {
+        gzi::read_gzi(reader, archive_size, options)
     }
 
     /// Writes this index in gztool format.
@@ -304,12 +530,22 @@ impl GzipIndex {
         reader: &mut impl Read,
         archive_size: Option<u64>,
     ) -> Result<Self, IndexError> {
-        gztool::read_gztool(reader, archive_size)
+        Self::read_gztool_with_options(reader, archive_size, IndexReadOptions::default())
+    }
+
+    /// Reads a gztool index using explicit untrusted-input limits.
+    pub fn read_gztool_with_options(
+        reader: &mut impl Read,
+        archive_size: Option<u64>,
+        options: IndexReadOptions,
+    ) -> Result<Self, IndexError> {
+        gztool::read_gztool(reader, archive_size, options)
     }
 
     /// Checks the index invariants.
     ///
-    /// Offsets must increase strictly on both axes, a raw non-empty window must
+    /// Compressed offsets must increase strictly and decompressed offsets must
+    /// not decrease. Every non-empty window must
     /// be exactly [`WINDOW_SIZE`] bytes, and offsets must fall inside the
     /// recorded sizes when those are known.
     pub fn validate(&self) -> Result<(), IndexError> {
@@ -321,25 +557,24 @@ impl GzipIndex {
                         "compressed offsets are not strictly increasing",
                     ));
                 }
-                if checkpoint.uncompressed_offset_in_bytes <= previous.uncompressed_offset_in_bytes
-                {
+                if checkpoint.uncompressed_offset_in_bytes < previous.uncompressed_offset_in_bytes {
                     return Err(IndexError::InvalidCheckpoint(
-                        "uncompressed offsets are not strictly increasing",
+                        "uncompressed offsets are decreasing",
                     ));
                 }
             }
 
-            if self.compressed_size_in_bytes != 0
-                && checkpoint.compressed_offset_in_bits
-                    > self.compressed_size_in_bytes.saturating_mul(8)
+            if self
+                .compressed_size_in_bytes
+                .is_some_and(|size| checkpoint.compressed_offset_in_bits > size.saturating_mul(8))
             {
                 return Err(IndexError::InvalidCheckpoint(
                     "checkpoint compressed offset is after the source end",
                 ));
             }
-            if self.uncompressed_size_in_bytes != u64::MAX
-                && self.uncompressed_size_in_bytes != 0
-                && checkpoint.uncompressed_offset_in_bytes > self.uncompressed_size_in_bytes
+            if self
+                .uncompressed_size_in_bytes
+                .is_some_and(|size| checkpoint.uncompressed_offset_in_bytes > size)
             {
                 return Err(IndexError::InvalidCheckpoint(
                     "checkpoint uncompressed offset is after the source end",
@@ -347,12 +582,43 @@ impl GzipIndex {
             }
 
             if let Some(window) = self.windows.get(checkpoint.compressed_offset_in_bits) {
-                if !window.is_compressed()
-                    && !window.is_empty()
-                    && window.stored_len() != WINDOW_SIZE
+                validate_expanded_window(&window.decompressed()?)?;
+            }
+            if matches!(checkpoint.kind, CheckpointKind::MemberHeader) {
+                if !checkpoint.compressed_offset_in_bits.is_multiple_of(8) {
+                    return Err(IndexError::InvalidCheckpoint(
+                        "member-header checkpoint is not byte aligned",
+                    ));
+                }
+                if self
+                    .windows
+                    .get(checkpoint.compressed_offset_in_bits)
+                    .is_some()
                 {
                     return Err(IndexError::InvalidCheckpoint(
-                        "non-empty predecessor window is not 32768 bytes",
+                        "member-header checkpoint carries a predecessor window",
+                    ));
+                }
+            }
+            if let CheckpointKind::MemberDeflate {
+                header_offset_in_bytes,
+            } = checkpoint.kind
+            {
+                if !checkpoint.compressed_offset_in_bits.is_multiple_of(8)
+                    || header_offset_in_bytes.saturating_mul(8)
+                        >= checkpoint.compressed_offset_in_bits
+                {
+                    return Err(IndexError::InvalidCheckpoint(
+                        "member-DEFLATE checkpoint has inconsistent header and payload offsets",
+                    ));
+                }
+                if self
+                    .windows
+                    .get(checkpoint.compressed_offset_in_bits)
+                    .is_some()
+                {
+                    return Err(IndexError::InvalidCheckpoint(
+                        "member-DEFLATE checkpoint carries a predecessor window",
                     ));
                 }
             }
@@ -373,9 +639,9 @@ pub enum IndexError {
         found: Vec<u8>,
     },
     /// The format version is newer than this crate supports.
-    UnsupportedVersion(u8),
+    UnsupportedVersion(u64),
     /// The index declared a window size other than [`WINDOW_SIZE`].
-    InvalidWindowSize(u32),
+    InvalidWindowSize(u64),
     /// A declared count or length exceeded the accepted maximum.
     ExcessiveLength {
         /// What the value described.
@@ -396,6 +662,18 @@ pub enum IndexError {
     Truncated,
     /// A window payload could not be compressed or decompressed.
     WindowCodec(&'static str),
+    /// The process could not reserve memory within the configured limit.
+    AllocationFailed {
+        /// What allocation was attempted.
+        what: &'static str,
+    },
+    /// A format contained flags this crate does not understand.
+    UnsupportedFlags {
+        /// Flags observed in the input.
+        flags: u64,
+    },
+    /// An operation requires metadata not present in this index.
+    MissingMetadata(&'static str),
     /// An I/O failure occurred.
     Io {
         /// The original error.
@@ -441,6 +719,13 @@ impl Display for IndexError {
             ),
             Self::Truncated => formatter.write_str("truncated index"),
             Self::WindowCodec(reason) => write!(formatter, "index window codec failure: {reason}"),
+            Self::AllocationFailed { what } => {
+                write!(formatter, "could not allocate memory for index {what}")
+            }
+            Self::UnsupportedFlags { flags } => {
+                write!(formatter, "unsupported index flags {flags:#x}")
+            }
+            Self::MissingMetadata(what) => write!(formatter, "index is missing {what}"),
             Self::Io { source } => write!(formatter, "index I/O error: {source}"),
         }
     }
@@ -484,6 +769,13 @@ impl PartialEq for IndexError {
             ) => left_index == right_index && left_archive == right_archive,
             (Self::Truncated, Self::Truncated) => true,
             (Self::WindowCodec(left), Self::WindowCodec(right)) => left == right,
+            (Self::AllocationFailed { what: left }, Self::AllocationFailed { what: right }) => {
+                left == right
+            }
+            (Self::UnsupportedFlags { flags: left }, Self::UnsupportedFlags { flags: right }) => {
+                left == right
+            }
+            (Self::MissingMetadata(left), Self::MissingMetadata(right)) => left == right,
             (Self::Io { source: left }, Self::Io { source: right }) => {
                 left.kind() == right.kind() && left.to_string() == right.to_string()
             }
@@ -536,70 +828,94 @@ mod tests {
         Checkpoint {
             compressed_offset_in_bits: compressed_bits,
             uncompressed_offset_in_bytes: uncompressed,
-            line_offset: 0,
+            kind: CheckpointKind::DeflateBlock,
+            line_offset: None,
         }
     }
 
     #[test]
     fn validate_accepts_ordered_checkpoints_with_windows() {
         let mut index = GzipIndex::new();
-        index.compressed_size_in_bytes = 4096;
-        index.uncompressed_size_in_bytes = 1 << 20;
-        index.push(checkpoint(0, 0), StoredWindow::empty());
-        index.push(
-            checkpoint(8 * 1000, 65536),
-            StoredWindow::from_raw(vec![7u8; WINDOW_SIZE]),
-        );
+        index.set_compressed_size(Some(4096));
+        index.set_uncompressed_size(Some(1 << 20));
+        index
+            .push(checkpoint(0, 0), StoredWindow::empty())
+            .expect("origin");
+        index
+            .push(
+                checkpoint(8 * 1000, 65536),
+                StoredWindow::from_raw(vec![7u8; WINDOW_SIZE]).expect("window"),
+            )
+            .expect("checkpoint");
         assert_eq!(index.validate(), Ok(()));
         assert_eq!(index.checkpoint_count(), 2);
         assert_eq!(index.windows().len(), 1);
     }
 
     #[test]
-    fn validate_rejects_unordered_uncompressed_offsets() {
+    fn validate_allows_equal_but_rejects_decreasing_uncompressed_offsets() {
         let mut index = GzipIndex::new();
-        index.compressed_size_in_bytes = 4096;
-        index.uncompressed_size_in_bytes = 1 << 20;
-        index.push(checkpoint(0, 100), StoredWindow::empty());
-        index.push(
-            checkpoint(8, 100),
-            StoredWindow::from_raw(vec![0u8; WINDOW_SIZE]),
-        );
+        index.set_compressed_size(Some(4096));
+        index.set_uncompressed_size(Some(1 << 20));
+        index
+            .push(checkpoint(0, 100), StoredWindow::empty())
+            .expect("first");
+        index
+            .push(checkpoint(8, 100), StoredWindow::empty())
+            .expect("equal");
+        assert_eq!(index.validate(), Ok(()));
+        index
+            .push(
+                checkpoint(8, 100),
+                StoredWindow::from_raw(vec![0u8; WINDOW_SIZE]).expect("window"),
+            )
+            .expect("duplicate accepted until validate");
         assert!(matches!(
             index.validate(),
+            Err(IndexError::InvalidCheckpoint(_))
+        ));
+
+        let mut decreasing = GzipIndex::new();
+        decreasing
+            .push(checkpoint(0, 100), StoredWindow::empty())
+            .expect("first");
+        decreasing
+            .push(checkpoint(8, 99), StoredWindow::empty())
+            .expect("decreasing accepted until validate");
+        assert!(matches!(
+            decreasing.validate(),
             Err(IndexError::InvalidCheckpoint(_))
         ));
     }
 
     #[test]
     fn validate_rejects_wrong_window_length() {
-        let mut index = GzipIndex::new();
-        index.compressed_size_in_bytes = 4096;
-        index.uncompressed_size_in_bytes = 1 << 20;
-        index.push(checkpoint(0, 0), StoredWindow::empty());
-        index.push(checkpoint(64, 10), StoredWindow::from_raw(vec![1u8; 10]));
         assert_eq!(
-            index.validate(),
-            Err(IndexError::InvalidCheckpoint(
-                "non-empty predecessor window is not 32768 bytes"
-            ))
+            StoredWindow::from_raw(vec![1u8; 10]),
+            Err(IndexError::InvalidWindowSize(10))
         );
     }
 
     #[test]
     fn checkpoint_at_or_before_picks_the_last_not_after_target() {
         let mut index = GzipIndex::new();
-        index.compressed_size_in_bytes = 4096;
-        index.uncompressed_size_in_bytes = 1 << 20;
-        index.push(checkpoint(0, 0), StoredWindow::empty());
-        index.push(
-            checkpoint(80, 1000),
-            StoredWindow::from_raw(vec![1u8; WINDOW_SIZE]),
-        );
-        index.push(
-            checkpoint(160, 2000),
-            StoredWindow::from_raw(vec![2u8; WINDOW_SIZE]),
-        );
+        index.set_compressed_size(Some(4096));
+        index.set_uncompressed_size(Some(1 << 20));
+        index
+            .push(checkpoint(0, 0), StoredWindow::empty())
+            .expect("origin");
+        index
+            .push(
+                checkpoint(80, 1000),
+                StoredWindow::from_raw(vec![1u8; WINDOW_SIZE]).expect("window"),
+            )
+            .expect("checkpoint");
+        index
+            .push(
+                checkpoint(160, 2000),
+                StoredWindow::from_raw(vec![2u8; WINDOW_SIZE]).expect("window"),
+            )
+            .expect("checkpoint");
 
         assert_eq!(
             index

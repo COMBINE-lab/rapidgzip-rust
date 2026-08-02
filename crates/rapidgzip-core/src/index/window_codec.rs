@@ -2,11 +2,11 @@
 //!
 //! The gztool on-disk format stores windows zlib-compressed, and the native
 //! format and the in-memory index reuse the same encoding to bound resident
-//! memory. Payloads never exceed [`WINDOW_SIZE`] once expanded.
+//! memory. Every non-empty payload expands to exactly [`WINDOW_SIZE`].
 
 use super::{IndexError, WINDOW_SIZE};
 use libz_rs_sys as z;
-use std::ffi::c_int;
+use std::ffi::{c_int, c_ulong};
 
 /// Compression level used for stored windows, matching gztool.
 const LEVEL: c_int = 9;
@@ -38,9 +38,12 @@ pub(crate) fn zlib_compress_window(bytes: &[u8]) -> Result<Vec<u8>, IndexError> 
     let guard = DeflateGuard(&mut stream);
 
     // `deflateBound` is an upper bound for compressing the whole input in one
-    // pass, so a single `Z_FINISH` call always has room.
+    // pass, so a single `Z_FINISH` call always has room. Its argument is a
+    // `c_ulong`, which is 32 bits on Windows and 64 elsewhere, and a window is
+    // far below either limit.
+    let source_length = c_ulong::try_from(bytes.len()).unwrap_or(c_ulong::MAX);
     // SAFETY: the stream was initialized above and is uniquely borrowed here.
-    let bound = unsafe { z::deflateBound(guard.0, bytes.len() as u64) } as usize;
+    let bound = unsafe { z::deflateBound(guard.0, source_length) } as usize;
     let mut output = vec![0u8; bound.max(64)];
 
     guard.0.next_in = bytes.as_ptr();
@@ -65,7 +68,7 @@ pub(crate) fn zlib_compress_window(bytes: &[u8]) -> Result<Vec<u8>, IndexError> 
 /// [`WINDOW_SIZE`] bytes.
 pub(crate) fn zlib_decompress_window(payload: &[u8]) -> Result<Vec<u8>, IndexError> {
     if payload.is_empty() {
-        return Ok(Vec::new());
+        return Err(IndexError::WindowCodec("empty compressed window payload"));
     }
 
     let mut stream = z::z_stream::default();
@@ -102,6 +105,14 @@ pub(crate) fn zlib_decompress_window(payload: &[u8]) -> Result<Vec<u8>, IndexErr
     }
     if status != z::Z_STREAM_END {
         return Err(IndexError::WindowCodec("invalid window payload"));
+    }
+    if guard.0.avail_in != 0 {
+        return Err(IndexError::WindowCodec(
+            "trailing bytes after compressed window",
+        ));
+    }
+    if produced != WINDOW_SIZE {
+        return Err(IndexError::InvalidWindowSize(produced as u64));
     }
     output.truncate(produced);
     Ok(output)
@@ -164,9 +175,12 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_an_empty_payload() {
+    fn rejects_an_empty_payload() {
         assert!(zlib_compress_window(&[]).expect("compress").is_empty());
-        assert!(zlib_decompress_window(&[]).expect("decompress").is_empty());
+        assert!(matches!(
+            zlib_decompress_window(&[]),
+            Err(IndexError::WindowCodec(_))
+        ));
     }
 
     #[test]
@@ -187,6 +201,18 @@ mod tests {
             zlib_decompress_window(&[0xff, 0xff, 0xff, 0xff]),
             Err(IndexError::WindowCodec(_))
         ));
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_after_a_complete_window() {
+        let mut compressed = zlib_compress_window(&vec![3; WINDOW_SIZE]).expect("compress");
+        compressed.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(
+            zlib_decompress_window(&compressed),
+            Err(IndexError::WindowCodec(
+                "trailing bytes after compressed window"
+            ))
+        );
     }
 
     #[test]

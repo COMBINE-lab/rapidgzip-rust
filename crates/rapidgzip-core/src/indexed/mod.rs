@@ -1,38 +1,100 @@
 //! Random access to decompressed data through a [`GzipIndex`].
-//!
-//! [`IndexedReader`] resumes inflate at the checkpoint nearest before a
-//! requested decompressed offset, installs that checkpoint's predecessor
-//! window as the inflate dictionary, and discards output up to the target. It
-//! is single-threaded on purpose: throughput remains the job of
-//! [`crate::DecoderReader`], while this type serves scattered reads without
-//! decoding everything before them.
 
 mod window;
 
+use crate::crc32::Crc32;
 use crate::gzip::{SourceCursor, parse_member_header};
-use crate::index::{Checkpoint, GzipIndex, WINDOW_SIZE};
+use crate::index::{Checkpoint, CheckpointKind, GzipIndex, IndexError, WINDOW_SIZE};
 use crate::inflate::RawInflater;
 use crate::{DecodeError, ReadAt};
 use libz_rs_sys as z;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::Arc;
 use window::{DEFAULT_BUDGET, WindowCache};
 
-/// Compressed bytes read per positional request.
 const INPUT_PAGE: usize = 128 * 1024;
-
-/// Decompressed bytes produced per inflate call.
 const OUTPUT_STEP: usize = 128 * 1024;
 
-/// A [`Read`] and [`Seek`] view of the decompressed data behind an index.
+/// Failure while opening an [`IndexedReader`].
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum IndexedReaderError {
+    /// The supplied index is internally invalid.
+    Index(IndexError),
+    /// The raw inflate backend could not be initialized.
+    Decode(DecodeError),
+    /// The positional source could not be inspected.
+    Io(Arc<io::Error>),
+}
+
+impl Display for IndexedReaderError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Index(error) => write!(formatter, "invalid gzip index: {error}"),
+            Self::Decode(error) => {
+                write!(formatter, "could not initialize indexed decode: {error}")
+            }
+            Self::Io(error) => write!(formatter, "could not inspect indexed source: {error}"),
+        }
+    }
+}
+
+impl Error for IndexedReaderError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Index(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::Io(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<IndexError> for IndexedReaderError {
+    fn from(error: IndexError) -> Self {
+        Self::Index(error)
+    }
+}
+
+impl From<DecodeError> for IndexedReaderError {
+    fn from(error: DecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+struct Verification {
+    crc: Crc32,
+    output_size: u32,
+}
+
+impl Verification {
+    const fn new() -> Self {
+        Self {
+            crc: Crc32::new(),
+            output_size: 0,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.crc.update(bytes);
+        self.output_size = self.output_size.wrapping_add(bytes.len() as u32);
+    }
+}
+
+/// A [`Read`] and [`Seek`] view of decompressed bytes described by an index.
 ///
-/// Seeking positions the reader in the decompressed stream. Reads after a seek
-/// resume from the nearest checkpoint at or before that position, so the cost
-/// of a seek is bounded by the index's checkpoint spacing rather than by the
-/// distance from the start of the file.
+/// Seeking resumes at the nearest preceding checkpoint and discards output up
+/// to the requested byte. A member entered through a member checkpoint is
+/// fully CRC32/ISIZE verified, including bytes discarded during seeking. A
+/// member entered through an interior DEFLATE checkpoint cannot authenticate
+/// the skipped prefix because foreign index formats do not store its checksum
+/// state; its footer is still read structurally, and every later member is
+/// fully verified after its header is crossed.
 ///
-/// The index must describe the source actually supplied; an index built from
-/// different data produces decoding errors rather than silent corruption only
-/// insofar as DEFLATE itself detects them.
+/// The index is validated and a known compressed size is compared with the
+/// source before construction succeeds. Callers remain responsible for pairing
+/// indexes without a recorded size with the source from which they were built.
 pub struct IndexedReader<R: ReadAt> {
     source: R,
     index: GzipIndex,
@@ -44,32 +106,39 @@ pub struct IndexedReader<R: ReadAt> {
     next_input: u64,
     decoded: Vec<u8>,
     decoded_position: usize,
-    /// Decompressed offset of the next byte a read returns.
     position: u64,
     state: State,
+    verification: Option<Verification>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
-    /// The inflater must be resumed before the next read.
     NeedsResume,
-    /// The inflater is positioned at `position` plus the buffered bytes.
     Running,
-    /// The last member ended and no member follows.
     Ended,
 }
 
 impl<R: ReadAt> IndexedReader<R> {
     /// Opens `source` for random access through `index`.
     ///
-    /// The index is validated before use.
-    pub fn new(source: R, index: GzipIndex) -> Result<Self, DecodeError> {
-        index
-            .validate()
-            .map_err(|error| DecodeError::input_io(0, io::Error::other(error)))?;
+    /// # Errors
+    ///
+    /// Returns an error when the index violates its invariants, the source
+    /// length cannot be read or disagrees with a known index size, or the raw
+    /// inflate backend cannot be initialized.
+    pub fn new(source: R, index: GzipIndex) -> Result<Self, IndexedReaderError> {
+        index.validate()?;
         let source_length = source
             .len()
-            .map_err(|error| DecodeError::input_io(0, error))?;
+            .map_err(|error| IndexedReaderError::Io(Arc::new(error)))?;
+        if let Some(index_size) = index.compressed_size() {
+            if index_size != source_length {
+                return Err(IndexedReaderError::Index(IndexError::ArchiveSizeMismatch {
+                    index_size,
+                    archive_size: source_length,
+                }));
+            }
+        }
         Ok(Self {
             source,
             index,
@@ -83,13 +152,11 @@ impl<R: ReadAt> IndexedReader<R> {
             decoded_position: 0,
             position: 0,
             state: State::NeedsResume,
+            verification: None,
         })
     }
 
     /// Sets the expanded-window cache budget in bytes.
-    ///
-    /// The default holds eight full windows. A budget smaller than one window
-    /// disables caching.
     #[must_use]
     pub fn with_window_cache_bytes(mut self, bytes: usize) -> Self {
         self.windows = WindowCache::new(bytes);
@@ -124,7 +191,6 @@ impl<R: ReadAt> IndexedReader<R> {
         self.input_position = 0;
     }
 
-    /// Reads `length` bytes at `offset` into `self.input`.
     fn read_input_page(&mut self, offset: u64) -> io::Result<()> {
         let remaining = self.source_length.saturating_sub(offset);
         let length = usize::try_from(remaining)
@@ -138,33 +204,59 @@ impl<R: ReadAt> IndexedReader<R> {
                 .source
                 .read_at(offset + filled as u64, &mut self.input[filled..])?;
             if read == 0 {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "positional source ended before its reported length",
+                ));
             }
             filled += read;
         }
-        self.input.truncate(filled);
         self.input_position = 0;
         self.next_input = offset + filled as u64;
         Ok(())
     }
 
-    /// Positions the inflater so that the next produced byte is at
-    /// `self.position`.
+    fn read_exact_at<const N: usize>(&self, offset: u64) -> io::Result<[u8; N]> {
+        let mut bytes = [0_u8; N];
+        let mut filled = 0;
+        while filled < N {
+            let read = self
+                .source
+                .read_at(offset + filled as u64, &mut bytes[filled..])?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated gzip member footer",
+                ));
+            }
+            filled += read;
+        }
+        Ok(bytes)
+    }
+
+    fn parse_member_header(&self, offset: u64) -> io::Result<u64> {
+        let mut cursor =
+            SourceCursor::new(&self.source, INPUT_PAGE).map_err(|error| error.to_io_error())?;
+        cursor.seek(offset).map_err(|error| error.to_io_error())?;
+        let header =
+            parse_member_header(&mut cursor, offset == 0).map_err(|error| error.to_io_error())?;
+        Ok(header.deflate_start)
+    }
+
     fn resume(&mut self) -> io::Result<()> {
         self.discard_buffers();
-
-        let Some(checkpoint) = self.index.checkpoint_at_or_before(self.position).copied() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the index has no checkpoint at or before the requested offset",
-            ));
-        };
-
-        let window = self.expanded_window(&checkpoint)?;
+        let checkpoint = self
+            .index
+            .checkpoint_at_or_before(self.position)
+            .copied()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the index has no checkpoint at or before the requested offset",
+                )
+            })?;
         let bit_offset = checkpoint.compressed_offset_in_bits;
         let byte_offset = bit_offset / 8;
-        let remainder = (bit_offset % 8) as u8;
-
         if byte_offset > self.source_length {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -172,52 +264,60 @@ impl<R: ReadAt> IndexedReader<R> {
             ));
         }
 
-        self.inflater.reset(bit_offset).map_err(io::Error::other)?;
-
+        self.inflater
+            .reset(bit_offset)
+            .map_err(|error| error.to_io_error())?;
         let mut start = byte_offset;
-        if remainder != 0 {
-            let mut straddled = [0u8; 1];
-            let read = self.source.read_at(byte_offset, &mut straddled)?;
-            if read != 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "source ended inside a checkpoint's straddled byte",
-                ));
+        let window = self.expanded_window(&checkpoint)?;
+        self.verification = match checkpoint.kind {
+            CheckpointKind::MemberHeader => {
+                start = self.parse_member_header(byte_offset)?;
+                Some(Verification::new())
             }
-            self.inflater
-                .prime(8 - remainder, straddled[0] >> remainder, bit_offset)
-                .map_err(io::Error::other)?;
-            start += 1;
-        } else if window.is_empty() {
-            // A byte-aligned checkpoint with no history is a member boundary,
-            // so a gzip header sits here and must be skipped before inflating.
-            start = self.skip_member_header(byte_offset)?;
-        }
-
+            CheckpointKind::MemberDeflate {
+                header_offset_in_bytes,
+            } => {
+                let parsed_start = self.parse_member_header(header_offset_in_bytes)?;
+                if parsed_start != byte_offset {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "member checkpoint does not match the parsed gzip header",
+                    ));
+                }
+                Some(Verification::new())
+            }
+            CheckpointKind::DeflateBlock => {
+                let remainder = (bit_offset % 8) as u8;
+                if remainder != 0 {
+                    let straddled = self.read_exact_at::<1>(byte_offset)?[0];
+                    self.inflater
+                        .prime(8 - remainder, straddled >> remainder, bit_offset)
+                        .map_err(|error| error.to_io_error())?;
+                    start += 1;
+                }
+                None
+            }
+        };
         if !window.is_empty() {
             self.inflater
                 .set_dictionary_bytes(&window, bit_offset)
-                .map_err(io::Error::other)?;
+                .map_err(|error| error.to_io_error())?;
         }
-
         self.read_input_page(start)?;
         self.state = State::Running;
 
-        // Discard the decompressed bytes between the checkpoint and the target.
         let mut remaining = self.position - checkpoint.uncompressed_offset_in_bytes;
         while remaining > 0 {
             if self.buffered() == 0 && !self.fill()? {
                 return Ok(());
             }
-            let available = self.buffered() as u64;
-            let skipped = remaining.min(available);
+            let skipped = remaining.min(self.buffered() as u64);
             self.decoded_position += skipped as usize;
             remaining -= skipped;
         }
         Ok(())
     }
 
-    /// Returns the expanded predecessor window for `checkpoint`.
     fn expanded_window(&mut self, checkpoint: &Checkpoint) -> io::Result<Vec<u8>> {
         let key = checkpoint.compressed_offset_in_bits;
         if let Some(cached) = self.windows.get(key) {
@@ -230,29 +330,16 @@ impl<R: ReadAt> IndexedReader<R> {
             .decompressed()
             .map_err(io::Error::other)?
             .into_owned();
-        if expanded.len() > WINDOW_SIZE {
+        if expanded.len() != WINDOW_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "stored window is larger than the DEFLATE history",
+                "stored predecessor window is not exactly 32768 bytes",
             ));
         }
-        if !expanded.is_empty() {
-            self.windows.insert(key, expanded.clone());
-        }
+        self.windows.insert(key, expanded.clone());
         Ok(expanded)
     }
 
-    /// Parses the gzip header at `offset` and returns where its DEFLATE data
-    /// starts.
-    fn skip_member_header(&mut self, offset: u64) -> io::Result<u64> {
-        let mut cursor = SourceCursor::new(&self.source, INPUT_PAGE).map_err(io::Error::other)?;
-        cursor.seek(offset).map_err(io::Error::other)?;
-        let header = parse_member_header(&mut cursor, offset == 0).map_err(io::Error::other)?;
-        Ok(header.deflate_start)
-    }
-
-    /// Produces more decompressed bytes, returning false at the end of the
-    /// last member.
     fn fill(&mut self) -> io::Result<bool> {
         loop {
             match self.state {
@@ -271,24 +358,17 @@ impl<R: ReadAt> IndexedReader<R> {
 
             if self.input_position >= self.input.len() {
                 if self.next_input >= self.source_length {
-                    // Input exhausted without a final block: treat as the end
-                    // of the stream rather than looping forever.
-                    self.state = State::Ended;
-                    return Ok(false);
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated DEFLATE stream",
+                    ));
                 }
-                let next = self.next_input;
-                self.read_input_page(next)?;
-                if self.input.is_empty() {
-                    self.state = State::Ended;
-                    return Ok(false);
-                }
+                self.read_input_page(self.next_input)?;
             }
-
             if self.decoded_position == self.decoded.len() {
                 self.decoded.clear();
                 self.decoded_position = 0;
             }
-
             let produced = self.inflate_step()?;
             if produced > 0 {
                 return Ok(true);
@@ -299,8 +379,6 @@ impl<R: ReadAt> IndexedReader<R> {
         }
     }
 
-    /// Runs one inflate call, handling member ends, and returns the number of
-    /// decompressed bytes appended.
     fn inflate_step(&mut self) -> io::Result<usize> {
         let output_start = self.decoded.len();
         self.decoded.reserve(OUTPUT_STEP);
@@ -310,41 +388,39 @@ impl<R: ReadAt> IndexedReader<R> {
 
         self.inflater.stream.next_in = input.as_ptr();
         self.inflater.stream.avail_in = input_length as u32;
-        self.inflater.stream.next_out = self.decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+        self.inflater.stream.next_out = self.decoded.spare_capacity_mut().as_mut_ptr().cast();
         self.inflater.stream.avail_out = output_capacity as u32;
         let input_before = self.inflater.stream.avail_in;
         let output_before = self.inflater.stream.avail_out;
-
-        // SAFETY:
-        // - the inflater is initialized and uniquely borrowed for this call;
-        // - `next_in` covers `input`, which stays live and unmoved until
-        //   `inflate` returns;
-        // - `next_out` covers only uniquely owned spare capacity of `decoded`,
-        //   whose length is extended below by exactly the count zlib reports.
+        // SAFETY: input and output point to live, non-overlapping allocations
+        // for this call, and the initialized inflater is uniquely borrowed.
         let status = unsafe { z::inflate(&mut self.inflater.stream, z::Z_NO_FLUSH) };
-
         let consumed = (input_before - self.inflater.stream.avail_in) as usize;
         let produced = (output_before - self.inflater.stream.avail_out) as usize;
+        self.inflater.stream.next_in = std::ptr::null();
+        self.inflater.stream.avail_in = 0;
+        self.inflater.stream.next_out = std::ptr::null_mut();
+        self.inflater.stream.avail_out = 0;
         self.input_position += consumed;
-        // SAFETY: zlib initialized exactly `produced` bytes of the spare
-        // capacity supplied above and cannot report more than that capacity.
+        // SAFETY: zlib initialized exactly `produced` bytes in the supplied
+        // spare capacity and cannot report more than its `avail_out` bound.
         unsafe { self.decoded.set_len(output_start + produced) };
+        if let Some(verification) = self.verification.as_mut() {
+            verification.update(&self.decoded[output_start..]);
+        }
 
         match status {
-            z::Z_OK => {
-                if consumed == 0 && produced == 0 && self.next_input >= self.source_length {
-                    self.state = State::Ended;
-                }
-                Ok(produced)
-            }
+            z::Z_OK if consumed != 0 || produced != 0 => Ok(produced),
+            z::Z_BUF_ERROR if consumed != 0 || produced != 0 => Ok(produced),
+            z::Z_OK | z::Z_BUF_ERROR if self.next_input >= self.source_length => Err(
+                io::Error::new(io::ErrorKind::UnexpectedEof, "truncated DEFLATE stream"),
+            ),
+            z::Z_OK | z::Z_BUF_ERROR => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DEFLATE decoder made no progress",
+            )),
             z::Z_STREAM_END => {
                 self.finish_member()?;
-                Ok(produced)
-            }
-            z::Z_BUF_ERROR => {
-                if consumed == 0 && produced == 0 && self.next_input >= self.source_length {
-                    self.state = State::Ended;
-                }
                 Ok(produced)
             }
             z::Z_DATA_ERROR => Err(io::Error::new(
@@ -359,25 +435,52 @@ impl<R: ReadAt> IndexedReader<R> {
         }
     }
 
-    /// Steps over a member footer and starts the next member, if any.
     fn finish_member(&mut self) -> io::Result<()> {
-        // The absolute offset of the first unconsumed input byte, which is the
-        // start of the eight-byte member footer.
-        let footer = self.next_input - (self.input.len() - self.input_position) as u64;
-        let next_member = footer.saturating_add(8);
-        if next_member >= self.source_length {
+        let footer_offset = self.next_input - (self.input.len() - self.input_position) as u64;
+        let footer = self.read_exact_at::<8>(footer_offset)?;
+        if let Some(verification) = self.verification.take() {
+            let expected_crc = u32::from_le_bytes(footer[..4].try_into().expect("four bytes"));
+            let expected_size = u32::from_le_bytes(footer[4..].try_into().expect("four bytes"));
+            let actual_crc = verification.crc.finish();
+            if expected_crc != actual_crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "gzip CRC32 mismatch: expected {expected_crc:#010x}, got {actual_crc:#010x}"
+                    ),
+                ));
+            }
+            if expected_size != verification.output_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "gzip ISIZE mismatch: expected {expected_size}, got {}",
+                        verification.output_size
+                    ),
+                ));
+            }
+        }
+
+        let next_member = footer_offset.checked_add(8).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "gzip footer offset overflow")
+        })?;
+        if next_member == self.source_length {
             self.state = State::Ended;
             return Ok(());
         }
-
-        let deflate_start = self.skip_member_header(next_member)?;
+        if next_member > self.source_length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated gzip member footer",
+            ));
+        }
+        let deflate_start = self.parse_member_header(next_member)?;
         self.inflater
             .reset(deflate_start.saturating_mul(8))
-            .map_err(io::Error::other)?;
+            .map_err(|error| error.to_io_error())?;
+        self.verification = Some(Verification::new());
         self.read_input_page(deflate_start)?;
-        if self.input.is_empty() {
-            self.state = State::Ended;
-        }
+        self.state = State::Running;
         Ok(())
     }
 }
@@ -408,23 +511,20 @@ impl<R: ReadAt> Seek for IndexedReader<R> {
         let position = match target {
             SeekFrom::Start(offset) => offset,
             SeekFrom::Current(delta) => add_offset(self.position, delta)?,
-            SeekFrom::End(delta) => {
-                let length = self.index.uncompressed_size_in_bytes;
-                if length == u64::MAX || length == 0 {
-                    return Err(io::Error::new(
+            SeekFrom::End(delta) => add_offset(
+                self.index.uncompressed_size().ok_or_else(|| {
+                    io::Error::new(
                         io::ErrorKind::Unsupported,
                         "the index does not record the decompressed size",
-                    ));
-                }
-                add_offset(length, delta)?
-            }
+                    )
+                })?,
+                delta,
+            )?,
         };
 
         if position == self.position && self.state != State::NeedsResume {
             return Ok(position);
         }
-
-        // A forward seek inside the buffered bytes needs no resume.
         if position > self.position && self.state == State::Running {
             let ahead = position - self.position;
             if ahead <= self.buffered() as u64 {
@@ -433,9 +533,9 @@ impl<R: ReadAt> Seek for IndexedReader<R> {
                 return Ok(position);
             }
         }
-
         self.position = position;
         self.state = State::NeedsResume;
+        self.verification = None;
         self.discard_buffers();
         Ok(position)
     }

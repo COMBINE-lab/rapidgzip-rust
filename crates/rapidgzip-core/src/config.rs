@@ -1,8 +1,13 @@
-use crate::backend::{DirectOutput, decode_source, decode_stream};
+use crate::backend::{
+    DirectOutput, decode_source, decode_source_with_index, decode_stream, decode_stream_with_index,
+};
 use crate::gzip::{StreamCursor, validate_initial_header};
 use crate::reader;
 use crate::runtime::RuntimeState;
-use crate::{DecodeError, DecodeReport, DecoderReader, ReadAt};
+use crate::{
+    DecodeError, DecodeReport, DecoderReader, IndexOptions, IndexedDecodeReport,
+    IndexingDecoderReader, IndexingError, ReadAt,
+};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
@@ -190,6 +195,42 @@ impl Decoder {
         decode_source(source, &self.config, &cancelled, &mut sink, &runtime)
     }
 
+    /// Decodes and verifies every gzip member while collecting a random-access
+    /// index.
+    ///
+    /// Index construction is explicit per operation. Ordinary [`Self::decode`]
+    /// calls therefore retain their small [`Copy`] report and perform no
+    /// checkpoint-window work. On error, `output` can contain a verified
+    /// prefix; writes are not rolled back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexingError::Decode`] for source, framing, DEFLATE,
+    /// verification, output, or limit failures, and [`IndexingError::Index`]
+    /// when a checkpoint window cannot be stored or the final index is invalid.
+    pub fn decode_with_index<R, W>(
+        &self,
+        source: &R,
+        output: &mut W,
+        options: IndexOptions,
+    ) -> Result<IndexedDecodeReport, IndexingError>
+    where
+        R: ReadAt + ?Sized,
+        W: Write,
+    {
+        let cancelled = AtomicBool::new(false);
+        let mut sink = DirectOutput::new(output);
+        let runtime = RuntimeState::new(self.config.decoder_threads);
+        decode_source_with_index(
+            source,
+            &self.config,
+            &cancelled,
+            &mut sink,
+            &runtime,
+            options,
+        )
+    }
+
     /// Starts decoding an owned positional source and returns `Read + Send`
     /// decompressed output.
     ///
@@ -203,6 +244,31 @@ impl Decoder {
     {
         validate_initial_header(&source, self.config.input_page_size)?;
         reader::spawn(source, self.config.clone())
+    }
+
+    /// Starts positional decoding with index construction and returns owned
+    /// `Read + Send` decompressed output.
+    ///
+    /// The returned [`IndexingDecoderReader`] exposes the same telemetry and
+    /// dynamic worker controls as [`DecoderReader`]. Its index becomes
+    /// available only after verified EOF, either through
+    /// [`IndexingDecoderReader::report`] or [`IndexingDecoderReader::finish`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an initial source or gzip-framing failure. Later decode and
+    /// index failures are reported by [`Read::read`] and preserved in typed
+    /// form by [`IndexingDecoderReader::finish`].
+    pub fn reader_with_index<R>(
+        &self,
+        source: R,
+        options: IndexOptions,
+    ) -> Result<IndexingDecoderReader, DecodeError>
+    where
+        R: ReadAt + 'static,
+    {
+        validate_initial_header(&source, self.config.input_page_size)?;
+        reader::spawn_indexed(source, self.config.clone(), options)
     }
 
     /// Decodes and verifies all gzip members from a non-seekable source.
@@ -258,6 +324,41 @@ impl Decoder {
         decode_stream(&mut cursor, &self.config, &cancelled, &mut sink, &runtime)
     }
 
+    /// Decodes a non-seekable gzip stream while collecting a coarse but valid
+    /// member-boundary index.
+    ///
+    /// A forward-only source does not expose independently discoverable
+    /// interior block boundaries, so the resulting index records member starts.
+    /// It can later seek a stable positional copy of the same compressed bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexingError`] for the same decode failures as
+    /// [`Self::decode_stream`] or for index construction and validation errors.
+    pub fn decode_stream_with_index<R, W>(
+        &self,
+        source: R,
+        output: &mut W,
+        options: IndexOptions,
+    ) -> Result<IndexedDecodeReport, IndexingError>
+    where
+        R: Read,
+        W: Write,
+    {
+        let cancelled = AtomicBool::new(false);
+        let mut sink = DirectOutput::new(output);
+        let runtime = RuntimeState::new(self.config.decoder_threads);
+        let mut cursor = StreamCursor::new(source, self.config.input_page_size);
+        decode_stream_with_index(
+            &mut cursor,
+            &self.config,
+            &cancelled,
+            &mut sink,
+            &runtime,
+            options,
+        )
+    }
+
     /// Starts decoding an owned non-seekable source and returns `Read + Send`
     /// decompressed output.
     ///
@@ -303,6 +404,29 @@ impl Decoder {
         R: Read + Send + 'static,
     {
         reader::spawn_stream(source, self.config.clone())
+    }
+
+    /// Starts pull-driven decoding of a non-seekable source while collecting
+    /// a member-boundary index.
+    ///
+    /// Like [`Self::stream_reader`], this runs synchronously in the caller's
+    /// `read` calls and spawns no coordinator or decoder worker. The returned
+    /// reader remains `Read + Send` and publishes the index only at verified
+    /// EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input failure or an initial framing failure. Later failures
+    /// are returned by [`Read::read`] or [`IndexingDecoderReader::finish`].
+    pub fn stream_reader_with_index<R>(
+        &self,
+        source: R,
+        options: IndexOptions,
+    ) -> Result<IndexingDecoderReader, DecodeError>
+    where
+        R: Read + Send + 'static,
+    {
+        reader::spawn_stream_indexed(source, self.config.clone(), options)
     }
 
     /// Opens, decodes, and verifies every gzip member from a filesystem path.

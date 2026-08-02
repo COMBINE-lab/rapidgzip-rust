@@ -1,8 +1,14 @@
-use crate::backend::{Output, SequentialDecoder, SequentialItem, decode_source};
+use crate::backend::{
+    Output, SequentialDecoder, SequentialItem, decode_source, decode_source_with_index,
+};
 use crate::config::Config;
 use crate::gzip::{StreamCursor, validate_initial_stream_header};
+use crate::index::{IndexCollector, IndexOptions};
 use crate::runtime::{AuxiliaryKind, RuntimeState};
-use crate::{DecodeError, DecodeReport, DecoderHandle, DecoderStats, ReadAt, WorkerLimitError};
+use crate::{
+    DecodeError, DecodeReport, DecoderHandle, DecoderStats, IndexedDecodeReport, IndexingError,
+    ReadAt, WorkerLimitError,
+};
 use std::io::{self, IoSliceMut, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,8 +18,18 @@ use std::time::Duration;
 
 enum Message {
     Data(Vec<u8>),
-    Finished(DecodeReport),
-    Failed(DecodeError),
+    Finished(Completion),
+    Failed(Failure),
+}
+
+enum Completion {
+    Decode(DecodeReport),
+    Indexed(IndexedDecodeReport),
+}
+
+enum Failure {
+    Decode(DecodeError),
+    Indexing(IndexingError),
 }
 
 struct ChannelOutput {
@@ -59,8 +75,8 @@ impl Output for ChannelOutput {
 
 enum Terminal {
     Open,
-    Finished(DecodeReport),
-    Failed(DecodeError),
+    Finished(Completion),
+    Failed(Failure),
 }
 
 /// Owned parallel decoder output implementing [`Read`] and [`Send`].
@@ -92,7 +108,10 @@ enum ReaderMode {
         receiver: Option<Receiver<Message>>,
         worker: Option<JoinHandle<()>>,
     },
-    Streaming(Box<SequentialDecoder<StreamCursor<Box<dyn Read + Send>>>>),
+    Streaming {
+        decoder: Box<SequentialDecoder<StreamCursor<Box<dyn Read + Send>>>>,
+        collector: Option<Arc<IndexCollector>>,
+    },
 }
 
 /// Launches a coordinator thread around `decode` and wires it to the reader.
@@ -108,7 +127,7 @@ where
             &AtomicBool,
             &mut ChannelOutput,
             &Arc<RuntimeState>,
-        ) -> Result<DecodeReport, DecodeError>
+        ) -> Result<Completion, IndexingError>
         + Send
         + 'static,
 {
@@ -128,12 +147,20 @@ where
                 runtime: Arc::clone(&worker_runtime),
             };
             let terminal = match decode(&worker_cancelled, &mut output, &worker_runtime) {
-                Ok(report) => {
-                    worker_runtime.set_member_count(report.member_count);
-                    Message::Finished(report)
+                Ok(completion) => {
+                    worker_runtime.set_member_count(match &completion {
+                        Completion::Decode(report) => report.member_count,
+                        Completion::Indexed(report) => report.decode.member_count,
+                    });
+                    Message::Finished(completion)
                 }
-                Err(DecodeError::Cancelled) if worker_cancelled.load(Ordering::Relaxed) => return,
-                Err(error) => Message::Failed(error),
+                Err(IndexingError::Decode(DecodeError::Cancelled))
+                    if worker_cancelled.load(Ordering::Relaxed) =>
+                {
+                    return;
+                }
+                Err(IndexingError::Decode(error)) => Message::Failed(Failure::Decode(error)),
+                Err(error) => Message::Failed(Failure::Indexing(error)),
             };
             let _ = output.send(terminal);
         })
@@ -161,10 +188,33 @@ where
     spawn_coordinator(
         move |cancelled, output, runtime| {
             decode_source(&source, &config, cancelled, output, runtime)
+                .map(Completion::Decode)
+                .map_err(IndexingError::from)
         },
         in_flight_chunks,
         configured_workers,
     )
+}
+
+pub(crate) fn spawn_indexed<R>(
+    source: R,
+    config: Config,
+    options: IndexOptions,
+) -> Result<IndexingDecoderReader, DecodeError>
+where
+    R: ReadAt + 'static,
+{
+    let in_flight_chunks = config.in_flight_chunks;
+    let configured_workers = config.decoder_threads;
+    spawn_coordinator(
+        move |cancelled, output, runtime| {
+            decode_source_with_index(&source, &config, cancelled, output, runtime, options)
+                .map(Completion::Indexed)
+        },
+        in_flight_chunks,
+        configured_workers,
+    )
+    .map(|inner| IndexingDecoderReader { inner })
 }
 
 /// Creates a pull-driven decoder for a non-seekable source.
@@ -181,14 +231,63 @@ where
     validate_initial_stream_header(&mut cursor)?;
     let runtime = RuntimeState::new(config.decoder_threads);
     let handle = DecoderHandle::new(Arc::clone(&runtime));
-    let decoder = SequentialDecoder::new(cursor, &config, 0, 0, config.decoder_threads, &runtime);
+    let decoder = SequentialDecoder::new(
+        cursor,
+        &config,
+        0,
+        0,
+        config.decoder_threads,
+        &runtime,
+        None,
+    );
     Ok(DecoderReader {
-        mode: ReaderMode::Streaming(Box::new(decoder)),
+        mode: ReaderMode::Streaming {
+            decoder: Box::new(decoder),
+            collector: None,
+        },
         cancelled: Arc::new(AtomicBool::new(false)),
         handle,
         current: Vec::new(),
         current_offset: 0,
         terminal: Terminal::Open,
+    })
+}
+
+pub(crate) fn spawn_stream_indexed<R>(
+    source: R,
+    config: Config,
+    options: IndexOptions,
+) -> Result<IndexingDecoderReader, DecodeError>
+where
+    R: Read + Send + 'static,
+{
+    let source: Box<dyn Read + Send> = Box::new(source);
+    let mut cursor = StreamCursor::new(source, config.input_page_size);
+    validate_initial_stream_header(&mut cursor)?;
+    let runtime = RuntimeState::new(config.decoder_threads);
+    let handle = DecoderHandle::new(Arc::clone(&runtime));
+    let collector = IndexCollector::new(options);
+    let decoder = SequentialDecoder::new(
+        cursor,
+        &config,
+        0,
+        0,
+        config.decoder_threads,
+        &runtime,
+        Some(&collector),
+    );
+    Ok(IndexingDecoderReader {
+        inner: DecoderReader {
+            mode: ReaderMode::Streaming {
+                decoder: Box::new(decoder),
+                collector: Some(collector),
+            },
+            cancelled: Arc::new(AtomicBool::new(false)),
+            handle,
+            current: Vec::new(),
+            current_offset: 0,
+            terminal: Terminal::Open,
+        },
     })
 }
 
@@ -225,7 +324,8 @@ impl DecoderReader {
     /// This is `None` while decoding is open and after a terminal failure.
     pub const fn report(&self) -> Option<&DecodeReport> {
         match &self.terminal {
-            Terminal::Finished(report) => Some(report),
+            Terminal::Finished(Completion::Decode(report)) => Some(report),
+            Terminal::Finished(Completion::Indexed(report)) => Some(&report.decode),
             Terminal::Open | Terminal::Failed(_) => None,
         }
     }
@@ -233,7 +333,7 @@ impl DecoderReader {
     fn join_worker(&mut self) -> Result<(), DecodeError> {
         let worker = match &mut self.mode {
             ReaderMode::Coordinator { worker, .. } => worker.take(),
-            ReaderMode::Streaming(_) => None,
+            ReaderMode::Streaming { .. } => None,
         };
         if let Some(worker) = worker {
             if worker.join().is_err() {
@@ -252,7 +352,7 @@ impl DecoderReader {
                 .expect("receiver remains present until shutdown")
                 .recv()
                 .ok(),
-            ReaderMode::Streaming(decoder) => {
+            ReaderMode::Streaming { decoder, collector } => {
                 let runtime = Arc::clone(&self.handle.state);
                 let result = {
                     let _busy = runtime.begin_task();
@@ -263,8 +363,26 @@ impl DecoderReader {
                         runtime.add_decompressed_bytes(data.len());
                         Some(Message::Data(data))
                     }
-                    Ok(SequentialItem::Finished(report)) => Some(Message::Finished(report)),
-                    Err(error) => Some(Message::Failed(error)),
+                    Ok(SequentialItem::Finished(report)) => {
+                        if let Some(collector) = collector {
+                            match collector
+                                .finish(report.compressed_bytes, report.decompressed_bytes)
+                            {
+                                Ok(index) => Some(Message::Finished(Completion::Indexed(
+                                    IndexedDecodeReport {
+                                        decode: report,
+                                        index,
+                                    },
+                                ))),
+                                Err(error) => Some(Message::Failed(Failure::Indexing(
+                                    IndexingError::Index(error),
+                                ))),
+                            }
+                        } else {
+                            Some(Message::Finished(Completion::Decode(report)))
+                        }
+                    }
+                    Err(error) => Some(Message::Failed(Failure::Decode(error))),
                 }
             }
         };
@@ -273,11 +391,11 @@ impl DecoderReader {
                 self.current = data;
                 self.current_offset = 0;
             }
-            Some(Message::Finished(report)) => {
+            Some(Message::Finished(completion)) => {
                 self.handle.state.mark_terminal();
                 let terminal = match self.join_worker() {
-                    Ok(()) => Terminal::Finished(report),
-                    Err(error) => Terminal::Failed(error),
+                    Ok(()) => Terminal::Finished(completion),
+                    Err(error) => Terminal::Failed(Failure::Decode(error)),
                 };
                 self.terminal = terminal;
             }
@@ -285,7 +403,7 @@ impl DecoderReader {
                 self.handle.state.mark_terminal();
                 let terminal = match self.join_worker() {
                     Ok(()) => Terminal::Failed(error),
-                    Err(join_error) => Terminal::Failed(join_error),
+                    Err(join_error) => Terminal::Failed(Failure::Decode(join_error)),
                 };
                 self.terminal = terminal;
             }
@@ -295,7 +413,7 @@ impl DecoderReader {
                     .join_worker()
                     .err()
                     .unwrap_or(DecodeError::WorkerPanicked);
-                self.terminal = Terminal::Failed(error);
+                self.terminal = Terminal::Failed(Failure::Decode(error));
             }
         }
     }
@@ -310,12 +428,107 @@ impl DecoderReader {
         self.current.clear();
         loop {
             match &self.terminal {
-                Terminal::Finished(report) => return Ok(*report),
-                Terminal::Failed(error) => return Err(error.clone()),
+                Terminal::Finished(Completion::Decode(report)) => return Ok(*report),
+                Terminal::Finished(Completion::Indexed(report)) => return Ok(report.decode),
+                Terminal::Failed(Failure::Decode(error)) => return Err(error.clone()),
+                Terminal::Failed(Failure::Indexing(IndexingError::Decode(error))) => {
+                    return Err(error.clone());
+                }
+                Terminal::Failed(Failure::Indexing(IndexingError::Index(_))) => {
+                    return Err(DecodeError::WorkerPanicked);
+                }
                 Terminal::Open => self.receive(),
             }
             self.current.clear();
         }
+    }
+
+    fn finish_indexed(mut self) -> Result<IndexedDecodeReport, IndexingError> {
+        self.current.clear();
+        while matches!(self.terminal, Terminal::Open) {
+            self.receive();
+            self.current.clear();
+        }
+        match std::mem::replace(&mut self.terminal, Terminal::Open) {
+            Terminal::Finished(Completion::Indexed(report)) => Ok(report),
+            Terminal::Finished(Completion::Decode(_)) | Terminal::Open => {
+                Err(IndexingError::Decode(DecodeError::WorkerPanicked))
+            }
+            Terminal::Failed(Failure::Decode(error)) => Err(IndexingError::Decode(error)),
+            Terminal::Failed(Failure::Indexing(error)) => Err(error),
+        }
+    }
+}
+
+/// Owned decoded output that publishes a random-access index at verified EOF.
+///
+/// This reader has the same `Read + Send` behavior, runtime telemetry, dynamic
+/// worker controls, backpressure, and cancellation semantics as
+/// [`DecoderReader`]. Index construction is explicit in the type so the normal
+/// reader does not pay for checkpoint windows or lose the small, [`Copy`]
+/// [`DecodeReport`] result.
+///
+/// Reaching [`Read`] EOF means both the gzip stream and collected index have
+/// been validated. [`Self::report`] then borrows the complete result, while
+/// [`Self::finish`] consumes the reader and returns ownership of it.
+#[must_use]
+pub struct IndexingDecoderReader {
+    inner: DecoderReader,
+}
+
+impl IndexingDecoderReader {
+    /// Returns a cloneable telemetry and runtime-control handle.
+    pub fn handle(&self) -> DecoderHandle {
+        self.inner.handle()
+    }
+
+    /// Returns an approximate lock-free snapshot of decoder activity.
+    pub fn stats(&self) -> DecoderStats {
+        self.inner.stats()
+    }
+
+    /// Changes the maximum number of workers that may accept decoder tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLimitError`] for zero or a value above the configured
+    /// worker budget.
+    pub fn set_worker_limit(&self, workers: usize) -> Result<(), WorkerLimitError> {
+        self.inner.set_worker_limit(workers)
+    }
+
+    /// Returns the indexed result after verified EOF has been observed.
+    ///
+    /// This is `None` while decoding is open and after a terminal failure.
+    #[must_use]
+    pub const fn report(&self) -> Option<&IndexedDecodeReport> {
+        match &self.inner.terminal {
+            Terminal::Finished(Completion::Indexed(report)) => Some(report),
+            Terminal::Open | Terminal::Finished(Completion::Decode(_)) | Terminal::Failed(_) => {
+                None
+            }
+        }
+    }
+
+    /// Discards unread output, verifies the remaining stream, finalizes the
+    /// index, and returns both the scalar report and index.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first decoding, verification, input, worker, or index
+    /// construction failure.
+    pub fn finish(self) -> Result<IndexedDecodeReport, IndexingError> {
+        self.inner.finish_indexed()
+    }
+}
+
+impl Read for IndexingDecoderReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(output)
+    }
+
+    fn read_vectored(&mut self, buffers: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        self.inner.read_vectored(buffers)
     }
 }
 
@@ -344,7 +557,8 @@ impl Read for DecoderReader {
 
             match &self.terminal {
                 Terminal::Finished(_) => return Ok(0),
-                Terminal::Failed(error) => return Err(error.to_io_error()),
+                Terminal::Failed(Failure::Decode(error)) => return Err(error.to_io_error()),
+                Terminal::Failed(Failure::Indexing(error)) => return Err(error.to_io_error()),
                 Terminal::Open => self.receive(),
             }
         }
@@ -385,7 +599,7 @@ impl Drop for DecoderReader {
 
 #[cfg(test)]
 mod tests {
-    use super::DecoderReader;
+    use super::{DecoderReader, IndexingDecoderReader};
     use std::io::Read;
 
     fn assert_traits<T: Read + Send + Unpin>() {}
@@ -393,5 +607,6 @@ mod tests {
     #[test]
     fn decoder_reader_is_read_send_and_unpin() {
         assert_traits::<DecoderReader>();
+        assert_traits::<IndexingDecoderReader>();
     }
 }

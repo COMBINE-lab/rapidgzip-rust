@@ -1,6 +1,9 @@
 use crate::config::Config;
 use crate::crc32::Crc32;
 use crate::gzip::{InputCursor, MemberHeader, SourceCursor, StreamCursor, parse_member_header};
+use crate::index::{
+    Checkpoint, CheckpointKind, IndexCollector, IndexKind, IndexOptions, WINDOW_SIZE,
+};
 use crate::inflate::RawInflater;
 use crate::parallel::Window;
 use crate::parallel::adaptive::AdaptiveConcurrency;
@@ -9,7 +12,10 @@ use crate::parallel::deflate::{
     find_next_structural_candidate,
 };
 use crate::runtime::{DecoderPath, RuntimeState};
-use crate::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, ReadAt};
+use crate::{
+    DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, IndexedDecodeReport, IndexingError,
+    ReadAt,
+};
 use crossbeam_deque::{Injector, Steal};
 use libz_rs_sys as z;
 use std::collections::BTreeMap;
@@ -66,13 +72,55 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
+    decode_source_inner(source, config, cancelled, output, runtime, None)
+}
+
+pub(crate) fn decode_source_with_index<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    runtime: &Arc<RuntimeState>,
+    options: IndexOptions,
+) -> Result<IndexedDecodeReport, IndexingError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
+    let collector = IndexCollector::new(options);
+    let report = decode_source_inner(source, config, cancelled, output, runtime, Some(&collector))?;
+    let index = collector.finish(report.compressed_bytes, report.decompressed_bytes)?;
+    Ok(IndexedDecodeReport {
+        decode: report,
+        index,
+    })
+}
+
+fn decode_source_inner<R, O>(
+    source: &R,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    runtime: &Arc<RuntimeState>,
+    collector: Option<&Arc<IndexCollector>>,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: ReadAt + ?Sized,
+    O: Output,
+{
     // BGZF block starts are normally tens of KiB apart and only their short
     // headers are needed for indexing. A small page avoids reading the
     // complete compressed payload before decoding.
     let bgzf_index = index_bgzf(source, config.input_page_size.min(256))?;
     if let Some(index) = bgzf_index {
+        if let Some(collector) = collector {
+            collector.set_kind(IndexKind::Bgzf);
+        }
         if index.len() > 1 {
             runtime.set_path(DecoderPath::Bgzf);
+            if let Some(collector) = collector {
+                offer_bgzf_checkpoints(source, &index, collector)?;
+            }
             return decode_bgzf_parallel(source, config, cancelled, output, &index, runtime);
         }
     }
@@ -80,20 +128,27 @@ where
         if let Some(index) = index_stored_stream(source, config.input_page_size.min(256))? {
             if index.tasks.len() > 1 {
                 runtime.set_path(DecoderPath::Stored);
+                if let Some(collector) = collector {
+                    offer_stored_checkpoints(&index, collector);
+                }
                 return decode_stored_parallel(source, config, cancelled, output, &index, runtime);
             }
         }
         if let Some(index) = index_independent_members(source, config)? {
             runtime.set_path(DecoderPath::DenseMembers);
-            return decode_independent_members(source, config, cancelled, output, &index, runtime);
+            return decode_independent_members(
+                source, config, cancelled, output, &index, runtime, collector,
+            );
         }
         let grid_size = adjusted_compressed_chunk_size(source, config)?;
         runtime.set_path(DecoderPath::MarkerWindow);
-        return decode_rapidgzip_estimated(source, config, cancelled, output, grid_size, runtime);
+        return decode_rapidgzip_estimated(
+            source, config, cancelled, output, grid_size, runtime, collector,
+        );
     }
     runtime.set_path(DecoderPath::Sequential);
     runtime.set_adaptive_target(1);
-    decode_source_sequential(source, config, cancelled, output, runtime)
+    decode_source_sequential(source, config, cancelled, output, runtime, collector)
 }
 
 fn adjusted_compressed_chunk_size<R: ReadAt + ?Sized>(
@@ -109,6 +164,13 @@ struct StoredMember {
     expected_size: u32,
 }
 
+#[derive(Clone, Copy)]
+struct StoredCheckpoint {
+    compressed_offset_in_bits: u64,
+    uncompressed_offset_in_bytes: u64,
+    kind: CheckpointKind,
+}
+
 #[derive(Clone)]
 struct StoredTask {
     member: usize,
@@ -120,6 +182,7 @@ struct StoredTask {
 struct StoredIndex {
     members: Vec<StoredMember>,
     tasks: Vec<StoredTask>,
+    checkpoints: Vec<StoredCheckpoint>,
     compressed_size: u64,
 }
 
@@ -130,6 +193,8 @@ fn index_stored_stream<R: ReadAt + ?Sized>(
     let mut cursor = SourceCursor::new(source, page_size)?;
     let mut members = Vec::new();
     let mut tasks = Vec::new();
+    let mut checkpoints = Vec::new();
+    let mut total_decoded = 0_u64;
 
     while !cursor.at_end() {
         let member_number = members.len() as u64;
@@ -137,6 +202,7 @@ fn index_stored_stream<R: ReadAt + ?Sized>(
         let mut member_ranges = Vec::new();
         let mut decoded_size = 0_u32;
         let mut block_start = header.deflate_start;
+        let mut first_block = true;
         loop {
             cursor.seek(block_start)?;
             let block_header = cursor.read_exact::<5>(block_start)?;
@@ -161,11 +227,23 @@ fn index_stored_stream<R: ReadAt + ?Sized>(
                     reason: DeflateErrorKind::Truncated,
                 });
             }
+            checkpoints.push(StoredCheckpoint {
+                compressed_offset_in_bits: block_start.saturating_mul(8),
+                uncompressed_offset_in_bytes: total_decoded.saturating_add(u64::from(decoded_size)),
+                kind: if first_block {
+                    CheckpointKind::MemberDeflate {
+                        header_offset_in_bytes: header.start,
+                    }
+                } else {
+                    CheckpointKind::DeflateBlock
+                },
+            });
             member_ranges.push(CompressedRange {
                 start: data_start,
                 end: data_end,
             });
             decoded_size = decoded_size.wrapping_add(u32::from(length));
+            first_block = false;
             block_start = data_end;
             if final_block {
                 break;
@@ -188,6 +266,7 @@ fn index_stored_stream<R: ReadAt + ?Sized>(
             expected_crc,
             expected_size,
         });
+        total_decoded = total_decoded.saturating_add(u64::from(decoded_size));
 
         let mut task_ranges = Vec::new();
         let mut task_size: usize = 0;
@@ -217,8 +296,23 @@ fn index_stored_stream<R: ReadAt + ?Sized>(
     Ok(Some(StoredIndex {
         members,
         tasks,
+        checkpoints,
         compressed_size: cursor.position(),
     }))
+}
+
+fn offer_stored_checkpoints(index: &StoredIndex, collector: &IndexCollector) {
+    for point in &index.checkpoints {
+        collector.offer(
+            Checkpoint {
+                compressed_offset_in_bits: point.compressed_offset_in_bits,
+                uncompressed_offset_in_bytes: point.uncompressed_offset_in_bytes,
+                kind: point.kind,
+                line_offset: None,
+            },
+            &[],
+        );
+    }
 }
 
 struct StoredResult {
@@ -500,6 +594,7 @@ fn decode_source_sequential<R, O>(
     cancelled: &AtomicBool,
     output: &mut O,
     runtime: &Arc<RuntimeState>,
+    collector: Option<&Arc<IndexCollector>>,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
@@ -515,6 +610,7 @@ where
         0,
         config.decoder_threads,
         runtime,
+        collector,
     )
 }
 
@@ -551,7 +647,42 @@ where
         0,
         config.decoder_threads,
         runtime,
+        None,
     )
+}
+
+/// Decodes a forward-only gzip stream while collecting a seek index.
+pub(crate) fn decode_stream_with_index<R, O>(
+    cursor: &mut StreamCursor<R>,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    runtime: &Arc<RuntimeState>,
+    options: IndexOptions,
+) -> Result<IndexedDecodeReport, IndexingError>
+where
+    R: Read,
+    O: Output,
+{
+    runtime.set_path(DecoderPath::Sequential);
+    runtime.set_adaptive_target(1);
+    let collector = IndexCollector::new(options);
+    let report = decode_members_sequential(
+        cursor,
+        config,
+        cancelled,
+        output,
+        0,
+        0,
+        config.decoder_threads,
+        runtime,
+        Some(&collector),
+    )?;
+    let index = collector.finish(report.compressed_bytes, report.decompressed_bytes)?;
+    Ok(IndexedDecodeReport {
+        decode: report,
+        index,
+    })
 }
 
 /// One increment of a sequential decode.
@@ -593,6 +724,7 @@ pub(crate) struct SequentialDecoder<C> {
     member_count: u64,
     decoder_threads: usize,
     runtime: Arc<RuntimeState>,
+    collector: Option<Arc<IndexCollector>>,
     state: SequentialState,
 }
 
@@ -614,6 +746,7 @@ impl<C: InputCursor> SequentialDecoder<C> {
         member_count: u64,
         decoder_threads: usize,
         runtime: &Arc<RuntimeState>,
+        collector: Option<&Arc<IndexCollector>>,
     ) -> Self {
         runtime.set_path(DecoderPath::Sequential);
         runtime.set_adaptive_target(1);
@@ -624,6 +757,7 @@ impl<C: InputCursor> SequentialDecoder<C> {
             member_count,
             decoder_threads,
             runtime: Arc::clone(runtime),
+            collector: collector.cloned(),
             state: SequentialState::Header,
         }
     }
@@ -668,6 +802,19 @@ impl<C: InputCursor> SequentialDecoder<C> {
                     debug_assert!(header.start <= header.deflate_start);
                     debug_assert_eq!(header.deflate_start, self.cursor.position());
                     let _observed_bgzf_size = header.bgzf_block_size;
+                    if let Some(collector) = &self.collector {
+                        collector.offer(
+                            Checkpoint {
+                                compressed_offset_in_bits: header.deflate_start.saturating_mul(8),
+                                uncompressed_offset_in_bytes: self.total_output,
+                                kind: CheckpointKind::MemberDeflate {
+                                    header_offset_in_bytes: header.start,
+                                },
+                                line_offset: None,
+                            },
+                            &[],
+                        );
+                    }
                     self.state = SequentialState::Inflating(SequentialMember {
                         header,
                         inflater: RawInflater::new()?,
@@ -847,6 +994,7 @@ fn decode_members_sequential<C, O>(
     member_count: u64,
     decoder_threads: usize,
     runtime: &Arc<RuntimeState>,
+    collector: Option<&Arc<IndexCollector>>,
 ) -> Result<DecodeReport, DecodeError>
 where
     C: InputCursor,
@@ -859,6 +1007,7 @@ where
         member_count,
         decoder_threads,
         runtime,
+        collector,
     );
     let mut reusable = Vec::with_capacity(config.decoded_chunk_size);
     loop {
@@ -1358,13 +1507,15 @@ struct DecodedIndependentMembers {
     start: u64,
     end: u64,
     bytes: Vec<u8>,
+    member_headers: [MemberHeader; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
     member_sizes: [usize; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
     member_count: usize,
 }
 
 impl DecodedIndependentMembers {
-    fn push_member_size(&mut self, size: usize) {
+    fn push_member(&mut self, header: MemberHeader, size: usize) {
         debug_assert!(self.member_count < self.member_sizes.len());
+        self.member_headers[self.member_count] = header;
         self.member_sizes[self.member_count] = size;
         self.member_count += 1;
     }
@@ -1375,6 +1526,10 @@ impl DecodedIndependentMembers {
 
     fn member_size(&self, index: usize) -> usize {
         self.member_sizes[index]
+    }
+
+    fn member_header(&self, index: usize) -> MemberHeader {
+        self.member_headers[index]
     }
 
     fn member_sizes(&self) -> impl Iterator<Item = usize> + '_ {
@@ -1470,6 +1625,11 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
                 start: header.start,
                 end: header.start,
                 bytes: Vec::new(),
+                member_headers: [MemberHeader {
+                    start: 0,
+                    deflate_start: 0,
+                    bgzf_block_size: None,
+                }; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
                 member_sizes: [0; INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES],
                 member_count: 0,
             },
@@ -1494,7 +1654,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
                 let member_size = run.decoded.bytes.len() - member_output_start;
                 decoded_bytes = decoded_bytes.saturating_add(member_size);
                 run.decoded.end = end;
-                run.decoded.push_member_size(member_size);
+                run.decoded.push_member(header, member_size);
                 if (member_size > maximum_collatable_member_size
                     || run.decoded.bytes.len() >= target_result_size)
                     && !send_finished_independent_run(&mut active, sender, stopped)
@@ -1657,6 +1817,7 @@ fn decode_independent_members<R, O>(
     output: &mut O,
     index: &IndependentMemberIndex,
     runtime: &Arc<RuntimeState>,
+    collector: Option<&Arc<IndexCollector>>,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
@@ -1898,6 +2059,20 @@ where
                             limit: config.output_limit.unwrap_or(u64::MAX),
                         });
                     }
+                    if let Some(collector) = collector {
+                        let header = decoded.member_header(member_index);
+                        collector.offer(
+                            Checkpoint {
+                                compressed_offset_in_bits: header.deflate_start.saturating_mul(8),
+                                uncompressed_offset_in_bytes: total_output,
+                                kind: CheckpointKind::MemberDeflate {
+                                    header_offset_in_bytes: header.start,
+                                },
+                                line_offset: None,
+                            },
+                            &[],
+                        );
+                    }
                     total_output =
                         next_total.expect("the overflow case returned immediately above");
                     member_count += 1;
@@ -1941,6 +2116,7 @@ where
             member_count,
             config.decoder_threads,
             runtime,
+            collector,
         );
     }
 
@@ -1963,6 +2139,42 @@ where
         member_count,
         decoder_threads: config.decoder_threads,
     })
+}
+
+/// Offers one fully framed, independently decodable checkpoint per non-empty
+/// BGZF block. The block footer supplies its exact decompressed contribution;
+/// final index publication still waits for the parallel decoder to verify all
+/// block CRC32 and ISIZE values.
+fn offer_bgzf_checkpoints<R: ReadAt + ?Sized>(
+    source: &R,
+    ranges: &[BgzfRange],
+    collector: &IndexCollector,
+) -> Result<(), DecodeError> {
+    let mut uncompressed = 0_u64;
+    let mut footer = Vec::new();
+    for range in ranges {
+        let isize_offset = range.end.checked_sub(4).ok_or(DecodeError::InvalidGzip {
+            offset: range.start,
+            reason: GzipErrorKind::Truncated,
+        })?;
+        read_range_reuse(source, isize_offset, 4, &mut footer)?;
+        let block_size = u32::from_le_bytes(footer[..4].try_into().expect("four bytes"));
+        if block_size != 0 {
+            collector.offer(
+                Checkpoint {
+                    compressed_offset_in_bits: range.deflate_start.saturating_mul(8),
+                    uncompressed_offset_in_bytes: uncompressed,
+                    kind: CheckpointKind::MemberDeflate {
+                        header_offset_in_bytes: range.start,
+                    },
+                    line_offset: None,
+                },
+                &[],
+            );
+        }
+        uncompressed = uncompressed.saturating_add(u64::from(block_size));
+    }
+    Ok(())
 }
 
 fn read_range<R: ReadAt + ?Sized>(
@@ -2688,6 +2900,7 @@ fn wait_for_resolved(
 fn enqueue_native_resolution(
     chunk: crate::parallel::deflate::Chunk,
     config: &Config,
+    collector: Option<&Arc<IndexCollector>>,
     current_bit: &mut u64,
     window: &mut Window,
     prepared_total: &mut u64,
@@ -2697,6 +2910,19 @@ fn enqueue_native_resolution(
     available_resolve_tasks: &AtomicUsize,
     work_signal: &(Mutex<()>, Condvar),
 ) -> Result<bool, DecodeError> {
+    if window.as_slice().len() == WINDOW_SIZE {
+        if let Some(collector) = collector {
+            collector.offer(
+                Checkpoint {
+                    compressed_offset_in_bits: *current_bit,
+                    uncompressed_offset_in_bytes: *prepared_total,
+                    kind: CheckpointKind::DeflateBlock,
+                    line_offset: None,
+                },
+                window.as_slice(),
+            );
+        }
+    }
     let prepared = prepare_native_chunk(chunk, *next_sequence, window, *current_bit)?;
     let next_total = prepared_total
         .checked_add(prepared.decoded_size as u64)
@@ -2813,6 +3039,7 @@ fn decode_rapidgzip_estimated<R, O>(
     output: &mut O,
     compressed_chunk_size: usize,
     runtime: &Arc<RuntimeState>,
+    collector: Option<&Arc<IndexCollector>>,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
@@ -2833,6 +3060,19 @@ where
     }
 
     let first_header = parse_member_header(&mut frame_cursor, true)?;
+    if let Some(collector) = collector {
+        collector.offer(
+            Checkpoint {
+                compressed_offset_in_bits: first_header.deflate_start.saturating_mul(8),
+                uncompressed_offset_in_bytes: 0,
+                kind: CheckpointKind::MemberDeflate {
+                    header_offset_in_bytes: first_header.start,
+                },
+                line_offset: None,
+            },
+            &[],
+        );
+    }
     let first_deflate_bit = first_header.deflate_start.saturating_mul(8);
     let length_bits = frame_cursor.length().saturating_mul(8);
     let spacing_bits = (compressed_chunk_size as u64).saturating_mul(8);
@@ -2987,6 +3227,19 @@ where
                 }
 
                 let header = parse_member_header(&mut frame_cursor, false)?;
+                if let Some(collector) = collector {
+                    collector.offer(
+                        Checkpoint {
+                            compressed_offset_in_bits: header.deflate_start.saturating_mul(8),
+                            uncompressed_offset_in_bytes: total_output,
+                            kind: CheckpointKind::MemberDeflate {
+                                header_offset_in_bytes: header.start,
+                            },
+                            line_offset: None,
+                        },
+                        &[],
+                    );
+                }
                 current_bit = header.deflate_start.saturating_mul(8);
                 window = Window::empty();
                 accounting = MemberAccounting::new();
@@ -3053,6 +3306,7 @@ where
                         let reached_stream_end = enqueue_native_resolution(
                             chunk,
                             config,
+                            collector,
                             &mut current_bit,
                             &mut window,
                             &mut prepared_total_output,
@@ -3131,6 +3385,7 @@ where
                     let reached_stream_end = enqueue_native_resolution(
                         chunk,
                         config,
+                        collector,
                         &mut current_bit,
                         &mut window,
                         &mut prepared_total_output,

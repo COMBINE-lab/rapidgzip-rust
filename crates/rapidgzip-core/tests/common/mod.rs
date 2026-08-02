@@ -63,3 +63,35 @@ fn deflate_with(bytes: &[u8], level: i32, window_bits: i32) -> Vec<u8> {
     output.truncate(produced);
     output
 }
+
+/// Compresses `bytes` into BGZF blocks and appends the standard empty EOF
+/// block.
+pub fn bgzf(bytes: &[u8], block_payload: usize) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for chunk in bytes.chunks(block_payload) {
+        let deflate = deflate_with(chunk, 6, -15);
+        let total = 18 + deflate.len() + 8;
+        assert!(total <= u16::MAX as usize + 1, "BGZF block does not fit");
+        let mut block = b"\x1f\x8b\x08\x04\0\0\0\0\x00\xff\x06\x00BC\x02\x00".to_vec();
+        block.extend_from_slice(&((total - 1) as u16).to_le_bytes());
+        block.extend_from_slice(&deflate);
+        block.extend_from_slice(&crc32(chunk).to_le_bytes());
+        block.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(&block);
+    }
+    encoded.extend_from_slice(&[
+        31, 139, 8, 4, 0, 0, 0, 0, 0, 255, 6, 0, 66, 67, 2, 0, 27, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    encoded
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut value = u32::MAX;
+    for &byte in bytes {
+        value ^= u32::from(byte);
+        for _ in 0..8 {
+            value = (value >> 1) ^ (0xEDB8_8320 & 0_u32.wrapping_sub(value & 1));
+        }
+    }
+    !value
+}

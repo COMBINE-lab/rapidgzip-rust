@@ -2,9 +2,9 @@
 //!
 //! `rapidgzip-core` decodes single-member gzip, concatenated gzip, and BGZF.
 //! It follows rapidgzip's marker/window algorithm for parallel decoding of
-//! ordinary DEFLATE streams and uses zlib-rs as its inflate backend. Encoding,
-//! index persistence, and decoded-output seeking are outside this crate's
-//! current scope.
+//! ordinary DEFLATE streams and uses zlib-rs as its inflate backend. Encoding
+//! is outside this crate's current scope. Index construction, persistence, and
+//! decoded-output seeking are available through explicit opt-in APIs.
 //!
 //! # Output interfaces
 //!
@@ -80,6 +80,20 @@
 //! ceiling after a [`DecoderReader`] moves into another component. Excess
 //! workers finish their current task and retire; sustained reader backpressure
 //! also reduces admission automatically.
+//!
+//! # Random access
+//!
+//! [`Decoder::decode_with_index`] and [`Decoder::reader_with_index`] collect a
+//! [`GzipIndex`] only when requested, leaving [`DecodeReport`] small and
+//! [`Copy`]. The streaming counterparts collect a coarser member-boundary index
+//! while reading a forward-only source. Indexes can be persisted in the native,
+//! indexed_gzip GZIDX, htslib BGZF `.gzi`, and gztool formats.
+//!
+//! [`IndexedReader`] implements [`std::io::Read`] + [`std::io::Seek`] over a
+//! stable [`ReadAt`] source. Member checkpoints permit full footer verification;
+//! an imported interior checkpoint cannot authenticate bytes skipped earlier
+//! in that same member because external formats do not store prefix checksum
+//! state. Later members are fully verified.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
@@ -98,9 +112,14 @@ pub mod index;
 pub mod parallel;
 
 pub use config::{ConfigError, Decoder, DecoderBuilder};
-pub use error::{DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind};
-pub use index::{Checkpoint, GzipIndex, IndexError, StoredWindow, WindowMap};
-pub use indexed::IndexedReader;
+pub use error::{
+    DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, IndexedDecodeReport, IndexingError,
+};
+pub use index::{
+    Checkpoint, CheckpointKind, GzipIndex, IndexError, IndexKind, IndexOptions, IndexReadOptions,
+    StoredWindow, WindowMap, WindowStorage,
+};
+pub use indexed::{IndexedReader, IndexedReaderError};
 pub use read_at::ReadAt;
-pub use reader::DecoderReader;
+pub use reader::{DecoderReader, IndexingDecoderReader};
 pub use runtime::{DecoderHandle, DecoderPath, DecoderPressure, DecoderStats, WorkerLimitError};
