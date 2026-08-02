@@ -139,6 +139,10 @@ Every `Checkpoint` explicitly carries a `CheckpointKind`:
 - `MemberHeader`: the compressed offset is the first gzip magic byte. It must
   be byte-aligned and requires no predecessor window. Resume parses the header
   before raw inflate.
+- `MemberDeflate`: the compressed offset is the byte-aligned raw-DEFLATE
+  payload, and the checkpoint separately retains its member-header byte
+  offset. This preserves full CRC32/ISIZE verification while allowing export
+  to formats that store raw-DEFLATE positions.
 - `DeflateBlock`: the compressed offset is the first bit of a DEFLATE block.
   It may be bit-aligned and requires a 32 KiB predecessor window unless the
   external format or decoder proves the block independent.
@@ -165,9 +169,9 @@ It is stored raw or as a complete zlib stream. Constructors reject every other
 expanded length. Validation expands compressed windows, checks the exact
 length, and requires the zlib payload to be consumed completely.
 
-The absence of a window is valid for a `MemberHeader` and for an explicitly
-independent `DeflateBlock`. The model records the point kind; absence alone is
-never used to infer how to resume.
+The absence of a window is valid for `MemberHeader`, `MemberDeflate`, and an
+explicitly independent `DeflateBlock`. The model records the point kind;
+absence alone is never used to infer how to resume.
 
 ### Ordering and empty members
 
@@ -187,9 +191,10 @@ adaptive controller never own windows or perform window compression.
 Decode paths submit only boundaries that have become authoritative in output
 order:
 
-- sequential positional and streaming paths submit every parsed member
-  header;
-- BGZF submits every proven block header, including empty blocks;
+- sequential positional and streaming paths submit every parsed member's raw
+  DEFLATE offset together with its header offset;
+- BGZF submits every proven non-empty block with both offsets; its conventional
+  empty EOF member is decoded and verified but need not be a seek target;
 - dense-member decoding submits a member header only when its preceding chain
   has been authenticated by the coordinator;
 - stored-stream decoding submits member headers and independent stored-block
@@ -226,9 +231,10 @@ footer is `UnexpectedEof`; remaining non-gzip bytes are trailing garbage.
 
 Integrity depends on the resume point:
 
-- From `MemberHeader`, the reader hashes every produced byte (including bytes
-  discarded to reach the seek target) and tracks member output modulo 2^32.
-  CRC32 and ISIZE must match before the member is accepted.
+- From `MemberHeader` or `MemberDeflate`, the reader parses the header and
+  hashes every produced byte (including bytes discarded to reach the seek
+  target), tracking member output modulo 2^32. CRC32 and ISIZE must match
+  before the member is accepted.
 - From an interior `DeflateBlock`, foreign indexes do not supply the skipped
   prefix checksum state. The reader parses the footer structurally but cannot
   authenticate that member's whole CRC32 or ISIZE and documents this limit.
@@ -245,10 +251,10 @@ and begins with `RGZIDX01`, a `u16` version, and a `u16` known-flags field.
 Flags encode which optional aggregate fields are present and whether the
 source is BGZF. Unknown flags are rejected.
 
-Each checkpoint stores both checkpoint kind and window kind. An explicit
-checkpoint flag records whether line metadata is present. Payload lengths use
-checked arithmetic and are bounded by read options. Writers validate the whole
-index before writing anything.
+Each checkpoint stores checkpoint kind, optional member-header offset, and
+window kind. An explicit checkpoint flag records whether line metadata is
+present. Payload lengths use checked arithmetic and are bounded by read
+options. Writers validate the whole index before writing anything.
 
 ## External formats
 
@@ -262,8 +268,10 @@ points according to indexed_gzip's format semantics.
 ### htslib `.gzi`
 
 Pairs are BGZF member-header offsets, with origin implicit. Import produces an
-`IndexKind::Bgzf` index with `MemberHeader` points. Export requires BGZF
-provenance, byte alignment, absent windows, and known compatible offsets.
+`IndexKind::Bgzf` index with `MemberHeader` points. Export accepts
+`MemberDeflate` points only when their retained header offsets are available,
+and otherwise requires member-header points, BGZF provenance, byte alignment,
+and absent windows.
 
 ### gztool
 

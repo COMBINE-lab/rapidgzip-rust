@@ -14,6 +14,8 @@ The project provides:
   BGZF;
 - both a push API over `std::io::Write` and an owned `std::io::Read + Send`
   stream suitable for parsers such as [paraseq];
+- opt-in random-access index construction, interoperable index formats, and a
+  decoded-output `Read + Seek` adapter;
 - decoding of non-seekable compressed input such as standard input, a FIFO, a
   process substitution, or a socket.
 
@@ -21,8 +23,8 @@ Non-seekable input is decoded sequentially by the same zlib-rs path the parallel
 decoders fall back to, so it is verified exactly as strictly as a regular file
 but is not decoded in parallel. See [Non-seekable input](#non-seekable-input).
 
-The project intentionally does not yet provide compression, random-access
-indexes, or seeking in decoded output.
+The project intentionally does not provide compression. Its random-access API
+is decoder-only and leaves ordinary decode operations unchanged.
 
 ## Library installation
 
@@ -188,6 +190,65 @@ is one [`DecoderBuilder::input_page_size`] window. `stream_reader` advances its
 resumable inflater only inside the consumer's `Read::read` call, so a slow
 consumer naturally stops reading the producer. Dropping it immediately drops
 the source; there is no streaming coordinator thread to block or detach.
+
+### Random-access indexes and seeking
+
+Index construction is explicit per decode operation. This keeps the existing
+`DecodeReport` small and `Copy`, and keeps checkpoint-window work out of calls
+that do not request it:
+
+```rust,no_run
+use rapidgzip_core::{Decoder, GzipIndex, IndexOptions, IndexedReader};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let decoder = Decoder::builder().decoder_threads(8).build()?;
+    let source = File::open("reads.fastq.gz")?;
+    let indexed = decoder.decode_with_index(
+        &source,
+        &mut io::sink(),
+        IndexOptions::default(),
+    )?;
+
+    let mut serialized = File::create("reads.fastq.gz.rgzidx")?;
+    indexed.index.write_native(&mut serialized)?;
+
+    let mut serialized = File::open("reads.fastq.gz.rgzidx")?;
+    let index = GzipIndex::read_native(&mut serialized)?;
+    let mut reader = IndexedReader::new(File::open("reads.fastq.gz")?, index)?;
+    reader.seek(SeekFrom::Start(4_000_000))?;
+    let mut buffer = [0; 4096];
+    reader.read_exact(&mut buffer)?;
+    Ok(())
+}
+```
+
+The pull API is `Decoder::reader_with_index`; its
+`IndexingDecoderReader` remains `Read + Send`, exposes the same telemetry and
+worker controls as `DecoderReader`, and returns an `IndexedDecodeReport` from
+`finish`. `decode_stream_with_index` and `stream_reader_with_index` can also
+collect a coarse member-boundary index while consuming forward-only input. The
+result can be used later only with a stable positional copy of the same
+compressed bytes.
+
+`GzipIndex` reads and writes:
+
+- the native versioned format, which preserves all rapidgzip-rust metadata;
+- indexed_gzip `GZIDX` versions 0/1 (writing version 1);
+- htslib BGZF `.gzi` indexes; and
+- gztool version 0/1 indexes.
+
+Format parsers apply explicit checkpoint and window-allocation limits through
+`IndexReadOptions`. `.gzi` export requires an index proven to come from BGZF;
+gztool line-aware export requires real line counters and never invents them.
+
+`IndexedReader` validates the index and any recorded source size before use.
+Resuming at a member checkpoint verifies that complete member's CRC32 and
+ISIZE, including bytes discarded during a seek, and all later members are
+fully verified. An interior checkpoint imported from an external format
+cannot authenticate bytes skipped earlier in that same member because those
+formats do not carry prefix checksum state.
 
 ## Command-line installation and use
 
