@@ -1,4 +1,4 @@
-use crate::backend::{Output, decode_source, decode_stream};
+use crate::backend::{Output, SequentialDecoder, SequentialItem, decode_source};
 use crate::config::Config;
 use crate::gzip::{StreamCursor, validate_initial_stream_header};
 use crate::runtime::{AuxiliaryKind, RuntimeState};
@@ -73,32 +73,35 @@ enum Terminal {
 /// unread compressed data; use [`DecoderReader::finish`] to discard unread
 /// output while still verifying the complete stream.
 ///
-/// A reader over a positional source also joins the pipeline on drop. A reader
-/// over a non-seekable source does not, because its coordinator can be blocked
-/// in a read against a producer that never writes again, and a drop must not be
-/// able to block forever. That coordinator observes the cancellation and exits
-/// at its next read or send boundary.
+/// A positional source is decoded by a background pipeline that is cancelled
+/// and joined on drop. A non-seekable source is decoded synchronously as this
+/// reader is pulled, so dropping it immediately drops the source and never
+/// leaves a blocked coordinator thread behind.
 #[must_use]
 pub struct DecoderReader {
-    receiver: Option<Receiver<Message>>,
-    worker: Option<JoinHandle<()>>,
+    mode: ReaderMode,
     cancelled: Arc<AtomicBool>,
     handle: DecoderHandle,
     current: Vec<u8>,
     current_offset: usize,
     terminal: Terminal,
-    join_on_drop: bool,
+}
+
+enum ReaderMode {
+    Coordinator {
+        receiver: Option<Receiver<Message>>,
+        worker: Option<JoinHandle<()>>,
+    },
+    Streaming(Box<SequentialDecoder<StreamCursor<Box<dyn Read + Send>>>>),
 }
 
 /// Launches a coordinator thread around `decode` and wires it to the reader.
 ///
-/// `configured_workers` seeds the runtime's immutable worker maximum, and
-/// `join_on_drop` selects whether dropping the reader waits for the coordinator.
+/// `configured_workers` seeds the runtime's immutable worker maximum.
 fn spawn_coordinator<F>(
     decode: F,
     in_flight_chunks: usize,
     configured_workers: usize,
-    join_on_drop: bool,
 ) -> Result<DecoderReader, DecodeError>
 where
     F: FnOnce(
@@ -137,14 +140,15 @@ where
         .map_err(DecodeError::output_io)?;
 
     Ok(DecoderReader {
-        receiver: Some(receiver),
-        worker: Some(worker),
+        mode: ReaderMode::Coordinator {
+            receiver: Some(receiver),
+            worker: Some(worker),
+        },
         cancelled,
         handle,
         current: Vec::new(),
         current_offset: 0,
         terminal: Terminal::Open,
-        join_on_drop,
     })
 }
 
@@ -160,34 +164,32 @@ where
         },
         in_flight_chunks,
         configured_workers,
-        true,
     )
 }
 
-/// Spawns a coordinator that decodes a non-seekable source sequentially.
+/// Creates a pull-driven decoder for a non-seekable source.
 ///
-/// The initial header is validated on the calling thread, before anything is
-/// spawned, so obviously wrong input is reported by the constructor rather than
-/// by the first read.
-///
-/// The runtime is configured with a single worker because the sequential path
-/// is the only one a forward-only source can reach, so the telemetry reports
-/// the concurrency actually in use rather than the builder's thread count.
+/// One initial read provides best-effort fail-fast header validation. The
+/// resumable decoder then reads only from `DecoderReader::read`; no coordinator
+/// or decoder-worker thread is created for this path.
 pub(crate) fn spawn_stream<R>(source: R, config: Config) -> Result<DecoderReader, DecodeError>
 where
     R: Read + Send + 'static,
 {
+    let source: Box<dyn Read + Send> = Box::new(source);
     let mut cursor = StreamCursor::new(source, config.input_page_size);
     validate_initial_stream_header(&mut cursor)?;
-    let in_flight_chunks = config.in_flight_chunks;
-    spawn_coordinator(
-        move |cancelled, output, runtime| {
-            decode_stream(&mut cursor, &config, cancelled, output, runtime)
-        },
-        in_flight_chunks,
-        1,
-        false,
-    )
+    let runtime = RuntimeState::new(config.decoder_threads);
+    let handle = DecoderHandle::new(Arc::clone(&runtime));
+    let decoder = SequentialDecoder::new(cursor, &config, 0, 0, config.decoder_threads, &runtime);
+    Ok(DecoderReader {
+        mode: ReaderMode::Streaming(Box::new(decoder)),
+        cancelled: Arc::new(AtomicBool::new(false)),
+        handle,
+        current: Vec::new(),
+        current_offset: 0,
+        terminal: Terminal::Open,
+    })
 }
 
 impl DecoderReader {
@@ -229,7 +231,11 @@ impl DecoderReader {
     }
 
     fn join_worker(&mut self) -> Result<(), DecodeError> {
-        if let Some(worker) = self.worker.take() {
+        let worker = match &mut self.mode {
+            ReaderMode::Coordinator { worker, .. } => worker.take(),
+            ReaderMode::Streaming(_) => None,
+        };
+        if let Some(worker) = worker {
             if worker.join().is_err() {
                 return Err(DecodeError::WorkerPanicked);
             }
@@ -238,17 +244,36 @@ impl DecoderReader {
     }
 
     fn receive(&mut self) {
-        let message = self
-            .receiver
-            .as_ref()
-            .expect("receiver remains present until shutdown")
-            .recv();
+        let mut reusable = std::mem::take(&mut self.current);
+        reusable.clear();
+        let message = match &mut self.mode {
+            ReaderMode::Coordinator { receiver, .. } => receiver
+                .as_ref()
+                .expect("receiver remains present until shutdown")
+                .recv()
+                .ok(),
+            ReaderMode::Streaming(decoder) => {
+                let runtime = Arc::clone(&self.handle.state);
+                let result = {
+                    let _busy = runtime.begin_task();
+                    decoder.next_chunk(&self.cancelled, reusable)
+                };
+                match result {
+                    Ok(SequentialItem::Chunk(data)) => {
+                        runtime.add_decompressed_bytes(data.len());
+                        Some(Message::Data(data))
+                    }
+                    Ok(SequentialItem::Finished(report)) => Some(Message::Finished(report)),
+                    Err(error) => Some(Message::Failed(error)),
+                }
+            }
+        };
         match message {
-            Ok(Message::Data(data)) => {
+            Some(Message::Data(data)) => {
                 self.current = data;
                 self.current_offset = 0;
             }
-            Ok(Message::Finished(report)) => {
+            Some(Message::Finished(report)) => {
                 self.handle.state.mark_terminal();
                 let terminal = match self.join_worker() {
                     Ok(()) => Terminal::Finished(report),
@@ -256,7 +281,7 @@ impl DecoderReader {
                 };
                 self.terminal = terminal;
             }
-            Ok(Message::Failed(error)) => {
+            Some(Message::Failed(error)) => {
                 self.handle.state.mark_terminal();
                 let terminal = match self.join_worker() {
                     Ok(()) => Terminal::Failed(error),
@@ -264,7 +289,7 @@ impl DecoderReader {
                 };
                 self.terminal = terminal;
             }
-            Err(_) => {
+            None => {
                 self.handle.state.mark_terminal();
                 let error = self
                     .join_worker()
@@ -351,15 +376,9 @@ impl Drop for DecoderReader {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Relaxed);
         self.handle.state.mark_terminal();
-        self.receiver.take();
-        if self.join_on_drop {
+        if let ReaderMode::Coordinator { receiver, .. } = &mut self.mode {
+            receiver.take();
             let _ = self.join_worker();
-        } else {
-            // A non-seekable coordinator can be parked inside a read against a
-            // producer that never writes again, so joining here could block
-            // forever. Cancellation is already visible and the closed receiver
-            // fails its next send, so it exits without further help.
-            self.worker.take();
         }
     }
 }

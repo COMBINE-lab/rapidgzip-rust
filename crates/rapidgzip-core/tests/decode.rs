@@ -289,8 +289,12 @@ fn assert_paths_agree(decoder: &Decoder, compressed: &[u8]) -> DecodeReport {
         streamed_report.compressed_bytes,
         positional_report.compressed_bytes
     );
-    // A stream is read once in order, so it never reports more than one worker.
-    assert_eq!(streamed_report.decoder_threads, 1);
+    // Reports retain the configured worker budget even though telemetry shows
+    // an effective target of one for this sequential path.
+    assert_eq!(
+        streamed_report.decoder_threads,
+        positional_report.decoder_threads
+    );
     streamed_report
 }
 
@@ -923,7 +927,8 @@ fn streaming_rejects_input_that_is_not_gzip_at_all() {
         matches!(error, DecodeError::InvalidGzip { .. }),
         "expected bad magic to be rejected, got {error:?}"
     );
-    // The pull interface rejects this before spawning a coordinator.
+    // With four bytes available immediately, best-effort constructor
+    // validation can reject this before returning a reader.
     assert!(
         decoder
             .stream_reader(pipe_from(b"not gzip at all", 4, Duration::ZERO))
@@ -948,25 +953,71 @@ fn streaming_enforces_output_limit_before_emitting_excess() {
 }
 
 #[test]
-fn streaming_reader_reports_the_sequential_path_and_one_worker() {
+fn streaming_reader_preserves_the_budget_but_uses_no_workers() {
     let compressed = member(&b"ACGT".repeat(20_000));
     let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
     let reader = decoder
         .stream_reader(pipe_from(&compressed, 4096, Duration::ZERO))
         .unwrap();
     let handle = reader.handle();
-    assert_eq!(handle.stats().configured_workers, 1);
+    let initial = handle.stats();
+    assert_eq!(initial.configured_workers, 8);
+    assert_eq!(initial.worker_limit, 8);
+    assert_eq!(initial.active_workers, 1);
+    assert_eq!(initial.spawned_workers, 0);
+    assert_eq!(initial.auxiliary_threads, 0);
+    reader.set_worker_limit(7).unwrap();
 
     let report = reader.finish().unwrap();
     assert_eq!(report.member_count, 1);
-    assert_eq!(report.decoder_threads, 1);
+    assert_eq!(report.decoder_threads, 8);
 
     let stats = handle.stats();
     assert_eq!(stats.path, DecoderPath::Sequential);
-    assert_eq!(stats.configured_workers, 1);
+    assert_eq!(stats.configured_workers, 8);
+    assert_eq!(stats.worker_limit, 7);
     assert_eq!(stats.spawned_workers, 0);
     assert_eq!(stats.auxiliary_threads, 0);
     assert_eq!(stats.pressure, DecoderPressure::Finished);
+}
+
+#[test]
+fn streaming_reader_reports_the_calling_thread_while_blocked_on_input() {
+    let (sender, pipe) = pipe_pair();
+    // Best-effort construction can validate this complete fixed header. The
+    // first read then consumes it and blocks waiting for DEFLATE input.
+    sender
+        .send(b"\x1f\x8b\x08\x00\0\0\0\0\x00\xff".to_vec())
+        .unwrap();
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let reader = decoder.stream_reader(pipe).unwrap();
+    let handle = reader.handle();
+    let consumer = thread::spawn(move || {
+        let mut reader = reader;
+        let mut byte = [0_u8; 1];
+        let result = reader.read(&mut byte);
+        (reader, result)
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let stats = handle.stats();
+        if stats.busy_workers == 1 {
+            assert_eq!(stats.active_workers, 1);
+            assert_eq!(stats.spawned_workers, 0);
+            assert_eq!(stats.auxiliary_threads, 0);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "streaming read never became busy"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    drop(sender);
+    let (_reader, result) = consumer.join().unwrap();
+    assert!(result.is_err(), "header-only input must be truncated");
 }
 
 #[test]
@@ -996,16 +1047,11 @@ fn streaming_reader_coerces_to_boxed_read_send_for_paraseq() {
 }
 
 #[test]
-fn dropping_a_streaming_reader_before_eof_does_not_hang() {
+fn dropping_a_streaming_reader_before_eof_releases_its_source() {
     let compressed = member(&b"ACGT".repeat(200_000));
-    // Hold the sender for the whole test so the pipe never reaches end of
-    // input: this models a producer that stalls instead of closing.
     let (sender, pipe) = pipe_pair();
     let prefix = compressed[..1024].to_vec();
-    thread::spawn(move || {
-        let _ = sender.send(prefix);
-        thread::sleep(Duration::from_secs(30));
-    });
+    sender.send(prefix).unwrap();
 
     let decoder = Decoder::default();
     let mut reader = decoder.stream_reader(pipe).unwrap();
@@ -1014,14 +1060,12 @@ fn dropping_a_streaming_reader_before_eof_does_not_hang() {
     // Nothing claims the unread remainder was verified.
     assert!(reader.report().is_none());
 
-    let (done_sender, done_receiver) = mpsc::channel();
-    thread::spawn(move || {
-        drop(reader);
-        let _ = done_sender.send(());
-    });
+    drop(reader);
+    // The pipe receiver is owned by the source. A detached coordinator would
+    // keep it alive; synchronous pull decoding drops it with DecoderReader.
     assert!(
-        done_receiver.recv_timeout(Duration::from_secs(5)).is_ok(),
-        "dropping a streaming reader must not block on a stalled producer"
+        sender.send(vec![0]).is_err(),
+        "dropping a streaming reader must release its source immediately"
     );
 }
 
@@ -1107,7 +1151,7 @@ fn streaming_decodes_a_real_operating_system_pipe() {
     assert_eq!(streamed, positional);
     assert_eq!(streamed, payload);
     assert_eq!(report.member_count, 1);
-    assert_eq!(report.decoder_threads, 1);
+    assert_eq!(report.decoder_threads, 8);
 }
 
 #[cfg(unix)]
@@ -1149,10 +1193,10 @@ fn open_routes_a_fifo_to_the_streaming_path() {
 
     assert_eq!(decoded, payload);
     assert_eq!(report.member_count, 1);
-    assert_eq!(report.decoder_threads, 1);
+    assert_eq!(report.decoder_threads, 8);
     let stats = handle.stats();
     assert_eq!(stats.path, DecoderPath::Sequential);
-    assert_eq!(stats.configured_workers, 1);
+    assert_eq!(stats.configured_workers, 8);
 }
 
 #[cfg(unix)]

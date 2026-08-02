@@ -6,7 +6,8 @@ The crate denies unsafe operations inside unsafe functions:
 #![deny(unsafe_op_in_unsafe_fn)]
 ```
 
-There is no unsafe public API and no manual `Send` or `Sync` implementation.
+There is no unsafe public API. One private manual `Send` implementation, for the
+resumable sequential decoder, is justified below; there is no manual `Sync`.
 
 ## zlib-rs ABI adapter
 
@@ -21,6 +22,8 @@ There is no unsafe public API and no manual `Send` or `Sync` implementation.
   lengths come only from the backend's reduced `avail_*` fields. When spare
   capacity is used, `Vec::set_len` exposes exactly the byte count zlib-rs
   reported initialized and never more than the proven capacity.
+- The resumable decoder clears `next_in`, `next_out`, and their lengths
+  immediately after each `inflate` call, before it can yield or move.
 - `inflatePrime` supplies at most seven unread low-order bits from one source
   byte before the first inflate call.
 - `inflateSetDictionary` receives an immutable slice no larger than 32 KiB.
@@ -41,6 +44,26 @@ the spare capacity remaining beneath its per-member output bound. It exposes
 exactly the initialized byte count reported by zlib-rs, verifies that the
 stream reached `Z_STREAM_END`, and authenticates CRC32 and ISIZE before the
 coordinator can emit the buffer.
+
+## Resumable decoder `Send`
+
+`SequentialDecoder<C>` has a private `unsafe impl<C: Send> Send`. Its zlib-rs
+`z_stream` contains raw pointers, so Rust cannot derive this property even
+though the state is movable:
+
+- the decoder exclusively owns the cursor and initialized inflater, and all
+  decode operations require `&mut self`, preventing concurrent calls;
+- zlib-rs inflate state is not attached to the OS thread that initialized it;
+- the only pointers into caller-owned input/output storage are `next_in` and
+  `next_out`, and the state machine clears both before returning a chunk,
+  returning an error, or otherwise yielding control;
+- zlib-rs's private allocations remain at stable heap addresses when the Rust
+  wrapper moves, and its RAII wrapper still invokes `inflateEnd` exactly once;
+- `C: Send` separately proves that the externally supplied input state can move.
+
+This implementation is required to preserve `DecoderReader: Read + Send` when
+the reader owns an in-progress non-seekable inflate operation. It does not make
+the decoder `Sync` and exposes no unsafe contract to callers.
 
 ## SIMD gzip-header scan
 

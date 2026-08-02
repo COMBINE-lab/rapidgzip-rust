@@ -68,6 +68,28 @@ pub(crate) trait InputCursor {
     }
 }
 
+impl<T: InputCursor + ?Sized> InputCursor for &mut T {
+    fn position(&self) -> u64 {
+        (**self).position()
+    }
+
+    fn is_at_end(&mut self) -> Result<bool, DecodeError> {
+        (**self).is_at_end()
+    }
+
+    fn available(&mut self) -> Result<&[u8], DecodeError> {
+        (**self).available()
+    }
+
+    fn advance(&mut self, count: usize) {
+        (**self).advance(count);
+    }
+
+    fn verify_source_unchanged(&self) -> Result<(), DecodeError> {
+        (**self).verify_source_unchanged()
+    }
+}
+
 /// Buffered cursor over an immutable positional source.
 pub(crate) struct SourceCursor<'a, R: ReadAt + ?Sized> {
     source: &'a R,
@@ -464,14 +486,14 @@ pub(crate) fn validate_initial_header<R: ReadAt + ?Sized>(
 /// Validates the first member header against a stream's buffered prefix.
 ///
 /// The prefix is inspected in place, so nothing is consumed and the cursor is
-/// still positioned at offset zero afterwards. This gives
-/// `Decoder::stream_reader` the same fail-fast behaviour that `Decoder::reader`
-/// gets from [`validate_initial_header`].
+/// still positioned at offset zero afterwards. This provides best-effort
+/// fail-fast validation for `Decoder::stream_reader`: unlike a positional
+/// source, an arbitrary `Read` may return a short prefix without reaching EOF.
 ///
-/// A header longer than the buffered prefix cannot be validated here. That case
-/// is reported as `Ok(())` and left to the decode itself, which sees the whole
-/// header, rather than being mistaken for truncation. Genuine truncation is
-/// distinguished by the stream having already reached its end.
+/// A short read or a header longer than the buffered prefix cannot be validated
+/// here. That case is reported as `Ok(())` and left to the decode itself, which
+/// sees the whole header, rather than being mistaken for truncation. Genuine
+/// truncation is distinguished by the stream having already reached its end.
 pub(crate) fn validate_initial_stream_header<R: Read>(
     cursor: &mut StreamCursor<R>,
 ) -> Result<(), DecodeError> {

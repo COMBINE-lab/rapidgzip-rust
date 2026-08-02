@@ -2,9 +2,9 @@
 
 use clap::{ArgAction, Parser};
 use rapidgzip_core::{DecodeError, DecodeReport, Decoder};
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, Write};
-use std::path::{Path, PathBuf};
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Debug, Parser)]
@@ -32,45 +32,22 @@ struct Arguments {
 
     /// Gzip or BGZF input file, or `-` for standard input.
     ///
-    /// A seekable file is decoded in parallel. A pipe, FIFO, or standard input
+    /// A regular file is decoded in parallel. A pipe, FIFO, or standard input
     /// is decoded sequentially with the same verification.
     #[arg(value_name = "INPUT")]
     input: PathBuf,
 }
 
-/// Compressed input, already classified by whether it can be read positionally.
-enum Source {
-    Positional(File),
-    Stream(Box<dyn Read + Send>),
-}
-
-/// Mirrors the routing `Decoder::open` performs, for the push interface.
-fn open_source(path: &Path) -> io::Result<Source> {
-    if path.as_os_str() == "-" {
-        return Ok(Source::Stream(Box::new(io::stdin())));
-    }
-    let mut file = File::open(path)?;
-    let positional = match file.metadata() {
-        Ok(metadata) if metadata.file_type().is_file() => true,
-        Ok(_) => file.stream_position().is_ok(),
-        Err(_) => false,
-    };
-    if positional {
-        Ok(Source::Positional(file))
-    } else {
-        Ok(Source::Stream(Box::new(file)))
-    }
-}
-
+/// Decodes through the core library's single source classifier.
 fn decode_into<W: Write>(
     decoder: &Decoder,
-    source: Source,
+    path: &std::path::Path,
     output: &mut W,
 ) -> Result<DecodeReport, DecodeError> {
-    match source {
-        Source::Positional(file) => decoder.decode(&file, output),
-        Source::Stream(reader) => decoder.decode_stream(reader, output),
+    if path.as_os_str() == "-" {
+        return decoder.decode_stream(io::stdin(), output);
     }
+    decoder.decode_path(path, output)
 }
 
 fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
@@ -79,10 +56,9 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.decoder_threads(threads);
     }
     let decoder = builder.build()?;
-    let input = open_source(&arguments.input)?;
 
     if arguments.test {
-        let report = decode_into(&decoder, input, &mut io::sink())?;
+        let report = decode_into(&decoder, &arguments.input, &mut io::sink())?;
         eprintln!(
             "{}: ok, {} member(s), {} decoded bytes",
             arguments.input.display(),
@@ -97,12 +73,12 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        decode_into(&decoder, input, &mut output)?;
+        decode_into(&decoder, &arguments.input, &mut output)?;
         output.flush()?;
     } else {
         let stdout = io::stdout();
         let mut output = stdout.lock();
-        decode_into(&decoder, input, &mut output)?;
+        decode_into(&decoder, &arguments.input, &mut output)?;
         output.flush()?;
     }
     Ok(())

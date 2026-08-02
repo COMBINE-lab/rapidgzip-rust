@@ -17,10 +17,11 @@ payload through one of five bounded paths:
 5. Other streams use a file-wide estimated grid and rapidgzip's marker/window
    path, with zlib-rs fallback from the last authoritative boundary.
 
-All paths return ordered owned chunks to one coordinator. The coordinator alone
-updates member accounting and calls the user's `Write`, so a writer need not be
-`Send`. `DecoderReader` substitutes a bounded synchronous channel at this final
-edge and therefore implements `Read + Send` without changing the decoder core.
+Positional paths return ordered owned chunks to one coordinator. The
+coordinator updates member accounting and calls the user's `Write`, so a writer
+need not be `Send`. A positional `DecoderReader` substitutes a bounded
+synchronous channel at this final edge. The non-seekable path uses the same
+sequential core as a resumable state machine, described below.
 
 ## Non-seekable input
 
@@ -50,10 +51,24 @@ means the whole input was verified, and `verify_source_unchanged` is a no-op.
 The `ReadAt` contract itself is unchanged, and no parallel path observes any of
 this.
 
-Sequencing follows the positional entry points. The first member header is
-validated against the initial window, without consuming it, before any
-coordinator is spawned. The runtime is then configured with a single worker so
-`DecoderStats` and `DecodeReport` report the concurrency actually in use.
+`decode_stream` drives the resumable engine to completion on the calling thread.
+`stream_reader` performs one initial read for best-effort fail-fast header
+validation, then advances the engine only from the consumer's `Read::read`.
+This avoids both a permanently allocated streaming thread and the possibility
+of detaching one blocked inside an arbitrary `Read`. The state machine owns the
+current header, zlib-rs inflater, CRC32, member size, and input cursor between
+chunks, so dropping the reader drops the source immediately.
+
+Runtime telemetry retains the builder's immutable configured-worker budget and
+application worker limit. The sequential path sets its adaptive target to one,
+spawns no decoder workers or auxiliary coordinator, and returns the configured
+budget in `DecodeReport::decoder_threads`, preserving the published field
+semantics while still exposing the concurrency actually in use.
+
+`Decoder::open` classifies only regular files as positional. Seekability alone
+is insufficient: block and character devices can implement seek while lacking
+the stable, known-length, concurrently readable snapshot required by `ReadAt`.
+Every non-regular path accepted by `File::open` uses the streaming engine.
 
 ## Marker/window algorithm
 
@@ -223,10 +238,9 @@ chunk. Dropping it closes the consumer edge, sets cancellation, and joins the
 coordinator.
 
 A non-seekable source holds one input window instead of a positional page and
-spools nothing, so its memory is independent of the input length. Backpressure
-reaches the producer without any new mechanism: the bounded final handoff blocks
-the coordinator, the coordinator therefore stops reading, and the pipe fills.
-Dropping such a reader closes the consumer edge and sets cancellation as usual,
-but does not join. Its coordinator can be parked inside a read against a
-producer that never writes again, and a drop that could block forever is worse
-than a thread that exits at its next read or send boundary.
+spools nothing, so its memory is independent of the input length. There is no
+final handoff or streaming coordinator: the consumer directly advances one
+decoded chunk at a time. A slow consumer therefore stops calling the compressed
+source, naturally propagating backpressure to a pipe or socket. Dropping the
+reader drops the cursor and source synchronously, so no OS thread, stack,
+channel, or input resource can remain detached behind it.

@@ -108,18 +108,17 @@ rapidgzip task activity rather than operating-system CPU utilization.
 ### Push decoding
 
 [`Decoder::decode`] avoids the final reader copy and calls a `Write` value only
-from the calling thread. The writer therefore does not need to implement
-`Send`:
+from the calling thread. [`Decoder::decode_path`] is its filesystem-path
+counterpart and automatically applies the same regular/non-regular routing as
+[`Decoder::open`]. The writer therefore does not need to implement `Send`:
 
 ```rust,no_run
 use rapidgzip_core::Decoder;
-use std::fs::File;
 use std::io;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let input = File::open("reads.fastq.gz")?;
     let decoder = Decoder::default();
-    let report = decoder.decode(&input, &mut io::sink())?;
+    let report = decoder.decode_path("reads.fastq.gz", &mut io::sink())?;
     println!("verified {} gzip members", report.member_count);
     Ok(())
 }
@@ -180,16 +179,15 @@ limit. Reaching EOF, or an `Ok` report, still means the complete input was
 verified.
 
 What differs: the four parallel decode paths all need positional reads, so a
-non-seekable source always uses the sequential path. Telemetry reports this
-honestly rather than reporting an unused thread budget, so
-[`DecoderStats::path`] is [`DecoderPath::Sequential`], `configured_workers` is
-`1`, and `DecodeReport::decoder_threads` is `1`, whatever the builder was given.
-Nothing is spooled to memory or to disk: input memory is one
-[`DecoderBuilder::input_page_size`] window, and a slow consumer is throttled by
-the same bounded handoff as a positional reader, which in turn stops reading the
-pipe. Dropping a streaming [`DecoderReader`] before end of output cancels but
-does not wait for the background thread, so a producer that stalls without
-closing cannot block the drop.
+non-seekable source always uses the sequential path. Telemetry preserves the
+builder contract: [`DecoderStats::configured_workers`] and
+`DecodeReport::decoder_threads` remain the requested maximum budget, while
+[`DecoderStats::active_workers`] is one and both `spawned_workers` and
+`auxiliary_threads` are zero. Nothing is spooled to memory or disk: input memory
+is one [`DecoderBuilder::input_page_size`] window. `stream_reader` advances its
+resumable inflater only inside the consumer's `Read::read` call, so a slow
+consumer naturally stops reading the producer. Dropping it immediately drops
+the source; there is no streaming coordinator thread to block or detach.
 
 ## Command-line installation and use
 
@@ -317,6 +315,7 @@ The repository is distributed under the combined terms of BSD-3-Clause and
 MIT. See [LICENSE-BSD-3-CLAUSE] and [LICENSE-MIT].
 
 [`Decoder::decode`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode
+[`Decoder::decode_path`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode_path
 [`Decoder::decode_stream`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode_stream
 [`Decoder::open`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.open
 [`Decoder::reader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.reader
@@ -328,6 +327,8 @@ MIT. See [LICENSE-BSD-3-CLAUSE] and [LICENSE-MIT].
 [`DecoderBuilder::output_limit`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.output_limit
 [`DecoderReader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderReader.html
 [`DecoderStats::path`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderStats.html#structfield.path
+[`DecoderStats::configured_workers`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderStats.html#structfield.configured_workers
+[`DecoderStats::active_workers`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderStats.html#structfield.active_workers
 [`ReadAt`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/trait.ReadAt.html
 [ARCHITECTURE.md]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/ARCHITECTURE.md
 [BENCHMARKING.md]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/BENCHMARKING.md

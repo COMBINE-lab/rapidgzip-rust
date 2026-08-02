@@ -9,18 +9,20 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Decoding of non-seekable compressed input through `Decoder::decode_stream`
   and `Decoder::stream_reader`, which accept any `std::io::Read` and mirror
-  `Decoder::decode` and `Decoder::reader`. `Decoder::open` now routes a path
-  that cannot be read positionally, such as a FIFO, character device, or
-  socket, to the streaming decoder instead of failing, and the CLI accepts `-`
+  `Decoder::decode` and `Decoder::reader`. `Decoder::open` and the new push
+  counterpart `Decoder::decode_path` now route a
+  non-regular path accepted by `File::open`, such as a FIFO or character
+  device, to the streaming decoder instead of failing, and the CLI accepts `-`
   for standard input. Such input runs the sequential zlib-rs path that the
   parallel paths already use as their authoritative fallback, sharing its
   framing, footer verification, trailing-garbage detection, and output limit,
   so it is verified identically but is not decoded in parallel.
-  `DecoderStats` and `DecodeReport` report a single worker for it rather than
-  the configured thread budget. Nothing is spooled; input memory is one
-  configured input window. Dropping a streaming `DecoderReader` before end of
-  output cancels without waiting for its background thread, so a stalled
-  producer cannot block the drop.
+  `DecoderStats` and `DecodeReport` preserve the configured thread budget while
+  reporting an effective target of one and no spawned worker or auxiliary
+  threads. Nothing is spooled; input memory is one configured input window.
+  A streaming `DecoderReader` advances a resumable sequential decoder in the
+  caller's `Read::read`, so dropping it immediately drops the source and cannot
+  leave a coordinator blocked on a stalled producer.
 
 ## [0.1.0] - 2026-07-31
 
