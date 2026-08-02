@@ -4,10 +4,8 @@
 //! owns exactly one initialized `z_stream`, ends it exactly once, and confines
 //! the crate's inflate-side `unsafe` to one place. Resuming mid-stream uses
 //! [`RawInflater::prime`] for a bit offset that is not byte aligned and
-//! [`RawInflater::set_dictionary`] or [`RawInflater::set_dictionary_bytes`]
-//! for the predecessor window.
+//! [`RawInflater::set_dictionary_bytes`] for the predecessor window.
 
-use crate::parallel::Window;
 use crate::{DecodeError, DeflateErrorKind};
 use libz_rs_sys as z;
 use std::ffi::CStr;
@@ -17,24 +15,38 @@ use std::mem::size_of;
 pub(crate) struct RawInflater {
     pub(crate) stream: z::z_stream,
     initialized: bool,
+    window_bits: u8,
 }
 
 impl RawInflater {
     pub(crate) fn new() -> Result<Self, DecodeError> {
+        Self::new_with_window_bits(15)
+    }
+
+    /// Initializes raw inflation with an RFC 1950 CINFO-derived window.
+    pub(crate) fn new_with_window_bits(window_bits: u8) -> Result<Self, DecodeError> {
+        if !(8..=15).contains(&window_bits) {
+            return Err(DecodeError::InvalidDeflate {
+                bit_offset: 0,
+                reason: DeflateErrorKind::InvalidData,
+            });
+        }
         let mut result = Self {
             stream: z::z_stream::default(),
             initialized: false,
+            window_bits,
         };
 
         // SAFETY:
         // - `result.stream` is a live, uniquely borrowed `z_stream`.
         // - `zlibVersion` returns a static NUL-terminated version string.
         // - the structure size matches the exact Rust ABI type passed.
-        // - `-15` requests raw DEFLATE with a 32 KiB window.
+        // - a negative `window_bits` requests raw DEFLATE with the container's
+        //   declared history limit.
         let status = unsafe {
             z::inflateInit2_(
                 &mut result.stream,
-                -15,
+                -i32::from(window_bits),
                 z::zlibVersion(),
                 size_of::<z::z_stream>() as i32,
             )
@@ -63,11 +75,27 @@ impl RawInflater {
     }
 
     pub(crate) fn reset(&mut self, bit_offset: u64) -> Result<(), DecodeError> {
+        self.reset_with_window_bits(self.window_bits, bit_offset)
+    }
+
+    /// Resets raw inflation and changes the maximum history window.
+    pub(crate) fn reset_with_window_bits(
+        &mut self,
+        window_bits: u8,
+        bit_offset: u64,
+    ) -> Result<(), DecodeError> {
+        if !(8..=15).contains(&window_bits) {
+            return Err(DecodeError::InvalidDeflate {
+                bit_offset,
+                reason: DeflateErrorKind::InvalidData,
+            });
+        }
         // SAFETY: this wrapper owns a successfully initialized stream and
-        // holds its unique mutable borrow. `inflateReset` retains the raw
-        // window mode selected by `inflateInit2_`.
-        let status = unsafe { z::inflateReset(&mut self.stream) };
+        // holds its unique mutable borrow. A negative value keeps raw mode;
+        // the accepted range is checked above.
+        let status = unsafe { z::inflateReset2(&mut self.stream, -i32::from(window_bits)) };
         if status == z::Z_OK {
+            self.window_bits = window_bits;
             Ok(())
         } else {
             Err(DecodeError::InvalidDeflate {
@@ -98,39 +126,10 @@ impl RawInflater {
         }
     }
 
-    pub(crate) fn set_dictionary(
-        &mut self,
-        window: &Window,
-        bit_offset: u64,
-    ) -> Result<(), DecodeError> {
-        if window.as_slice().is_empty() {
-            return Ok(());
-        }
-        // SAFETY: `window` remains immutably borrowed for the call, and its
-        // slice is no larger than DEFLATE's 32 KiB history limit.
-        let status = unsafe {
-            z::inflateSetDictionary(
-                &mut self.stream,
-                window.as_slice().as_ptr(),
-                window.as_slice().len() as u32,
-            )
-        };
-        if status == z::Z_OK {
-            Ok(())
-        } else {
-            Err(DecodeError::InvalidDeflate {
-                bit_offset,
-                reason: DeflateErrorKind::BackendStatus(status),
-            })
-        }
-    }
-
     /// Installs `bytes` as the raw-inflate history.
     ///
-    /// This is the byte-slice form of [`Self::set_dictionary`], used by the
-    /// indexed reader, whose windows come from an index rather than from a
-    /// marker-resolution [`Window`].
-    #[allow(dead_code)] // Used by the indexed reader, which lands next.
+    /// The indexed reader supplies stored windows, while the parallel decoder
+    /// supplies only the suffix permitted by the selected container.
     pub(crate) fn set_dictionary_bytes(
         &mut self,
         bytes: &[u8],

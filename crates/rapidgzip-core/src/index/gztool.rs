@@ -1,9 +1,9 @@
 //! gztool index import and export.
 
 use super::{
-    Checkpoint, CheckpointKind, GzipIndex, IndexError, IndexReadOptions, StoredWindow,
-    decode_bit_offset, encode_bit_offset, read_exact_bytes, read_u32_be, read_u64_be, write_u32_be,
-    write_u64_be, zlib_compress_window,
+    Checkpoint, CheckpointKind, DeflateIndex, IndexError, IndexKind, IndexReadOptions,
+    StoredWindow, decode_bit_offset, encode_bit_offset, read_exact_bytes, read_u32_be, read_u64_be,
+    write_u32_be, write_u64_be, zlib_compress_window,
 };
 use std::io::{Read, Write};
 
@@ -21,15 +21,21 @@ pub enum WithLines {
 }
 
 pub(crate) fn write_gztool(
-    index: &GzipIndex,
+    index: &DeflateIndex,
     writer: &mut impl Write,
     lines: WithLines,
 ) -> Result<(), IndexError> {
     index.validate()?;
+    if !matches!(index.kind, IndexKind::Gzip | IndexKind::Bgzf) {
+        return Err(IndexError::IncompatibleFormat {
+            operation: "gztool export",
+            kind: index.kind,
+        });
+    }
     if index
         .checkpoints
         .iter()
-        .any(|point| matches!(point.kind, CheckpointKind::MemberHeader))
+        .any(|point| matches!(point.kind, CheckpointKind::GzipMemberHeader))
     {
         return Err(IndexError::InvalidCheckpoint(
             "gztool export requires raw-DEFLATE resume offsets",
@@ -111,7 +117,7 @@ pub(crate) fn read_gztool(
     reader: &mut impl Read,
     archive_size: Option<u64>,
     options: IndexReadOptions,
-) -> Result<GzipIndex, IndexError> {
+) -> Result<DeflateIndex, IndexError> {
     let mut header = [0_u8; 16];
     read_exact_bytes(reader, &mut header)?;
     if header[..8] != [0_u8; 8] {
@@ -153,7 +159,7 @@ pub(crate) fn read_gztool(
         });
     }
 
-    let mut index = GzipIndex::new();
+    let mut index = DeflateIndex::new();
     index.compressed_size_in_bytes = archive_size;
     index
         .checkpoints

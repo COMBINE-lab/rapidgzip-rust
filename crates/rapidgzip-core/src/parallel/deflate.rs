@@ -467,8 +467,9 @@ fn copy_match_unknown(
     distance: usize,
     length: usize,
     output_limit: usize,
+    maximum_distance: usize,
 ) -> Result<(), Error> {
-    if distance == 0 || distance > WINDOW_SIZE {
+    if distance == 0 || distance > maximum_distance.min(WINDOW_SIZE) {
         return Err(Error::InvalidDistance);
     }
     if length > output_limit.saturating_sub(output.len()) {
@@ -511,6 +512,7 @@ fn decode_compressed_block_unknown(
     distance: &Huffman,
     output: &mut Vec<Symbol>,
     output_limit: usize,
+    maximum_distance: usize,
 ) -> Result<(), Error> {
     loop {
         let symbol = literal.decode(reader)?;
@@ -532,7 +534,13 @@ fn decode_compressed_block_unknown(
                 }
                 let copy_distance = DISTANCE_BASE[distance_symbol]
                     + reader.read_bits(DISTANCE_EXTRA[distance_symbol])? as usize;
-                copy_match_unknown(output, copy_distance, length, output_limit)?;
+                copy_match_unknown(
+                    output,
+                    copy_distance,
+                    length,
+                    output_limit,
+                    maximum_distance,
+                )?;
             }
             _ => return Err(Error::InvalidSymbol),
         }
@@ -577,6 +585,7 @@ fn decode_to_estimated_boundary_unknown(
     start_bit: usize,
     estimated_stop_bit: usize,
     maximum_output: usize,
+    maximum_distance: usize,
 ) -> Result<Chunk, Error> {
     if estimated_stop_bit <= start_bit {
         return Err(Error::BoundaryMismatch);
@@ -596,6 +605,7 @@ fn decode_to_estimated_boundary_unknown(
                     distance,
                     &mut marked,
                     maximum_output,
+                    maximum_distance,
                 )?;
             }
             2 => {
@@ -606,6 +616,7 @@ fn decode_to_estimated_boundary_unknown(
                     &distance,
                     &mut marked,
                     maximum_output,
+                    maximum_distance,
                 )?;
             }
             _ => return Err(Error::InvalidBlockType),
@@ -664,7 +675,11 @@ fn copy_match_marked(
     history: &mut History,
     output: &mut DecodedBuffer,
     output_limit: usize,
+    maximum_distance: usize,
 ) -> Result<(), Error> {
+    if distance == 0 || distance > maximum_distance.min(WINDOW_SIZE) {
+        return Err(Error::InvalidDistance);
+    }
     if length > output_limit.saturating_sub(output.len()) {
         return Err(Error::OutputLimit);
     }
@@ -684,6 +699,7 @@ fn decode_compressed_block(
     history: &mut History,
     output: &mut DecodedBuffer,
     output_limit: usize,
+    maximum_distance: usize,
 ) -> Result<(), Error> {
     if !history.contains_markers() {
         return decode_compressed_block_clean(
@@ -693,6 +709,7 @@ fn decode_compressed_block(
             history,
             output,
             output_limit,
+            maximum_distance,
         );
     }
     loop {
@@ -710,7 +727,14 @@ fn decode_compressed_block(
                 }
                 let copy_distance = DISTANCE_BASE[distance_symbol]
                     + reader.read_bits(DISTANCE_EXTRA[distance_symbol])? as usize;
-                copy_match_marked(length, copy_distance, history, output, output_limit)?;
+                copy_match_marked(
+                    length,
+                    copy_distance,
+                    history,
+                    output,
+                    output_limit,
+                    maximum_distance,
+                )?;
             }
             _ => return Err(Error::InvalidSymbol),
         }
@@ -722,6 +746,7 @@ fn decode_compressed_block(
                 history,
                 output,
                 output_limit,
+                maximum_distance,
             );
         }
     }
@@ -740,6 +765,7 @@ fn decode_compressed_block_clean(
     history: &mut History,
     output: &mut DecodedBuffer,
     output_limit: usize,
+    maximum_distance: usize,
 ) -> Result<(), Error> {
     debug_assert!(!history.contains_markers());
     loop {
@@ -762,6 +788,9 @@ fn decode_compressed_block_clean(
                 }
                 let copy_distance = DISTANCE_BASE[distance_symbol]
                     + reader.read_bits(DISTANCE_EXTRA[distance_symbol])? as usize;
+                if copy_distance == 0 || copy_distance > maximum_distance.min(WINDOW_SIZE) {
+                    return Err(Error::InvalidDistance);
+                }
                 if length > output_limit.saturating_sub(output.len()) {
                     return Err(Error::OutputLimit);
                 }
@@ -920,6 +949,7 @@ fn decode_chunk(
                     &mut history,
                     &mut output,
                     maximum_output,
+                    WINDOW_SIZE,
                 )?;
             }
             2 => {
@@ -931,6 +961,7 @@ fn decode_chunk(
                     &mut history,
                     &mut output,
                     maximum_output,
+                    WINDOW_SIZE,
                 )?;
             }
             _ => return Err(Error::InvalidBlockType),
@@ -1106,6 +1137,7 @@ pub(crate) fn decode_to_estimated_boundary(
     estimated_stop_bit: usize,
     initial_history: InitialHistory<'_>,
     maximum_output: usize,
+    maximum_distance: usize,
 ) -> Result<Chunk, Error> {
     if matches!(initial_history, InitialHistory::Unknown) {
         return decode_to_estimated_boundary_unknown(
@@ -1113,6 +1145,7 @@ pub(crate) fn decode_to_estimated_boundary(
             start_bit,
             estimated_stop_bit,
             maximum_output,
+            maximum_distance,
         );
     }
     if estimated_stop_bit <= start_bit {
@@ -1140,6 +1173,7 @@ pub(crate) fn decode_to_estimated_boundary(
                     &mut history,
                     &mut output,
                     maximum_output,
+                    maximum_distance,
                 )?;
             }
             2 => {
@@ -1151,6 +1185,7 @@ pub(crate) fn decode_to_estimated_boundary(
                     &mut history,
                     &mut output,
                     maximum_output,
+                    maximum_distance,
                 )?;
             }
             _ => return Err(Error::InvalidBlockType),
@@ -1276,7 +1311,8 @@ mod tests {
                     let expected = &expected_history[WINDOW_SIZE..];
 
                     let mut actual = prefix.clone();
-                    copy_match_unknown(&mut actual, distance, length, usize::MAX).unwrap();
+                    copy_match_unknown(&mut actual, distance, length, usize::MAX, WINDOW_SIZE)
+                        .unwrap();
                     assert_eq!(
                         actual, expected,
                         "prefix={prefix_length} d={distance} l={length}"
@@ -1284,6 +1320,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn speculative_matches_respect_the_container_window() {
+        let mut output = Vec::new();
+        assert_eq!(
+            copy_match_unknown(&mut output, 257, 3, usize::MAX, 256),
+            Err(super::Error::InvalidDistance)
+        );
+        assert!(copy_match_unknown(&mut output, 256, 3, usize::MAX, 256).is_ok());
     }
 
     #[test]

@@ -16,13 +16,13 @@ pub enum DecoderPath {
     /// Input classification has not completed yet.
     #[default]
     Starting,
-    /// Serial gzip-member inflation on the coordinator thread.
+    /// Serial container inflation on the caller or coordinator thread.
     Sequential,
     /// Direct copying of independently indexed stored DEFLATE blocks.
     Stored,
     /// Independent inflation of densely spaced ordinary gzip members.
     DenseMembers,
-    /// The rapidgzip marker/window pipeline for ordinary DEFLATE streams.
+    /// The rapidgzip marker/window pipeline for gzip, zlib, or raw DEFLATE.
     MarkerWindow,
     /// Independent inflation of indexed BGZF blocks.
     Bgzf,
@@ -110,7 +110,7 @@ pub struct DecoderStats {
     pub decompressed_bytes: u64,
     /// Decompressed bytes returned through [`std::io::Read`].
     pub consumed_bytes: u64,
-    /// Gzip members accepted through verified output so far.
+    /// Completed framing units: gzip members, or one zlib/raw stream.
     pub member_count: u64,
     /// Average decoded-output production rate since decoder startup.
     pub decode_throughput_bps: f64,

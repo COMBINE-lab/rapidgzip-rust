@@ -1,17 +1,17 @@
 # rapidgzip-rust
 
 `rapidgzip-rust` is a Rust 2024, decoder-only implementation of the
-[rapidgzip] approach to parallel gzip decompression. It uses the same
-marker/window strategy for ordinary gzip streams, with zlib-rs as the inflate
-backend, and adds direct parallel paths for BGZF, stored streams, and dense
-multi-member archives.
+[rapidgzip] approach to parallel DEFLATE decompression. It uses the same
+marker/window strategy for gzip, zlib, and raw-DEFLATE streams, with zlib-rs as
+the inflate backend, and adds direct parallel paths for BGZF, stored gzip, and
+dense multi-member gzip archives.
 
 The project provides:
 
 - the `rapidgzip-core` library crate;
 - the `rapidgzip-rust` binary, distributed by the `rapidgzip-rust-cli` package;
-- verified decoding of single-member gzip, concatenated/multi-member gzip, and
-  BGZF;
+- verified decoding of single-member gzip, concatenated/multi-member gzip,
+  BGZF, and zlib, plus structurally validated raw DEFLATE;
 - both a push API over `std::io::Write` and an owned `std::io::Read + Send`
   stream suitable for parsers such as [paraseq];
 - opt-in random-access index construction, interoperable index formats, and a
@@ -20,8 +20,9 @@ The project provides:
   process substitution, or a socket.
 
 Non-seekable input is decoded sequentially by the same zlib-rs path the parallel
-decoders fall back to, so it is verified exactly as strictly as a regular file
-but is not decoded in parallel. See [Non-seekable input](#non-seekable-input).
+decoders fall back to, so it receives the same format-specific validation as a
+regular file but is not decoded in parallel. See
+[Non-seekable input](#non-seekable-input).
 
 The project intentionally does not provide compression. Its random-access API
 is decoder-only and leaves ordinary decode operations unchanged.
@@ -36,6 +37,35 @@ cargo add rapidgzip-core
 
 The package name contains a hyphen and its Rust crate name is
 `rapidgzip_core`. Rust 1.87 or newer is required.
+
+### Container formats
+
+Strict gzip is the compatibility-preserving default. Select zlib or raw
+DEFLATE explicitly, or opt into detection between gzip and zlib:
+
+```rust
+use rapidgzip_core::{Decoder, Format};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let zlib = Decoder::builder().format(Format::Zlib).build()?;
+let raw = Decoder::builder()
+    .format(Format::RawDeflate)
+    .expected_uncompressed_size(Some(1_000_000))
+    .build()?;
+let detected = Decoder::builder().auto_detect_format().build()?;
+# let _ = (zlib, raw, detected);
+# Ok(())
+# }
+```
+
+Auto-detection performs an exact, non-consuming two-byte check and never
+guesses raw DEFLATE, which has no identifying header. Zlib CMF/FLG, its declared
+history window, and its Adler-32 trailer are checked. Raw DEFLATE has no
+container checksum or stored size: successful decoding establishes structural
+validity and exact input consumption, while
+[`DecoderBuilder::expected_uncompressed_size`] can add an exact size contract.
+`DecodeReport::format` always contains the concrete detected or selected
+format and the report remains `Copy`.
 
 ### Streaming reader
 
@@ -135,7 +165,7 @@ that contract is handled by the entry points below instead.
 ### Non-seekable input
 
 [`Decoder::stream_reader`] and [`Decoder::decode_stream`] accept any
-`std::io::Read`, so gzip arriving on standard input, a FIFO, a process
+`std::io::Read`, so compressed input arriving on standard input, a FIFO, a process
 substitution, or a socket can be decoded without a second decompressor. They
 mirror [`Decoder::reader`] and [`Decoder::decode`], and `stream_reader` returns
 the same [`DecoderReader`]:
@@ -171,11 +201,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-What works exactly as it does for a regular file: single-member, concatenated
-and empty members, BGZF including its 28-byte EOF member, and fully stored
-streams. A member is accepted only after a real final DEFLATE block whose CRC32
-and ISIZE both match. Truncation, invalid DEFLATE, footer mismatches, and
-trailing non-gzip bytes are all errors, and
+What works exactly as it does for a regular file: every supported format,
+including concatenated and empty gzip members, BGZF's 28-byte EOF member, and
+fully stored streams. Gzip members require matching CRC32 and ISIZE; zlib
+requires a matching Adler-32; raw DEFLATE requires a complete final block and
+exact source end. Truncation, invalid DEFLATE, framing/checksum mismatches, and
+trailing bytes are errors, and
 [`DecoderBuilder::output_limit`] still fails before emitting bytes past the
 limit. Reaching EOF, or an `Ok` report, still means the complete input was
 verified.
@@ -186,7 +217,8 @@ builder contract: [`DecoderStats::configured_workers`] and
 `DecodeReport::decoder_threads` remain the requested maximum budget, while
 [`DecoderStats::active_workers`] is one and both `spawned_workers` and
 `auxiliary_threads` are zero. Nothing is spooled to memory or disk: input memory
-is one [`DecoderBuilder::input_page_size`] window. `stream_reader` advances its
+is one [`DecoderBuilder::input_page_size`] window, raised to two bytes only when
+configured smaller so detection can retain its prefix. `stream_reader` advances its
 resumable inflater only inside the consumer's `Read::read` call, so a slow
 consumer naturally stops reading the producer. Dropping it immediately drops
 the source; there is no streaming coordinator thread to block or detach.
@@ -198,7 +230,7 @@ Index construction is explicit per decode operation. This keeps the existing
 that do not request it:
 
 ```rust,no_run
-use rapidgzip_core::{Decoder, GzipIndex, IndexOptions, IndexedReader};
+use rapidgzip_core::{Decoder, DeflateIndex, IndexOptions, IndexedReader};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -215,7 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     indexed.index.write_native(&mut serialized)?;
 
     let mut serialized = File::open("reads.fastq.gz.rgzidx")?;
-    let index = GzipIndex::read_native(&mut serialized)?;
+    let index = DeflateIndex::read_native(&mut serialized)?;
     let mut reader = IndexedReader::new(File::open("reads.fastq.gz")?, index)?;
     reader.seek(SeekFrom::Start(4_000_000))?;
     let mut buffer = [0; 4096];
@@ -232,7 +264,8 @@ collect a coarse member-boundary index while consuming forward-only input. The
 result can be used later only with a stable positional copy of the same
 compressed bytes.
 
-`GzipIndex` reads and writes:
+`DeflateIndex` records gzip, BGZF, zlib, or raw-DEFLATE provenance and reads and
+writes:
 
 - the native versioned format, which preserves all rapidgzip-rust metadata;
 - indexed_gzip `GZIDX` versions 0/1 (writing version 1);
@@ -240,15 +273,16 @@ compressed bytes.
 - gztool version 0/1 indexes.
 
 Format parsers apply explicit checkpoint and window-allocation limits through
-`IndexReadOptions`. `.gzi` export requires an index proven to come from BGZF;
-gztool line-aware export requires real line counters and never invents them.
+`IndexReadOptions`. The native format represents every container. `.gzi`
+export requires an index proven to come from BGZF; GZIDX and gztool export
+require gzip-family provenance; gztool line-aware export requires real line
+counters and never invents them.
 
 `IndexedReader` validates the index and any recorded source size before use.
-Resuming at a member checkpoint verifies that complete member's CRC32 and
-ISIZE, including bytes discarded during a seek, and all later members are
-fully verified. An interior checkpoint imported from an external format
-cannot authenticate bytes skipped earlier in that same member because those
-formats do not carry prefix checksum state.
+Resuming at a gzip member or zlib-header checkpoint verifies that complete
+framing unit, including bytes discarded during a seek. A raw stream has no
+checksum to verify. An interior checkpoint cannot authenticate bytes skipped
+before it because persisted indexes do not carry prefix checksum state.
 
 ## Command-line installation and use
 
@@ -287,6 +321,10 @@ backpressured, or additional concurrency reduces throughput.
 
 - Every accepted gzip member is terminated by an actual final DEFLATE block
   and checked against its CRC32 and modulo-2^32 uncompressed size.
+- Every accepted zlib stream has a valid CMF/FLG header, respects its declared
+  window, ends exactly once, and matches its Adler-32 trailer.
+- Raw DEFLATE must end exactly after its final block; it is structurally
+  validated but not described as checksum-authenticated.
 - Concatenated members, empty members, optional gzip headers, BGZF data, and
   the conventional BGZF EOF member are supported.
 - Bytes resembling a gzip header inside DEFLATE data are never trusted as a
@@ -296,6 +334,8 @@ backpressured, or additional concurrency reduces throughput.
   mismatches are errors. Output written before an error is not rolled back.
 - [`DecoderBuilder::output_limit`] bounds total decoded output. The decoder
   fails before emitting bytes beyond the configured limit.
+- [`DecoderBuilder::expected_uncompressed_size`] optionally requires one exact
+  total for any format, rejecting overruns before handoff and underruns at end.
 - Work queues and reader handoff are bounded. Memory still scales with active
   workers and configured chunk sizes; the defaults are intended for throughput
   on general-purpose machines rather than minimum memory use.
@@ -304,9 +344,10 @@ backpressured, or additional concurrency reduces throughput.
   authoritative fallback. It is not decoded in parallel, and the telemetry says
   so rather than reporting an unused thread budget.
 
-There is no unsafe public API and no manual `Send` or `Sync` implementation.
-Private unsafe code is limited to the zlib-rs ABI, checked SIMD operations, and
-proven initialized-buffer operations; each site has a local safety argument.
+There is no unsafe public API. Private unsafe code is limited to the zlib-rs
+ABI, checked SIMD operations, proven initialized-buffer operations, and the
+audited `Send` implementation for exclusively owned resumable inflate state;
+each site has a local safety argument.
 See [SAFETY.md] for the complete audit.
 
 ## Performance status
@@ -335,9 +376,10 @@ measurements rather than treating these results as a universal speed claim:
   on AArch64, and scalar fallbacks
 - Inflate backend: zlib-rs through `libz-rs-sys`
 
-The `0.1.x` series should be treated as an evolving initial API. Correct gzip
-decoding, member verification, and the `Read + Send` contract are foundational;
-configuration details may be refined as additional workloads are measured.
+Pre-1.0 releases should be treated as an evolving initial API. Correct
+format-specific decoding, multi-member gzip verification, and the `Read + Send`
+contract are foundational; configuration details may be refined as additional
+workloads are measured.
 
 ## Development
 
@@ -348,10 +390,12 @@ cargo test --workspace --all-targets
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
 
-The integration suite covers ordinary gzip, multi-member streams, BGZF,
-corruption, false header candidates, output limits, cancellation, one-byte
-consumer buffers, and direct paraseq consumption. Generated benchmark corpora
-and large sequencing files are deliberately not stored in the repository.
+The integration suite covers gzip, zlib, raw DEFLATE, multi-member streams,
+BGZF, corruption, format detection across short/interrupted reads, false header
+candidates, output limits and exact sizes, indexing/seeking, cancellation,
+one-byte consumer buffers, and direct paraseq consumption. Generated benchmark
+corpora and large sequencing files are deliberately not stored in the
+repository.
 
 ## Releasing
 
@@ -386,6 +430,7 @@ MIT. See [LICENSE-BSD-3-CLAUSE] and [LICENSE-MIT].
 [`DecoderReader::handle`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderReader.html#method.handle
 [`DecoderBuilder::input_page_size`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.input_page_size
 [`DecoderBuilder::output_limit`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.output_limit
+[`DecoderBuilder::expected_uncompressed_size`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.expected_uncompressed_size
 [`DecoderReader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderReader.html
 [`DecoderStats::path`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderStats.html#structfield.path
 [`DecoderStats::configured_workers`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderStats.html#structfield.configured_workers

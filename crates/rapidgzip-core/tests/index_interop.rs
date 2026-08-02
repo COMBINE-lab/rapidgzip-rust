@@ -11,7 +11,7 @@ mod common;
 
 use common::{bgzf, corpus, gzip};
 use rapidgzip_core::index::WithLines;
-use rapidgzip_core::{Decoder, GzipIndex, IndexOptions, IndexedReader};
+use rapidgzip_core::{Decoder, DeflateIndex, IndexOptions, IndexedReader};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -56,7 +56,7 @@ fn write(path: &Path, bytes: &[u8]) {
         .expect("write fixture");
 }
 
-fn built_index(path: &Path) -> GzipIndex {
+fn built_index(path: &Path) -> DeflateIndex {
     let decoder = Decoder::builder()
         .decoder_threads(4)
         .build()
@@ -68,7 +68,7 @@ fn built_index(path: &Path) -> GzipIndex {
         .index
 }
 
-fn assert_seeks_match(compressed: &Path, index: GzipIndex, plain: &[u8], targets: &[usize]) {
+fn assert_seeks_match(compressed: &Path, index: DeflateIndex, plain: &[u8], targets: &[usize]) {
     let source = fs::File::open(compressed).expect("open archive");
     let mut reader = IndexedReader::new(source, index).expect("indexed reader");
     for &target in targets {
@@ -96,7 +96,8 @@ fn reads_the_gzi_written_by_bgzip() {
     let archive = directory.join("corpus.txt.gz");
     let bytes = fs::read(directory.join("corpus.txt.gz.gzi")).expect("read gzi");
     let archive_size = fs::metadata(&archive).expect("stat archive").len();
-    let index = GzipIndex::read_gzi(&mut bytes.as_slice(), Some(archive_size)).expect("gzi import");
+    let index =
+        DeflateIndex::read_gzi(&mut bytes.as_slice(), Some(archive_size)).expect("gzi import");
     assert_seeks_match(
         &archive,
         index,
@@ -154,7 +155,7 @@ fn reads_the_gzidx_written_by_indexed_gzip() {
     let bytes = fs::read(&exported).expect("read GZIDX");
     let archive_size = fs::metadata(&archive).expect("stat archive").len();
     let index =
-        GzipIndex::read_gzidx(&mut bytes.as_slice(), Some(archive_size)).expect("GZIDX import");
+        DeflateIndex::read_gzidx(&mut bytes.as_slice(), Some(archive_size)).expect("GZIDX import");
     assert_seeks_match(
         &archive,
         index,
@@ -211,8 +212,8 @@ fn reads_the_index_written_by_gztool() {
 
     let bytes = fs::read(directory.join("corpus.gzi")).expect("read gztool index");
     let archive_size = fs::metadata(&archive).expect("stat archive").len();
-    let index =
-        GzipIndex::read_gztool(&mut bytes.as_slice(), Some(archive_size)).expect("gztool import");
+    let index = DeflateIndex::read_gztool(&mut bytes.as_slice(), Some(archive_size))
+        .expect("gztool import");
     assert_seeks_match(
         &archive,
         index,

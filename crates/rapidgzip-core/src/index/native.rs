@@ -5,8 +5,8 @@
 //! kinds, optional line offsets, and raw or zlib-compressed windows.
 
 use super::{
-    Checkpoint, CheckpointKind, GzipIndex, IndexError, IndexKind, IndexReadOptions, StoredWindow,
-    read_exact_bytes, read_u8, read_u32_le, read_u64_le, write_u32_le, write_u64_le,
+    Checkpoint, CheckpointKind, DeflateIndex, IndexError, IndexKind, IndexReadOptions,
+    StoredWindow, read_exact_bytes, read_u8, read_u32_le, read_u64_le, write_u32_le, write_u64_le,
 };
 use std::io::{Read, Write};
 
@@ -18,19 +18,29 @@ const HAS_UNCOMPRESSED_SIZE: u16 = 1 << 1;
 const HAS_SPACING: u16 = 1 << 2;
 const HAS_TOTAL_LINES: u16 = 1 << 3;
 const SOURCE_IS_BGZF: u16 = 1 << 4;
+const SOURCE_IS_ZLIB: u16 = 1 << 5;
+const SOURCE_IS_RAW_DEFLATE: u16 = 1 << 6;
+const SOURCE_KIND_FLAGS: u16 = SOURCE_IS_BGZF | SOURCE_IS_ZLIB | SOURCE_IS_RAW_DEFLATE;
 const KNOWN_HEADER_FLAGS: u16 =
-    HAS_COMPRESSED_SIZE | HAS_UNCOMPRESSED_SIZE | HAS_SPACING | HAS_TOTAL_LINES | SOURCE_IS_BGZF;
+    HAS_COMPRESSED_SIZE | HAS_UNCOMPRESSED_SIZE | HAS_SPACING | HAS_TOTAL_LINES | SOURCE_KIND_FLAGS;
 
 const HAS_LINE_OFFSET: u8 = 1 << 0;
 const IS_DEFLATE_BLOCK: u8 = 1 << 1;
 const IS_MEMBER_DEFLATE: u8 = 1 << 2;
-const KNOWN_CHECKPOINT_FLAGS: u8 = HAS_LINE_OFFSET | IS_DEFLATE_BLOCK | IS_MEMBER_DEFLATE;
+const IS_ZLIB_HEADER: u8 = 1 << 3;
+const IS_RAW_DEFLATE_START: u8 = 1 << 4;
+const RESUME_KIND_FLAGS: u8 =
+    IS_DEFLATE_BLOCK | IS_MEMBER_DEFLATE | IS_ZLIB_HEADER | IS_RAW_DEFLATE_START;
+const KNOWN_CHECKPOINT_FLAGS: u8 = HAS_LINE_OFFSET | RESUME_KIND_FLAGS;
 
 const WINDOW_ABSENT: u8 = 0;
 const WINDOW_RAW: u8 = 1;
 const WINDOW_ZLIB: u8 = 2;
 
-pub(crate) fn write_native(index: &GzipIndex, writer: &mut impl Write) -> Result<(), IndexError> {
+pub(crate) fn write_native(
+    index: &DeflateIndex,
+    writer: &mut impl Write,
+) -> Result<(), IndexError> {
     index.validate()?;
 
     let mut flags = 0_u16;
@@ -46,9 +56,12 @@ pub(crate) fn write_native(index: &GzipIndex, writer: &mut impl Write) -> Result
     if index.total_line_count.is_some() {
         flags |= HAS_TOTAL_LINES;
     }
-    if index.kind == IndexKind::Bgzf {
-        flags |= SOURCE_IS_BGZF;
-    }
+    flags |= match index.kind {
+        IndexKind::Gzip => 0,
+        IndexKind::Bgzf => SOURCE_IS_BGZF,
+        IndexKind::Zlib => SOURCE_IS_ZLIB,
+        IndexKind::RawDeflate => SOURCE_IS_RAW_DEFLATE,
+    };
 
     writer.write_all(MAGIC).map_err(IndexError::io)?;
     writer
@@ -76,7 +89,7 @@ pub(crate) fn write_native(index: &GzipIndex, writer: &mut impl Write) -> Result
         write_u64_le(
             writer,
             match checkpoint.kind {
-                CheckpointKind::MemberDeflate {
+                CheckpointKind::GzipMemberDeflate {
                     header_offset_in_bytes,
                 } => header_offset_in_bytes,
                 _ => 0,
@@ -87,8 +100,10 @@ pub(crate) fn write_native(index: &GzipIndex, writer: &mut impl Write) -> Result
             checkpoint_flags |= HAS_LINE_OFFSET;
         }
         match checkpoint.kind {
-            CheckpointKind::MemberHeader => {}
-            CheckpointKind::MemberDeflate { .. } => checkpoint_flags |= IS_MEMBER_DEFLATE,
+            CheckpointKind::GzipMemberHeader => {}
+            CheckpointKind::GzipMemberDeflate { .. } => checkpoint_flags |= IS_MEMBER_DEFLATE,
+            CheckpointKind::ZlibHeader => checkpoint_flags |= IS_ZLIB_HEADER,
+            CheckpointKind::RawDeflateStart => checkpoint_flags |= IS_RAW_DEFLATE_START,
             CheckpointKind::DeflateBlock => checkpoint_flags |= IS_DEFLATE_BLOCK,
         }
 
@@ -120,7 +135,7 @@ pub(crate) fn write_native(index: &GzipIndex, writer: &mut impl Write) -> Result
 pub(crate) fn read_native(
     reader: &mut impl Read,
     options: IndexReadOptions,
-) -> Result<GzipIndex, IndexError> {
+) -> Result<DeflateIndex, IndexError> {
     let mut magic = [0_u8; 8];
     read_exact_bytes(reader, &mut magic)?;
     if &magic != MAGIC {
@@ -143,6 +158,11 @@ pub(crate) fn read_native(
             flags: u64::from(flags),
         });
     }
+    if (flags & SOURCE_KIND_FLAGS).count_ones() > 1 {
+        return Err(IndexError::UnsupportedFlags {
+            flags: u64::from(flags),
+        });
+    }
 
     let compressed_size = read_u64_le(reader)?;
     let uncompressed_size = read_u64_le(reader)?;
@@ -160,11 +180,12 @@ pub(crate) fn read_native(
         });
     }
 
-    let mut index = GzipIndex::new();
-    index.kind = if flags & SOURCE_IS_BGZF != 0 {
-        IndexKind::Bgzf
-    } else {
-        IndexKind::Gzip
+    let mut index = DeflateIndex::new();
+    index.kind = match flags & SOURCE_KIND_FLAGS {
+        SOURCE_IS_BGZF => IndexKind::Bgzf,
+        SOURCE_IS_ZLIB => IndexKind::Zlib,
+        SOURCE_IS_RAW_DEFLATE => IndexKind::RawDeflate,
+        _ => IndexKind::Gzip,
     };
     index.compressed_size_in_bytes = (flags & HAS_COMPRESSED_SIZE != 0).then_some(compressed_size);
     index.uncompressed_size_in_bytes =
@@ -189,6 +210,11 @@ pub(crate) fn read_native(
             return Err(IndexError::UnsupportedFlags {
                 flags: u64::from(checkpoint_flags),
             });
+        }
+        if (checkpoint_flags & RESUME_KIND_FLAGS).count_ones() > 1 {
+            return Err(IndexError::InvalidCheckpoint(
+                "checkpoint declares multiple resume kinds",
+            ));
         }
         let window_kind = read_u8(reader)?;
         let payload_length = read_u32_le(reader)? as usize;
@@ -235,20 +261,18 @@ pub(crate) fn read_native(
             Checkpoint {
                 compressed_offset_in_bits,
                 uncompressed_offset_in_bytes,
-                kind: if checkpoint_flags & IS_DEFLATE_BLOCK != 0
-                    && checkpoint_flags & IS_MEMBER_DEFLATE != 0
-                {
-                    return Err(IndexError::InvalidCheckpoint(
-                        "checkpoint declares two resume kinds",
-                    ));
-                } else if checkpoint_flags & IS_DEFLATE_BLOCK != 0 {
+                kind: if checkpoint_flags & IS_DEFLATE_BLOCK != 0 {
                     CheckpointKind::DeflateBlock
                 } else if checkpoint_flags & IS_MEMBER_DEFLATE != 0 {
-                    CheckpointKind::MemberDeflate {
+                    CheckpointKind::GzipMemberDeflate {
                         header_offset_in_bytes: member_header_value,
                     }
+                } else if checkpoint_flags & IS_ZLIB_HEADER != 0 {
+                    CheckpointKind::ZlibHeader
+                } else if checkpoint_flags & IS_RAW_DEFLATE_START != 0 {
+                    CheckpointKind::RawDeflateStart
                 } else {
-                    CheckpointKind::MemberHeader
+                    CheckpointKind::GzipMemberHeader
                 },
                 line_offset: (checkpoint_flags & HAS_LINE_OFFSET != 0).then_some(line_value),
             },

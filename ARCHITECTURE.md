@@ -3,8 +3,9 @@
 ## Data flow
 
 `rapidgzip-core` accepts an immutable positional `ReadAt` source. A decode
-snapshots its length, parses gzip framing itself, and routes the raw DEFLATE
-payload through one of five bounded paths:
+snapshots its length, resolves explicit or automatic container selection,
+parses gzip or zlib framing itself, and routes the raw DEFLATE payload through
+one of five bounded paths:
 
 1. Standard zlib-rs raw inflate is the authoritative fallback and the
    single-thread path.
@@ -12,10 +13,11 @@ payload through one of five bounded paths:
    ordered worker tasks.
 3. A consistently formed BGZF stream is indexed from `BC/BSIZE` and its
    independently verified members are decoded by ordered worker tasks.
-4. Ordinary streams with densely spaced members use candidate-header
+4. Gzip streams with densely spaced members use candidate-header
    discovery and independently verified member workers.
-5. Other streams use a file-wide estimated grid and rapidgzip's marker/window
-   path, with zlib-rs fallback from the last authoritative boundary.
+5. Other sufficiently large gzip, zlib, and raw-DEFLATE streams use a
+   file-wide estimated grid and rapidgzip's marker/window path, with zlib-rs
+   fallback from the last authoritative boundary.
 
 Positional paths return ordered owned chunks to one coordinator. The
 coordinator updates member accounting and calls the user's `Write`, so a writer
@@ -34,13 +36,14 @@ boundaries as they are decoded; that coarser index is useful later with a
 stable positional copy of the same compressed bytes.
 
 Both cursors implement one internal `InputCursor` trait, which is the exact set
-of forward operations path 1 and the member-header parser use: current offset,
-end of input, the readable window, consume, and confirm the source did not
-change. `SourceCursor` implements it over `ReadAt`; `StreamCursor` implements it
-over `Read` with a single window that compacts consumed bytes on refill. Member
-framing, footer verification, trailing-garbage detection, per-member history
-reset, and the output limit are therefore not reimplemented for streams: path 1
-is generic over the cursor and is the same code either way.
+of forward operations path 1 and the framing parsers use: current offset, end
+of input, an exact non-consuming two-byte peek, the readable window, consume,
+and confirm the source did not change. `SourceCursor` implements it over
+`ReadAt`; `StreamCursor` implements it over `Read` with a single window that
+compacts consumed bytes on refill. Format resolution, framing, trailer
+verification, trailing-data detection, history reset, and output bounds are
+therefore not reimplemented for streams: path 1 is generic over the cursor and
+is the same code either way.
 
 The length snapshot does not exist for a non-seekable source rather than
 becoming mutable. A positional decode snapshots `len()` when it creates its
@@ -58,7 +61,8 @@ this.
 validation, then advances the engine only from the consumer's `Read::read`.
 This avoids both a permanently allocated streaming thread and the possibility
 of detaching one blocked inside an arbitrary `Read`. The state machine owns the
-current header, zlib-rs inflater, CRC32, member size, and input cursor between
+selected concrete format, current framing state, zlib-rs inflater,
+CRC32/Adler-32/none checksum policy, output size, and input cursor between
 chunks, so dropping the reader drops the source immediately.
 
 Runtime telemetry retains the builder's immutable configured-worker budget and
@@ -91,12 +95,13 @@ after resolving its complete 32 KiB predecessor history. Interior candidates
 are thinned by requested decompressed spacing before window compression.
 
 `CheckpointKind` distinguishes gzip-header positions, raw member-payload
-positions with retained header provenance, and interior DEFLATE block
-positions. `IndexedReader` therefore never guesses from gzip-like bytes. It
-fully checks CRC32 and ISIZE when it resumes at a member checkpoint; a foreign
-interior index cannot authenticate the skipped prefix of that member, but every
-later member is fully checked. Index parsers have explicit count and aggregate
-window limits, and source-size metadata is checked before indexed reads begin.
+positions with retained header provenance, zlib headers, raw-stream starts, and
+interior DEFLATE blocks. `IndexKind` records matching container provenance, so
+`IndexedReader` never guesses framing from source bytes. It fully checks gzip
+CRC32/ISIZE or zlib Adler-32 when it resumes at a framing start; an interior
+index cannot authenticate the skipped prefix. Raw DEFLATE has no checksum.
+Index parsers have explicit count and aggregate-window limits, and source-size
+metadata is checked before indexed reads begin.
 
 ## Marker/window algorithm
 
@@ -130,8 +135,8 @@ cross-boundary references become predecessor markers, and in-chunk matches use
 bulk `Vec::extend_from_within` copies with geometric doubling to preserve
 overlap semantics. It does not maintain a second per-byte 32 KiB symbol ring.
 
-Once a complete block leaves a marker-free 32 KiB window, the rest of that
-independent chunk is decoded by zlib-rs using `inflatePrime`,
+Once a complete block leaves a marker-free 32 KiB index window, the rest of
+that independent chunk is decoded by zlib-rs using `inflatePrime`,
 `inflateSetDictionary`, and `Z_BLOCK`. Successful speculative output is not
 decoded again. To advance dependencies, the coordinator resolves only the
 final 32 KiB needed for the successor window. Full marker replacement is a
@@ -141,6 +146,13 @@ small buffers retain runtime-dispatched SSE4.1 on x86-64, baseline NEON on
 AArch64, and a scalar fallback. Exact member starts are decoded directly by
 zlib-rs. False boundaries and chunks exceeding their speculative allowance
 fall back to zlib-rs from the last authoritative position.
+
+For zlib, CINFO supplies an 8--15 bit maximum history window. Both the native
+distance decoder and every zlib-rs bridge/tail enforce that limit; a persisted
+32 KiB predecessor window is sliced to the permitted suffix before it is
+installed. Ordered accounting selects CRC32 for gzip, Adler-32 for zlib, and no
+checksum pass for raw DEFLATE. The terminal coordinator then applies the
+container-specific trailer and exact-end rule.
 
 ## Members and BGZF
 

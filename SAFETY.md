@@ -11,11 +11,11 @@ resumable sequential decoder, is justified below; there is no manual `Sync`.
 
 ## zlib-rs ABI adapter
 
-`backend.rs` contains a private RAII wrapper around `libz-rs-sys`.
+`inflate.rs` contains a private RAII wrapper around `libz-rs-sys`.
 
 - `inflateInit2_` receives a live, uniquely borrowed `z_stream`, the matching
-  Rust structure size, zlib-rs's static version string, and raw-window value
-  `-15`.
+  Rust structure size, zlib-rs's static version string, and a checked raw-window
+  value from `-8` through `-15`.
 - Every `inflate` call sets `next_in/avail_in` to a live immutable page and
   `next_out/avail_out` to either a live unique `Vec<u8>` allocation or its spare
   capacity. Neither allocation moves during the call. Consumed and produced
@@ -27,11 +27,13 @@ resumable sequential decoder, is justified below; there is no manual `Sync`.
 - `inflatePrime` supplies at most seven unread low-order bits from one source
   byte before the first inflate call.
 - `inflateSetDictionary` receives an immutable slice no larger than 32 KiB.
-- `inflateReset` receives the same uniquely owned initialized stream between
-  completed BGZF blocks or independent ordinary gzip members. It preserves the
-  raw-window mode and is never called concurrently with `inflate`.
+- `inflateReset` or `inflateReset2` receives the same uniquely owned initialized
+  stream between completed streams. `inflateReset2` receives the same checked
+  negative raw-window range used at initialization. Neither is called
+  concurrently with `inflate`.
 - `inflateEnd` runs exactly once for each successfully initialized stream.
-- `crc32_z` receives a live immutable byte slice and uses its exact length.
+- `crc32_z` and `adler32_z` receive live immutable byte slices and use their
+  exact lengths.
 
 The BGZF fast path reserves the footer-declared output size plus one byte,
 passes only that spare capacity to zlib-rs, checks `Z_STREAM_END`, exact input

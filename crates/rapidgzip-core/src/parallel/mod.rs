@@ -2,7 +2,7 @@
 //!
 //! These types are public only as a module for architectural documentation and
 //! focused benchmarking; the stable decoder API exposes only validated
-//! [`crate::GzipIndex`] checkpoints, not these internal speculative blocks.
+//! [`crate::DeflateIndex`] checkpoints, not these internal speculative blocks.
 
 pub(crate) mod adaptive;
 pub(crate) mod deflate;

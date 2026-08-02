@@ -2,6 +2,7 @@
 //!
 //! Compression goes through the `libz-rs-sys` deflate ABI, which the crate
 //! already links, so the tests need no additional dependency.
+#![allow(dead_code)]
 
 use libz_rs_sys as z;
 
@@ -9,6 +10,16 @@ use libz_rs_sys as z;
 pub fn gzip(bytes: &[u8], level: i32) -> Vec<u8> {
     // `31` selects the gzip wrapper over a 32 KiB window.
     deflate_with(bytes, level, 31)
+}
+
+/// Compresses `bytes` into one RFC 1950 zlib stream.
+pub fn zlib(bytes: &[u8], level: i32) -> Vec<u8> {
+    deflate_with(bytes, level, 15)
+}
+
+/// Compresses `bytes` into an unwrapped RFC 1951 DEFLATE stream.
+pub fn raw_deflate(bytes: &[u8], level: i32) -> Vec<u8> {
+    deflate_with(bytes, level, -15)
 }
 
 /// Builds a deterministic, moderately compressible corpus of `size` bytes.

@@ -1,8 +1,9 @@
 //! indexed_gzip `GZIDX` import and export.
 
 use super::{
-    Checkpoint, CheckpointKind, GzipIndex, IndexError, IndexReadOptions, StoredWindow, WINDOW_SIZE,
-    read_exact_bytes, read_u8, read_u32_le, read_u64_le, write_u32_le, write_u64_le,
+    Checkpoint, CheckpointKind, DeflateIndex, IndexError, IndexKind, IndexReadOptions,
+    StoredWindow, WINDOW_SIZE, read_exact_bytes, read_u8, read_u32_le, read_u64_le, write_u32_le,
+    write_u64_le,
 };
 use std::io::{Read, Write};
 
@@ -43,8 +44,14 @@ pub fn decode_bit_offset(byte_offset: u64, bits_field: u8) -> Result<u64, IndexE
     Ok(bit_offset - u64::from(bits_field))
 }
 
-pub(crate) fn write_gzidx(index: &GzipIndex, writer: &mut impl Write) -> Result<(), IndexError> {
+pub(crate) fn write_gzidx(index: &DeflateIndex, writer: &mut impl Write) -> Result<(), IndexError> {
     index.validate()?;
+    if !matches!(index.kind, IndexKind::Gzip | IndexKind::Bgzf) {
+        return Err(IndexError::IncompatibleFormat {
+            operation: "GZIDX export",
+            kind: index.kind,
+        });
+    }
     let compressed_size = index
         .compressed_size_in_bytes
         .ok_or(IndexError::MissingMetadata(
@@ -72,7 +79,7 @@ pub(crate) fn write_gzidx(index: &GzipIndex, writer: &mut impl Write) -> Result<
     if index
         .checkpoints
         .iter()
-        .any(|point| matches!(point.kind, CheckpointKind::MemberHeader))
+        .any(|point| matches!(point.kind, CheckpointKind::GzipMemberHeader))
     {
         return Err(IndexError::InvalidCheckpoint(
             "GZIDX export requires raw-DEFLATE resume offsets",
@@ -115,7 +122,7 @@ pub(crate) fn read_gzidx(
     reader: &mut impl Read,
     archive_size: Option<u64>,
     options: IndexReadOptions,
-) -> Result<GzipIndex, IndexError> {
+) -> Result<DeflateIndex, IndexError> {
     let mut magic = [0_u8; 5];
     read_exact_bytes(reader, &mut magic)?;
     if &magic != MAGIC {
@@ -216,7 +223,7 @@ pub(crate) fn read_gzidx(
         });
     }
 
-    let mut index = GzipIndex::new();
+    let mut index = DeflateIndex::new();
     index.compressed_size_in_bytes = Some(compressed_size);
     index.uncompressed_size_in_bytes = Some(uncompressed_size);
     index.checkpoint_spacing_in_bytes = (spacing != 0).then_some(u64::from(spacing));

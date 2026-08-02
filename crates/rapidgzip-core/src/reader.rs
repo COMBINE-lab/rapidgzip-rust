@@ -1,8 +1,9 @@
 use crate::backend::{
     Output, SequentialDecoder, SequentialItem, decode_source, decode_source_with_index,
+    validate_initial_stream,
 };
 use crate::config::Config;
-use crate::gzip::{StreamCursor, validate_initial_stream_header};
+use crate::gzip::StreamCursor;
 use crate::index::{IndexCollector, IndexOptions};
 use crate::runtime::{AuxiliaryKind, RuntimeState};
 use crate::{
@@ -81,8 +82,9 @@ enum Terminal {
 
 /// Owned parallel decoder output implementing [`Read`] and [`Send`].
 ///
-/// Reaching EOF means every gzip member was verified and makes the final
-/// [`DecodeReport`] available through [`DecoderReader::report`]. A decoding
+/// Reaching EOF means the selected container passed every available check and
+/// makes the final [`DecodeReport`] available through
+/// [`DecoderReader::report`]. A decoding
 /// failure is returned as an [`io::Error`] whose source is a [`DecodeError`].
 ///
 /// Dropping this value cancels the background pipeline. It does not verify
@@ -228,7 +230,7 @@ where
 {
     let source: Box<dyn Read + Send> = Box::new(source);
     let mut cursor = StreamCursor::new(source, config.input_page_size);
-    validate_initial_stream_header(&mut cursor)?;
+    validate_initial_stream(&mut cursor, &config)?;
     let runtime = RuntimeState::new(config.decoder_threads);
     let handle = DecoderHandle::new(Arc::clone(&runtime));
     let decoder = SequentialDecoder::new(
@@ -263,7 +265,7 @@ where
 {
     let source: Box<dyn Read + Send> = Box::new(source);
     let mut cursor = StreamCursor::new(source, config.input_page_size);
-    validate_initial_stream_header(&mut cursor)?;
+    validate_initial_stream(&mut cursor, &config)?;
     let runtime = RuntimeState::new(config.decoder_threads);
     let handle = DecoderHandle::new(Arc::clone(&runtime));
     let collector = IndexCollector::new(options);
@@ -468,8 +470,8 @@ impl DecoderReader {
 /// reader does not pay for checkpoint windows or lose the small, [`Copy`]
 /// [`DecodeReport`] result.
 ///
-/// Reaching [`Read`] EOF means both the gzip stream and collected index have
-/// been validated. [`Self::report`] then borrows the complete result, while
+/// Reaching [`Read`] EOF means both the compressed stream and collected index
+/// have been validated. [`Self::report`] then borrows the complete result, while
 /// [`Self::finish`] consumes the reader and returns ownership of it.
 #[must_use]
 pub struct IndexingDecoderReader {
