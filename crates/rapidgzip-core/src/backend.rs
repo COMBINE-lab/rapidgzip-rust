@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::crc32::Crc32;
-use crate::gzip::{MemberHeader, SourceCursor, parse_member_header};
+use crate::gzip::{InputCursor, MemberHeader, SourceCursor, StreamCursor, parse_member_header};
 use crate::parallel::Window;
 use crate::parallel::adaptive::AdaptiveConcurrency;
 use crate::parallel::deflate::{
@@ -13,7 +13,7 @@ use crossbeam_deque::{Injector, Steal};
 use libz_rs_sys as z;
 use std::collections::BTreeMap;
 use std::ffi::CStr;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
@@ -581,7 +581,327 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    decode_members_sequential(source, config, cancelled, output, 0, 0, 0, runtime)
+    let mut cursor = SourceCursor::new(source, config.input_page_size)?;
+    decode_members_sequential(
+        &mut cursor,
+        config,
+        cancelled,
+        output,
+        0,
+        0,
+        config.decoder_threads,
+        runtime,
+    )
+}
+
+/// Decodes a complete gzip stream from a non-seekable source.
+///
+/// Non-seekable input can only be read forward once, which rules out every
+/// index-first path in [`decode_source`]. It therefore always runs the
+/// sequential path, which needs nothing but forward reads and is already the
+/// authoritative decoder the parallel paths fall back to. Framing, footer
+/// verification, trailing-garbage detection, and the output limit are the same
+/// code as for a positional source; only the cursor differs.
+///
+/// The cursor is supplied by the caller so push decoding can own it locally and
+/// pull decoding can retain it inside the resumable sequential state machine.
+pub(crate) fn decode_stream<R, O>(
+    cursor: &mut StreamCursor<R>,
+    config: &Config,
+    cancelled: &AtomicBool,
+    output: &mut O,
+    runtime: &Arc<RuntimeState>,
+) -> Result<DecodeReport, DecodeError>
+where
+    R: Read,
+    O: Output,
+{
+    runtime.set_path(DecoderPath::Sequential);
+    runtime.set_adaptive_target(1);
+    decode_members_sequential(
+        cursor,
+        config,
+        cancelled,
+        output,
+        0,
+        0,
+        config.decoder_threads,
+        runtime,
+    )
+}
+
+/// One increment of a sequential decode.
+///
+/// The pull reader and the push decoder use the same resumable engine. Keeping
+/// the state transition below the output adapter ensures that member framing,
+/// DEFLATE errors, CRC32, ISIZE, concatenated members, and output limits cannot
+/// diverge between the two public streaming APIs.
+pub(crate) enum SequentialItem {
+    Chunk(Vec<u8>),
+    Finished(DecodeReport),
+}
+
+struct SequentialMember {
+    header: MemberHeader,
+    inflater: RawInflater,
+    crc: Crc32,
+    output_size: u32,
+}
+
+enum SequentialState {
+    Header,
+    Inflating(SequentialMember),
+    Footer { crc: Crc32, output_size: u32 },
+    Failed(DecodeError),
+    Finished(DecodeReport),
+}
+
+/// Resumable form of the authoritative sequential decoder.
+///
+/// Unlike the parallel reader coordinator, this value owns no thread. A
+/// non-seekable source is read only when [`SequentialDecoder::next_chunk`] is
+/// called, so dropping the public reader also drops a blocked-capable source
+/// immediately instead of detaching a coordinator that may never wake up.
+pub(crate) struct SequentialDecoder<C> {
+    cursor: C,
+    config: Config,
+    total_output: u64,
+    member_count: u64,
+    decoder_threads: usize,
+    runtime: Arc<RuntimeState>,
+    state: SequentialState,
+}
+
+// SAFETY:
+// - `SequentialDecoder` exclusively owns its inflater and cursor, and every
+//   mutation requires `&mut self`, so decoding cannot occur concurrently.
+// - zlib-rs inflate state is not attached to the initializing thread.
+// - this state machine clears borrowed `next_in` and `next_out` pointers after
+//   every inflate call, before it can yield or be moved between threads.
+// - `C: Send` proves the only remaining externally supplied state can move.
+unsafe impl<C: Send> Send for SequentialDecoder<C> {}
+
+impl<C: InputCursor> SequentialDecoder<C> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        cursor: C,
+        config: &Config,
+        total_output: u64,
+        member_count: u64,
+        decoder_threads: usize,
+        runtime: &Arc<RuntimeState>,
+    ) -> Self {
+        runtime.set_path(DecoderPath::Sequential);
+        runtime.set_adaptive_target(1);
+        Self {
+            cursor,
+            config: config.clone(),
+            total_output,
+            member_count,
+            decoder_threads,
+            runtime: Arc::clone(runtime),
+            state: SequentialState::Header,
+        }
+    }
+
+    /// Advances until one decoded chunk or the verified terminal report exists.
+    ///
+    /// `decoded` is a cleared allocation returned by the output adapter. Its
+    /// capacity is reused when possible to avoid an allocation per chunk.
+    pub(crate) fn next_chunk(
+        &mut self,
+        cancelled: &AtomicBool,
+        mut decoded: Vec<u8>,
+    ) -> Result<SequentialItem, DecodeError> {
+        decoded.clear();
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(DecodeError::Cancelled);
+            }
+
+            let state = std::mem::replace(&mut self.state, SequentialState::Header);
+            match state {
+                SequentialState::Header => {
+                    if self.cursor.is_at_end()? {
+                        if self.member_count == 0 {
+                            return Err(DecodeError::InvalidGzip {
+                                offset: 0,
+                                reason: GzipErrorKind::BadMagic,
+                            });
+                        }
+                        self.cursor.verify_source_unchanged()?;
+                        let report = DecodeReport {
+                            compressed_bytes: self.cursor.position(),
+                            decompressed_bytes: self.total_output,
+                            member_count: self.member_count,
+                            decoder_threads: self.decoder_threads,
+                        };
+                        self.state = SequentialState::Finished(report);
+                        return Ok(SequentialItem::Finished(report));
+                    }
+
+                    let header = parse_member_header(&mut self.cursor, self.member_count == 0)?;
+                    debug_assert!(header.start <= header.deflate_start);
+                    debug_assert_eq!(header.deflate_start, self.cursor.position());
+                    let _observed_bgzf_size = header.bgzf_block_size;
+                    self.state = SequentialState::Inflating(SequentialMember {
+                        header,
+                        inflater: RawInflater::new()?,
+                        crc: Crc32::new(),
+                        output_size: 0,
+                    });
+                }
+                SequentialState::Inflating(mut member) => {
+                    let (input_pointer, input_length) = {
+                        let input = self.cursor.available()?;
+                        if input.is_empty() {
+                            return Err(DecodeError::InvalidDeflate {
+                                bit_offset: self.cursor.position().saturating_mul(8),
+                                reason: DeflateErrorKind::Truncated,
+                            });
+                        }
+                        (input.as_ptr(), input.len().min(u32::MAX as usize))
+                    };
+                    if decoded.capacity() < self.config.decoded_chunk_size {
+                        decoded.reserve_exact(self.config.decoded_chunk_size - decoded.capacity());
+                    }
+
+                    member.inflater.stream.next_in = input_pointer;
+                    member.inflater.stream.avail_in = input_length as u32;
+                    member.inflater.stream.next_out =
+                        decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+                    member.inflater.stream.avail_out = decoded.capacity() as u32;
+                    let input_before = member.inflater.stream.avail_in;
+                    let output_before = member.inflater.stream.avail_out;
+
+                    // SAFETY:
+                    // - `member.inflater.stream` is initialized and uniquely borrowed.
+                    // - `next_in/avail_in` describe the cursor's stable current window.
+                    // - `next_out/avail_out` describe the uniquely owned spare
+                    //   capacity of `decoded`; the returned count is checked below.
+                    let status = unsafe { z::inflate(&mut member.inflater.stream, z::Z_NO_FLUSH) };
+
+                    let consumed = usize::try_from(input_before - member.inflater.stream.avail_in)
+                        .expect("zlib uInt fits usize");
+                    let produced =
+                        usize::try_from(output_before - member.inflater.stream.avail_out)
+                            .expect("zlib uInt fits usize");
+                    // Do not retain borrowed pointers while the resumable
+                    // inflater is idle or moved to another thread.
+                    member.inflater.stream.next_in = std::ptr::null();
+                    member.inflater.stream.avail_in = 0;
+                    member.inflater.stream.next_out = std::ptr::null_mut();
+                    member.inflater.stream.avail_out = 0;
+                    self.cursor.advance(consumed);
+                    // SAFETY: zlib can reduce `avail_out` only after initializing
+                    // those bytes, so exactly the first `produced` bytes are live.
+                    unsafe { decoded.set_len(produced) };
+
+                    if !decoded.is_empty() {
+                        let new_total = self.total_output.checked_add(decoded.len() as u64).ok_or(
+                            DecodeError::OutputLimitExceeded {
+                                limit: self.config.output_limit.unwrap_or(u64::MAX),
+                            },
+                        )?;
+                        if self
+                            .config
+                            .output_limit
+                            .is_some_and(|limit| new_total > limit)
+                        {
+                            return Err(DecodeError::OutputLimitExceeded {
+                                limit: self.config.output_limit.expect("checked as some"),
+                            });
+                        }
+                        self.total_output = new_total;
+                        member.output_size = member.output_size.wrapping_add(decoded.len() as u32);
+                        member.crc.update(&decoded);
+                    }
+
+                    let transition = match status {
+                        z::Z_STREAM_END => Ok(SequentialState::Footer {
+                            crc: member.crc,
+                            output_size: member.output_size,
+                        }),
+                        z::Z_OK => {
+                            if consumed == 0 && produced == 0 {
+                                Err(DecodeError::InvalidDeflate {
+                                    bit_offset: self.cursor.position().saturating_mul(8),
+                                    reason: DeflateErrorKind::Stalled,
+                                })
+                            } else {
+                                Ok(SequentialState::Inflating(member))
+                            }
+                        }
+                        z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {
+                            Ok(SequentialState::Inflating(member))
+                        }
+                        z::Z_BUF_ERROR => Err(DecodeError::InvalidDeflate {
+                            bit_offset: self.cursor.position().saturating_mul(8),
+                            reason: DeflateErrorKind::Truncated,
+                        }),
+                        z::Z_NEED_DICT => Err(DecodeError::InvalidDeflate {
+                            bit_offset: member.header.deflate_start.saturating_mul(8),
+                            reason: DeflateErrorKind::UnexpectedDictionary,
+                        }),
+                        z::Z_DATA_ERROR => {
+                            let _diagnostic = member.inflater.message();
+                            Err(DecodeError::InvalidDeflate {
+                                bit_offset: self.cursor.position().saturating_mul(8),
+                                reason: DeflateErrorKind::InvalidData,
+                            })
+                        }
+                        other => Err(DecodeError::InvalidDeflate {
+                            bit_offset: self.cursor.position().saturating_mul(8),
+                            reason: DeflateErrorKind::BackendStatus(other),
+                        }),
+                    };
+
+                    match transition {
+                        Ok(next) => self.state = next,
+                        Err(error) if !decoded.is_empty() => {
+                            self.state = SequentialState::Failed(error);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    if !decoded.is_empty() {
+                        return Ok(SequentialItem::Chunk(decoded));
+                    }
+                }
+                SequentialState::Footer { crc, output_size } => {
+                    let footer_offset = self.cursor.position();
+                    let footer = self.cursor.read_exact::<8>(footer_offset)?;
+                    let expected_crc =
+                        u32::from_le_bytes(footer[0..4].try_into().expect("four bytes"));
+                    let expected_size =
+                        u32::from_le_bytes(footer[4..8].try_into().expect("four bytes"));
+                    let actual_crc = crc.finish();
+                    if expected_crc != actual_crc {
+                        return Err(DecodeError::ChecksumMismatch {
+                            member: self.member_count,
+                            expected: expected_crc,
+                            actual: actual_crc,
+                        });
+                    }
+                    if expected_size != output_size {
+                        return Err(DecodeError::SizeMismatch {
+                            member: self.member_count,
+                            expected: expected_size,
+                            actual_mod32: output_size,
+                        });
+                    }
+
+                    self.member_count += 1;
+                    self.runtime.set_member_count(self.member_count);
+                    self.state = SequentialState::Header;
+                }
+                SequentialState::Failed(error) => return Err(error),
+                SequentialState::Finished(report) => {
+                    self.state = SequentialState::Finished(report);
+                    return Ok(SequentialItem::Finished(report));
+                }
+            }
+        }
+    }
 }
 
 /// Decodes complete members beginning at a known member boundary.
@@ -590,190 +910,39 @@ where
 /// sequence inside DEFLATE happened to look like a gzip header. Previously
 /// emitted members remain valid, so resuming from the first uncommitted task
 /// avoids both duplicate output and trusting the speculative candidate index.
+///
+/// The cursor is supplied by the caller, already positioned at the boundary to
+/// resume from, so this drives both positional and non-seekable input.
 #[allow(clippy::too_many_arguments)]
-fn decode_members_sequential<R, O>(
-    source: &R,
+fn decode_members_sequential<C, O>(
+    cursor: C,
     config: &Config,
     cancelled: &AtomicBool,
     output: &mut O,
-    start_offset: u64,
-    mut total_output: u64,
-    mut member_count: u64,
+    total_output: u64,
+    member_count: u64,
+    decoder_threads: usize,
     runtime: &Arc<RuntimeState>,
 ) -> Result<DecodeReport, DecodeError>
 where
-    R: ReadAt + ?Sized,
+    C: InputCursor,
     O: Output,
 {
-    let mut cursor = SourceCursor::new(source, config.input_page_size)?;
-    cursor.seek(start_offset)?;
-
-    while !cursor.at_end() {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(DecodeError::Cancelled);
-        }
-
-        let header = parse_member_header(&mut cursor, member_count == 0)?;
-        debug_assert!(header.start <= header.deflate_start);
-        debug_assert_eq!(header.deflate_start, cursor.position());
-        let _observed_bgzf_size = header.bgzf_block_size;
-        let mut inflater = RawInflater::new()?;
-        let mut crc = Crc32::new();
-        let mut member_output = 0_u32;
-        let mut decoded = Vec::with_capacity(config.decoded_chunk_size);
-
-        loop {
-            if cancelled.load(Ordering::Relaxed) {
-                return Err(DecodeError::Cancelled);
-            }
-            if cursor.at_end() {
-                return Err(DecodeError::InvalidDeflate {
-                    bit_offset: cursor.position().saturating_mul(8),
-                    reason: DeflateErrorKind::Truncated,
-                });
-            }
-
-            let (input_pointer, input_length) = {
-                let input = cursor.available()?;
-                (input.as_ptr(), input.len().min(u32::MAX as usize))
-            };
-            if decoded.capacity() < config.decoded_chunk_size {
-                decoded.reserve_exact(config.decoded_chunk_size - decoded.capacity());
-            }
-
-            inflater.stream.next_in = input_pointer;
-            inflater.stream.avail_in = input_length as u32;
-            inflater.stream.next_out = decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-            inflater.stream.avail_out = decoded.capacity() as u32;
-            let input_before = inflater.stream.avail_in;
-            let output_before = inflater.stream.avail_out;
-
-            // SAFETY:
-            // - `inflater.stream` was initialized and is uniquely borrowed.
-            // - `next_in/avail_in` describe the current immutable cursor page,
-            //   which is not moved or mutated until this call returns.
-            // - `next_out/avail_out` describe the uniquely owned spare
-            //   capacity of `decoded`. The backend reports how many bytes it
-            //   initialized before that length is exposed below.
-            let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
-
-            let consumed = usize::try_from(input_before - inflater.stream.avail_in)
-                .expect("zlib uInt fits usize");
-            let produced = usize::try_from(output_before - inflater.stream.avail_out)
-                .expect("zlib uInt fits usize");
-            cursor.advance(consumed);
-            // SAFETY: `output_before` was exactly `decoded.capacity()` and
-            // zlib-rs can only reduce `avail_out` after initializing those
-            // output bytes. Therefore `produced <= capacity`, and precisely
-            // the first `produced` bytes are initialized.
-            unsafe { decoded.set_len(produced) };
-
-            if !decoded.is_empty() {
-                let new_total = total_output.checked_add(decoded.len() as u64).ok_or(
-                    DecodeError::OutputLimitExceeded {
-                        limit: config.output_limit.unwrap_or(u64::MAX),
-                    },
-                )?;
-                if config.output_limit.is_some_and(|limit| new_total > limit) {
-                    return Err(DecodeError::OutputLimitExceeded {
-                        limit: config.output_limit.expect("checked as some"),
-                    });
-                }
-                total_output = new_total;
-                member_output = member_output.wrapping_add(decoded.len() as u32);
-                crc.update(&decoded);
-                decoded = output.emit_reusable(decoded)?;
-            }
-
-            match status {
-                z::Z_STREAM_END => break,
-                z::Z_OK => {
-                    if consumed == 0 && produced == 0 {
-                        return Err(DecodeError::InvalidDeflate {
-                            bit_offset: cursor.position().saturating_mul(8),
-                            reason: DeflateErrorKind::Stalled,
-                        });
-                    }
-                }
-                z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {}
-                z::Z_BUF_ERROR => {
-                    return Err(DecodeError::InvalidDeflate {
-                        bit_offset: cursor.position().saturating_mul(8),
-                        reason: DeflateErrorKind::Truncated,
-                    });
-                }
-                z::Z_NEED_DICT => {
-                    return Err(DecodeError::InvalidDeflate {
-                        bit_offset: header.deflate_start.saturating_mul(8),
-                        reason: DeflateErrorKind::UnexpectedDictionary,
-                    });
-                }
-                z::Z_DATA_ERROR => {
-                    let _diagnostic = inflater.message();
-                    return Err(DecodeError::InvalidDeflate {
-                        bit_offset: cursor.position().saturating_mul(8),
-                        reason: DeflateErrorKind::InvalidData,
-                    });
-                }
-                other => {
-                    return Err(DecodeError::InvalidDeflate {
-                        bit_offset: cursor.position().saturating_mul(8),
-                        reason: DeflateErrorKind::BackendStatus(other),
-                    });
-                }
-            }
-        }
-
-        let footer_offset = cursor.position();
-        let footer = cursor.read_exact::<8>(footer_offset)?;
-        let expected_crc = u32::from_le_bytes(footer[0..4].try_into().expect("four bytes"));
-        let expected_size = u32::from_le_bytes(footer[4..8].try_into().expect("four bytes"));
-        let actual_crc = crc.finish();
-        if expected_crc != actual_crc {
-            return Err(DecodeError::ChecksumMismatch {
-                member: member_count,
-                expected: expected_crc,
-                actual: actual_crc,
-            });
-        }
-        if expected_size != member_output {
-            return Err(DecodeError::SizeMismatch {
-                member: member_count,
-                expected: expected_size,
-                actual_mod32: member_output,
-            });
-        }
-
-        member_count += 1;
-        runtime.set_member_count(member_count);
-    }
-
-    if member_count == 0 {
-        return Err(DecodeError::InvalidGzip {
-            offset: 0,
-            reason: GzipErrorKind::BadMagic,
-        });
-    }
-
-    let final_length = source
-        .len()
-        .map_err(|error| DecodeError::input_io(cursor.position(), error))?;
-    if final_length != cursor.length() {
-        return Err(DecodeError::input_io(
-            cursor.position(),
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "compressed source length changed during decoding",
-            ),
-        ));
-    }
-
-    Ok(DecodeReport {
-        compressed_bytes: cursor.position(),
-        decompressed_bytes: total_output,
+    let mut decoder = SequentialDecoder::new(
+        cursor,
+        config,
+        total_output,
         member_count,
-        decoder_threads: config.decoder_threads,
-    })
+        decoder_threads,
+        runtime,
+    );
+    let mut reusable = Vec::with_capacity(config.decoded_chunk_size);
+    loop {
+        match decoder.next_chunk(cancelled, reusable)? {
+            SequentialItem::Chunk(chunk) => reusable = output.emit_reusable(chunk)?,
+            SequentialItem::Finished(report) => return Ok(report),
+        }
+    }
 }
 
 const INDEPENDENT_MEMBER_SCAN_BYTES: usize = 4 * 1024 * 1024;
@@ -1837,14 +2006,16 @@ where
     stopped.store(true, Ordering::Relaxed);
 
     if let IndependentOutcome::SequentialFallback { offset } = outcome {
+        let mut cursor = SourceCursor::new(source, config.input_page_size)?;
+        cursor.seek(offset)?;
         return decode_members_sequential(
-            source,
+            &mut cursor,
             config,
             cancelled,
             output,
-            offset,
             total_output,
             member_count,
+            config.decoder_threads,
             runtime,
         );
     }
@@ -3671,8 +3842,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES, MemberAccounting, MemberHeader, SourceCursor,
-        Window, batch_independent_headers, find_gzip_magic, find_gzip_magic_scalar,
+        INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES, InputCursor, MemberAccounting, MemberHeader,
+        SourceCursor, Window, batch_independent_headers, find_gzip_magic, find_gzip_magic_scalar,
         independent_member_task_candidate_limit, inflate_tail, validate_footer,
     };
 

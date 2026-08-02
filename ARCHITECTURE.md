@@ -17,10 +17,58 @@ payload through one of five bounded paths:
 5. Other streams use a file-wide estimated grid and rapidgzip's marker/window
    path, with zlib-rs fallback from the last authoritative boundary.
 
-All paths return ordered owned chunks to one coordinator. The coordinator alone
-updates member accounting and calls the user's `Write`, so a writer need not be
-`Send`. `DecoderReader` substitutes a bounded synchronous channel at this final
-edge and therefore implements `Read + Send` without changing the decoder core.
+Positional paths return ordered owned chunks to one coordinator. The
+coordinator updates member accounting and calls the user's `Write`, so a writer
+need not be `Send`. A positional `DecoderReader` substitutes a bounded
+synchronous channel at this final edge. The non-seekable path uses the same
+sequential core as a resumable state machine, described below.
+
+## Non-seekable input
+
+`rapidgzip-core` also accepts a plain `std::io::Read`. Such a source cannot be
+indexed, probed, or revisited, so paths 2 through 5 are all unreachable: each
+one begins by reading headers or block boundaries scattered across the file
+before it decodes anything. Path 1 is reachable, because it only ever moves
+forward.
+
+Both cursors implement one internal `InputCursor` trait, which is the exact set
+of forward operations path 1 and the member-header parser use: current offset,
+end of input, the readable window, consume, and confirm the source did not
+change. `SourceCursor` implements it over `ReadAt`; `StreamCursor` implements it
+over `Read` with a single window that compacts consumed bytes on refill. Member
+framing, footer verification, trailing-garbage detection, per-member history
+reset, and the output limit are therefore not reimplemented for streams: path 1
+is generic over the cursor and is the same code either way.
+
+The length snapshot does not exist for a non-seekable source rather than
+becoming mutable. A positional decode snapshots `len()` when it creates its
+cursor and re-checks it at the end, which is what `verify_source_unchanged`
+does. A stream has nothing to snapshot: end of input is whatever the reader
+reports, and the framing loop refuses to stop anywhere except at a verified
+member boundary, so trailing bytes after the last member are parsed as another
+header and rejected as trailing garbage. Reaching end of input therefore still
+means the whole input was verified, and `verify_source_unchanged` is a no-op.
+The `ReadAt` contract itself is unchanged, and no parallel path observes any of
+this.
+
+`decode_stream` drives the resumable engine to completion on the calling thread.
+`stream_reader` performs one initial read for best-effort fail-fast header
+validation, then advances the engine only from the consumer's `Read::read`.
+This avoids both a permanently allocated streaming thread and the possibility
+of detaching one blocked inside an arbitrary `Read`. The state machine owns the
+current header, zlib-rs inflater, CRC32, member size, and input cursor between
+chunks, so dropping the reader drops the source immediately.
+
+Runtime telemetry retains the builder's immutable configured-worker budget and
+application worker limit. The sequential path sets its adaptive target to one,
+spawns no decoder workers or auxiliary coordinator, and returns the configured
+budget in `DecodeReport::decoder_threads`, preserving the published field
+semantics while still exposing the concurrency actually in use.
+
+`Decoder::open` classifies only regular files as positional. Seekability alone
+is insufficient: block and character devices can implement seek while lacking
+the stable, known-length, concurrently readable snapshot required by `ReadAt`.
+Every non-regular path accepted by `File::open` uses the streaming engine.
 
 ## Marker/window algorithm
 
@@ -188,3 +236,11 @@ oversized regions continue through zlib-rs instead. `DecoderReader` adds at most
 the configured in-flight chunk count plus its currently partially consumed
 chunk. Dropping it closes the consumer edge, sets cancellation, and joins the
 coordinator.
+
+A non-seekable source holds one input window instead of a positional page and
+spools nothing, so its memory is independent of the input length. There is no
+final handoff or streaming coordinator: the consumer directly advances one
+decoded chunk at a time. A slow consumer therefore stops calling the compressed
+source, naturally propagating backpressure to a pipe or socket. Dropping the
+reader drops the cursor and source synchronously, so no OS thread, stack,
+channel, or input resource can remain detached behind it.

@@ -1,9 +1,13 @@
 //! End-to-end decoder and paraseq integration tests.
 
 use paraseq::{Record, fastq};
-use rapidgzip_core::{DecodeError, Decoder, DecoderHandle, DecoderPath, DecoderPressure, ReadAt};
+use rapidgzip_core::{
+    DecodeError, DecodeReport, Decoder, DecoderHandle, DecoderPath, DecoderPressure, ReadAt,
+};
 use std::io::{self, Read};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -182,6 +186,116 @@ impl ReadAt for GatedReadAt {
         }
         self.bytes.as_slice().read_at(offset, output)
     }
+}
+
+/// Non-seekable byte source fed one chunk at a time by another thread.
+///
+/// This implements only [`Read`], never [`std::io::Seek`], so a test cannot
+/// accidentally exercise positional reads the way a `Cursor` would. Reads block
+/// until the producer supplies more bytes, which is what a real pipe does.
+struct ChunkedPipe {
+    receiver: mpsc::Receiver<Vec<u8>>,
+    current: Vec<u8>,
+    offset: usize,
+}
+
+impl Read for ChunkedPipe {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        while self.offset == self.current.len() {
+            match self.receiver.recv() {
+                Ok(chunk) => {
+                    self.current = chunk;
+                    self.offset = 0;
+                }
+                // Every sender was dropped, which is this pipe's end of input.
+                Err(_) => return Ok(0),
+            }
+        }
+        let count = (self.current.len() - self.offset).min(output.len());
+        output[..count].copy_from_slice(&self.current[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
+
+fn pipe_pair() -> (SyncSender<Vec<u8>>, ChunkedPipe) {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    (
+        sender,
+        ChunkedPipe {
+            receiver,
+            current: Vec::new(),
+            offset: 0,
+        },
+    )
+}
+
+/// Feeds `bytes` through a pipe in `chunk_size` pieces, pausing between each.
+fn pipe_from(bytes: &[u8], chunk_size: usize, pause: Duration) -> ChunkedPipe {
+    let (sender, pipe) = pipe_pair();
+    let chunks: Vec<Vec<u8>> = bytes
+        .chunks(chunk_size.max(1))
+        .map(<[u8]>::to_vec)
+        .collect();
+    thread::spawn(move || {
+        for chunk in chunks {
+            if !pause.is_zero() {
+                thread::sleep(pause);
+            }
+            if sender.send(chunk).is_err() {
+                return;
+            }
+        }
+    });
+    pipe
+}
+
+/// Decodes `compressed` positionally, the way every 0.1.0 entry point does.
+fn decode_positional(
+    decoder: &Decoder,
+    compressed: &[u8],
+) -> Result<(Vec<u8>, DecodeReport), DecodeError> {
+    let mut output = Vec::new();
+    decoder
+        .decode(compressed, &mut output)
+        .map(|report| (output, report))
+}
+
+/// Decodes `compressed` through a genuinely non-seekable source.
+fn decode_streaming(
+    decoder: &Decoder,
+    compressed: &[u8],
+) -> Result<(Vec<u8>, DecodeReport), DecodeError> {
+    let mut output = Vec::new();
+    decoder
+        .decode_stream(pipe_from(compressed, 64, Duration::ZERO), &mut output)
+        .map(|report| (output, report))
+}
+
+/// Asserts that both paths accept `compressed` and agree byte for byte.
+fn assert_paths_agree(decoder: &Decoder, compressed: &[u8]) -> DecodeReport {
+    let (positional, positional_report) = decode_positional(decoder, compressed).unwrap();
+    let (streamed, streamed_report) = decode_streaming(decoder, compressed).unwrap();
+    assert_eq!(streamed, positional);
+    assert_eq!(streamed_report.member_count, positional_report.member_count);
+    assert_eq!(
+        streamed_report.decompressed_bytes,
+        positional_report.decompressed_bytes
+    );
+    assert_eq!(
+        streamed_report.compressed_bytes,
+        positional_report.compressed_bytes
+    );
+    // Reports retain the configured worker budget even though telemetry shows
+    // an effective target of one for this sequential path.
+    assert_eq!(
+        streamed_report.decoder_threads,
+        positional_report.decoder_threads
+    );
+    streamed_report
 }
 
 fn assert_handle_traits<T: Clone + Send + Sync + Unpin>() {}
@@ -652,6 +766,464 @@ fn enforces_output_limit_before_emitting_excess() {
         Err(DecodeError::OutputLimitExceeded { limit: 5 })
     ));
     assert!(output.is_empty());
+}
+
+#[test]
+fn streaming_matches_positional_for_a_single_member() {
+    let payload = b"ACGT".repeat(5_000);
+    let compressed = member(&payload);
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let report = assert_paths_agree(&decoder, &compressed);
+    assert_eq!(report.member_count, 1);
+    assert_eq!(report.decompressed_bytes, payload.len() as u64);
+}
+
+#[test]
+fn streaming_matches_positional_for_concatenated_and_empty_members() {
+    let mut compressed = member(b"first");
+    compressed.extend_from_slice(&member(b""));
+    compressed.extend_from_slice(&member(b"second"));
+    let decoder = Decoder::builder().decoder_threads(4).build().unwrap();
+    let report = assert_paths_agree(&decoder, &compressed);
+    assert_eq!(report.member_count, 3);
+    let (streamed, _) = decode_streaming(&decoder, &compressed).unwrap();
+    assert_eq!(streamed, b"firstsecond");
+}
+
+#[test]
+fn streaming_matches_positional_for_bgzf_with_the_eof_member() {
+    // A dynamic-Huffman BGZF block, so the stream is not trivially stored.
+    let deflate = hex(
+        "edc3410900000804b06c870f0b5cff2c82393658661b5555555555555555555555555555555555555555555555555555555555555555555555555555f51f",
+    );
+    let block = b"ACGT".repeat(10_000);
+    let mut compressed = Vec::new();
+    for _ in 0..3 {
+        compressed.extend(bgzf_member_from_raw_deflate(&deflate, &block));
+    }
+    compressed.extend(bgzf_eof());
+
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let report = assert_paths_agree(&decoder, &compressed);
+    // Three data blocks plus the conventional 28-byte EOF member.
+    assert_eq!(report.member_count, 4);
+    assert_eq!(report.decompressed_bytes, 3 * block.len() as u64);
+
+    let (streamed, _) = decode_streaming(&decoder, &compressed).unwrap();
+    assert_eq!(streamed, block.repeat(3));
+}
+
+#[test]
+fn streaming_matches_positional_for_a_fully_stored_stream() {
+    let payload: Vec<u8> = (0..10_u32 * 1024 * 1024).map(|value| value as u8).collect();
+    let compressed = member(&payload);
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    // Positionally this fixture is large enough to take the parallel stored
+    // path, so the comparison below is against a genuinely different decoder.
+    let reader = decoder.reader(compressed.clone()).unwrap();
+    let handle = reader.handle();
+    assert_eq!(reader.finish().unwrap().member_count, 1);
+    assert_eq!(handle.stats().path, DecoderPath::Stored);
+
+    let report = assert_paths_agree(&decoder, &compressed);
+    assert_eq!(report.decompressed_bytes, payload.len() as u64);
+}
+
+#[test]
+fn streaming_rejects_input_truncated_inside_deflate() {
+    let compressed = member(&b"ACGT".repeat(5_000));
+    let truncated = &compressed[..compressed.len() - 64];
+    let decoder = Decoder::default();
+    let mut output = Vec::new();
+    let error = decoder
+        .decode_stream(pipe_from(truncated, 64, Duration::ZERO), &mut output)
+        .unwrap_err();
+    assert!(
+        matches!(error, DecodeError::InvalidDeflate { .. }),
+        "expected a DEFLATE truncation error, got {error:?}"
+    );
+}
+
+#[test]
+fn streaming_rejects_input_truncated_inside_the_footer() {
+    let compressed = member(b"payload");
+    let truncated = &compressed[..compressed.len() - 3];
+    let decoder = Decoder::default();
+    let mut output = Vec::new();
+    let error = decoder
+        .decode_stream(pipe_from(truncated, 4, Duration::ZERO), &mut output)
+        .unwrap_err();
+    assert!(
+        matches!(error, DecodeError::InvalidGzip { .. }),
+        "expected a truncated-footer error, got {error:?}"
+    );
+}
+
+#[test]
+fn streaming_reports_the_member_with_a_corrupt_checksum() {
+    let mut second = member(b"second");
+    let crc_start = second.len() - 8;
+    second[crc_start] ^= 0xFF;
+    let mut compressed = member(b"first");
+    compressed.extend_from_slice(&second);
+    compressed.extend_from_slice(&member(b"third"));
+
+    let decoder = Decoder::default();
+    let mut output = Vec::new();
+    let error = decoder
+        .decode_stream(pipe_from(&compressed, 8, Duration::ZERO), &mut output)
+        .unwrap_err();
+    assert!(
+        matches!(error, DecodeError::ChecksumMismatch { member: 1, .. }),
+        "expected member 1 to fail its checksum, got {error:?}"
+    );
+}
+
+#[test]
+fn streaming_reports_the_member_with_a_corrupt_size() {
+    let mut second = member(b"second");
+    let size_start = second.len() - 4;
+    second[size_start] ^= 0x0F;
+    let mut compressed = member(b"first");
+    compressed.extend_from_slice(&second);
+
+    let decoder = Decoder::default();
+    let mut output = Vec::new();
+    let error = decoder
+        .decode_stream(pipe_from(&compressed, 8, Duration::ZERO), &mut output)
+        .unwrap_err();
+    assert!(
+        matches!(error, DecodeError::SizeMismatch { member: 1, .. }),
+        "expected member 1 to fail its size check, got {error:?}"
+    );
+}
+
+#[test]
+fn streaming_rejects_trailing_garbage() {
+    let mut compressed = member(b"valid");
+    compressed.extend_from_slice(b"garbage");
+    let decoder = Decoder::default();
+    let mut output = Vec::new();
+    let error = decoder
+        .decode_stream(pipe_from(&compressed, 8, Duration::ZERO), &mut output)
+        .unwrap_err();
+    assert!(
+        matches!(error, DecodeError::InvalidGzip { .. }),
+        "expected trailing bytes to be rejected, got {error:?}"
+    );
+}
+
+#[test]
+fn streaming_rejects_input_that_is_not_gzip_at_all() {
+    let decoder = Decoder::default();
+    let mut output = Vec::new();
+    let error = decoder
+        .decode_stream(
+            pipe_from(b"not gzip at all", 4, Duration::ZERO),
+            &mut output,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, DecodeError::InvalidGzip { .. }),
+        "expected bad magic to be rejected, got {error:?}"
+    );
+    // With four bytes available immediately, best-effort constructor
+    // validation can reject this before returning a reader.
+    assert!(
+        decoder
+            .stream_reader(pipe_from(b"not gzip at all", 4, Duration::ZERO))
+            .is_err()
+    );
+}
+
+#[test]
+fn streaming_enforces_output_limit_before_emitting_excess() {
+    let compressed = member(b"0123456789");
+    let decoder = Decoder::builder().output_limit(Some(5)).build().unwrap();
+    let mut output = Vec::new();
+    assert!(matches!(
+        decoder.decode_stream(pipe_from(&compressed, 4, Duration::ZERO), &mut output),
+        Err(DecodeError::OutputLimitExceeded { limit: 5 })
+    ));
+    // A stream is fed to zlib-rs in small windows, so unlike the positional
+    // decode of this fixture the limit can be reached part way through the
+    // member. What must hold either way is that nothing past the limit is
+    // emitted.
+    assert!(output.len() <= 5, "emitted {} bytes", output.len());
+}
+
+#[test]
+fn streaming_reader_preserves_the_budget_but_uses_no_workers() {
+    let compressed = member(&b"ACGT".repeat(20_000));
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let reader = decoder
+        .stream_reader(pipe_from(&compressed, 4096, Duration::ZERO))
+        .unwrap();
+    let handle = reader.handle();
+    let initial = handle.stats();
+    assert_eq!(initial.configured_workers, 8);
+    assert_eq!(initial.worker_limit, 8);
+    assert_eq!(initial.active_workers, 1);
+    assert_eq!(initial.spawned_workers, 0);
+    assert_eq!(initial.auxiliary_threads, 0);
+    reader.set_worker_limit(7).unwrap();
+
+    let report = reader.finish().unwrap();
+    assert_eq!(report.member_count, 1);
+    assert_eq!(report.decoder_threads, 8);
+
+    let stats = handle.stats();
+    assert_eq!(stats.path, DecoderPath::Sequential);
+    assert_eq!(stats.configured_workers, 8);
+    assert_eq!(stats.worker_limit, 7);
+    assert_eq!(stats.spawned_workers, 0);
+    assert_eq!(stats.auxiliary_threads, 0);
+    assert_eq!(stats.pressure, DecoderPressure::Finished);
+}
+
+#[test]
+fn streaming_reader_reports_the_calling_thread_while_blocked_on_input() {
+    let (sender, pipe) = pipe_pair();
+    // Best-effort construction can validate this complete fixed header. The
+    // first read then consumes it and blocks waiting for DEFLATE input.
+    sender
+        .send(b"\x1f\x8b\x08\x00\0\0\0\0\x00\xff".to_vec())
+        .unwrap();
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let reader = decoder.stream_reader(pipe).unwrap();
+    let handle = reader.handle();
+    let consumer = thread::spawn(move || {
+        let mut reader = reader;
+        let mut byte = [0_u8; 1];
+        let result = reader.read(&mut byte);
+        (reader, result)
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let stats = handle.stats();
+        if stats.busy_workers == 1 {
+            assert_eq!(stats.active_workers, 1);
+            assert_eq!(stats.spawned_workers, 0);
+            assert_eq!(stats.auxiliary_threads, 0);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "streaming read never became busy"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    drop(sender);
+    let (_reader, result) = consumer.join().unwrap();
+    assert!(result.is_err(), "header-only input must be truncated");
+}
+
+#[test]
+fn streaming_reader_coerces_to_boxed_read_send_for_paraseq() {
+    let mut records = Vec::new();
+    for index in 0..64 {
+        records.extend_from_slice(format!("@read{index}\nACGTACGT\n+\nIIIIIIII\n").as_bytes());
+    }
+    let compressed = member(&records);
+    let decoder = Decoder::default();
+    let reader: Box<dyn Read + Send> = Box::new(
+        decoder
+            .stream_reader(pipe_from(&compressed, 512, Duration::ZERO))
+            .unwrap(),
+    );
+
+    let mut parsed = fastq::Reader::new(reader);
+    let mut record_set = fastq::RecordSet::new(16);
+    let mut seen = 0;
+    while record_set.fill(&mut parsed).unwrap() {
+        for record in record_set.iter() {
+            assert_eq!(record.unwrap().seq().as_ref(), b"ACGTACGT");
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 64);
+}
+
+#[test]
+fn dropping_a_streaming_reader_before_eof_releases_its_source() {
+    let compressed = member(&b"ACGT".repeat(200_000));
+    let (sender, pipe) = pipe_pair();
+    let prefix = compressed[..1024].to_vec();
+    sender.send(prefix).unwrap();
+
+    let decoder = Decoder::default();
+    let mut reader = decoder.stream_reader(pipe).unwrap();
+    let mut byte = [0_u8; 1];
+    assert_eq!(reader.read(&mut byte).unwrap(), 1);
+    // Nothing claims the unread remainder was verified.
+    assert!(reader.report().is_none());
+
+    drop(reader);
+    // The pipe receiver is owned by the source. A detached coordinator would
+    // keep it alive; synchronous pull decoding drops it with DecoderReader.
+    assert!(
+        sender.send(vec![0]).is_err(),
+        "dropping a streaming reader must release its source immediately"
+    );
+}
+
+#[test]
+fn streaming_tolerates_a_slow_producer_without_deadlock_or_spinning() {
+    let payload = b"ACGT".repeat(4_000);
+    let compressed = member(&payload);
+    let chunk_size = compressed.len().div_ceil(8);
+    let pause = Duration::from_millis(20);
+
+    let decoder = Decoder::default();
+    let start = Instant::now();
+    let mut output = Vec::new();
+    let report = decoder
+        .decode_stream(pipe_from(&compressed, chunk_size, pause), &mut output)
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(output, payload);
+    assert_eq!(report.member_count, 1);
+    // The decoder waited on the producer rather than failing early, and did not
+    // take pathologically longer than the producer's own schedule.
+    assert!(elapsed >= pause * 8, "finished too early: {elapsed:?}");
+    assert!(elapsed < pause * 8 * 10, "took far too long: {elapsed:?}");
+}
+
+#[test]
+fn streaming_reader_drains_one_byte_consumer_buffers() {
+    let payload = b"ACGT".repeat(5_000);
+    let compressed = member(&payload);
+    let decoder = Decoder::default();
+    let mut reader = decoder
+        .stream_reader(pipe_from(&compressed, 256, Duration::ZERO))
+        .unwrap();
+
+    let mut output = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        match reader.read(&mut byte).unwrap() {
+            0 => break,
+            _ => output.push(byte[0]),
+        }
+    }
+    assert_eq!(output, payload);
+    assert_eq!(reader.report().unwrap().member_count, 1);
+}
+
+/// A path in the system temporary directory, unique to this process and `name`.
+#[cfg(unix)]
+fn scratch_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("rapidgzip-{}-{name}", std::process::id()))
+}
+
+#[cfg(unix)]
+#[test]
+fn streaming_decodes_a_real_operating_system_pipe() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let payload = b"ACGTTGCA".repeat(20_000);
+    let compressed = member(&payload);
+
+    // `cat` gives both a real pipe file descriptor and a producer that is not
+    // this process, so nothing about the source can be read positionally.
+    let mut child = Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child_stdin = child.stdin.take().unwrap();
+    let written = compressed.clone();
+    thread::spawn(move || {
+        let _ = child_stdin.write_all(&written);
+    });
+    let child_stdout = child.stdout.take().unwrap();
+
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let mut streamed = Vec::new();
+    let report = decoder.decode_stream(child_stdout, &mut streamed).unwrap();
+    assert!(child.wait().unwrap().success());
+
+    let (positional, _) = decode_positional(&decoder, &compressed).unwrap();
+    assert_eq!(streamed, positional);
+    assert_eq!(streamed, payload);
+    assert_eq!(report.member_count, 1);
+    assert_eq!(report.decoder_threads, 8);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_routes_a_fifo_to_the_streaming_path() {
+    use std::fs;
+    use std::io::Write;
+    use std::process::Command;
+
+    let path = scratch_path("open-fifo.gz");
+    let _ = fs::remove_file(&path);
+    assert!(
+        Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success(),
+        "mkfifo failed"
+    );
+
+    let payload = b"ACGT".repeat(30_000);
+    let compressed = member(&payload);
+    let writer_path = path.clone();
+    // Opening a FIFO for writing blocks until a reader opens it, so this thread
+    // and the `open` below rendezvous.
+    let writer = thread::spawn(move || {
+        let mut file = fs::File::create(&writer_path).unwrap();
+        file.write_all(&compressed).unwrap();
+    });
+
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let mut reader = decoder.open(&path).unwrap();
+    let handle = reader.handle();
+    let mut decoded = Vec::new();
+    reader.read_to_end(&mut decoded).unwrap();
+    let report = reader.finish().unwrap();
+    writer.join().unwrap();
+    let _ = fs::remove_file(&path);
+
+    assert_eq!(decoded, payload);
+    assert_eq!(report.member_count, 1);
+    assert_eq!(report.decoder_threads, 8);
+    let stats = handle.stats();
+    assert_eq!(stats.path, DecoderPath::Sequential);
+    assert_eq!(stats.configured_workers, 8);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_still_uses_a_parallel_path_for_a_regular_file() {
+    use std::fs;
+
+    let path = scratch_path("open-regular.gz");
+    let mut compressed = Vec::new();
+    for index in 0..64 {
+        compressed.extend(member(format!("member-{index}").as_bytes()));
+    }
+    fs::write(&path, &compressed).unwrap();
+
+    let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+    let reader = decoder.open(&path).unwrap();
+    let handle = reader.handle();
+    let report = reader.finish().unwrap();
+    let _ = fs::remove_file(&path);
+
+    assert_eq!(report.member_count, 64);
+    assert_eq!(report.decoder_threads, 8);
+    // Which parallel path wins depends on the fixture; what matters is that
+    // routing a regular file did not divert it to the streaming decoder.
+    let stats = handle.stats();
+    assert_ne!(stats.path, DecoderPath::Sequential);
+    assert_eq!(stats.configured_workers, 8);
 }
 
 #[test]

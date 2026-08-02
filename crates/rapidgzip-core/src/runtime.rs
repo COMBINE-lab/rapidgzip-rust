@@ -96,9 +96,9 @@ pub struct DecoderStats {
     pub configured_workers: usize,
     /// Current application-controlled ceiling on decoder workers.
     pub worker_limit: usize,
-    /// Effective worker target after application and adaptive limits.
+    /// Effective decode-concurrency target after application and adaptive limits.
     pub active_workers: usize,
-    /// Workers currently executing decoder tasks.
+    /// Decoder workers, or the synchronous sequential caller, currently decoding.
     pub busy_workers: usize,
     /// Live decoder-worker operating-system threads.
     pub spawned_workers: usize,

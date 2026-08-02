@@ -1,8 +1,8 @@
 //! Decode-only command-line interface for `rapidgzip-core`.
 
 use clap::{ArgAction, Parser};
-use rapidgzip_core::Decoder;
-use std::fs::{File, OpenOptions};
+use rapidgzip_core::{DecodeError, DecodeReport, Decoder};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -30,9 +30,24 @@ struct Arguments {
     #[arg(short = 't', long = "test", action = ArgAction::SetTrue, conflicts_with_all = ["stdout", "output"])]
     test: bool,
 
-    /// Seekable gzip or BGZF input file.
+    /// Gzip or BGZF input file, or `-` for standard input.
+    ///
+    /// A regular file is decoded in parallel. A pipe, FIFO, or standard input
+    /// is decoded sequentially with the same verification.
     #[arg(value_name = "INPUT")]
     input: PathBuf,
+}
+
+/// Decodes through the core library's single source classifier.
+fn decode_into<W: Write>(
+    decoder: &Decoder,
+    path: &std::path::Path,
+    output: &mut W,
+) -> Result<DecodeReport, DecodeError> {
+    if path.as_os_str() == "-" {
+        return decoder.decode_stream(io::stdin(), output);
+    }
+    decoder.decode_path(path, output)
 }
 
 fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
@@ -41,10 +56,9 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.decoder_threads(threads);
     }
     let decoder = builder.build()?;
-    let input = File::open(&arguments.input)?;
 
     if arguments.test {
-        let report = decoder.decode(&input, &mut io::sink())?;
+        let report = decode_into(&decoder, &arguments.input, &mut io::sink())?;
         eprintln!(
             "{}: ok, {} member(s), {} decoded bytes",
             arguments.input.display(),
@@ -59,12 +73,12 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        decoder.decode(&input, &mut output)?;
+        decode_into(&decoder, &arguments.input, &mut output)?;
         output.flush()?;
     } else {
         let stdout = io::stdout();
         let mut output = stdout.lock();
-        decoder.decode(&input, &mut output)?;
+        decode_into(&decoder, &arguments.input, &mut output)?;
         output.flush()?;
     }
     Ok(())

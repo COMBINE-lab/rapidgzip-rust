@@ -8,11 +8,14 @@
 //!
 //! # Output interfaces
 //!
-//! - [`Decoder::decode`] is the lower-overhead push interface. It writes on the
-//!   calling thread, so the supplied [`std::io::Write`] need not be [`Send`].
+//! - [`Decoder::decode`] is the lower-overhead push interface, and
+//!   [`Decoder::decode_path`] adds automatic regular/non-regular path routing.
+//!   Both write on the calling thread, so [`std::io::Write`] need not be [`Send`].
 //! - [`Decoder::reader`] and [`Decoder::open`] return an owned [`DecoderReader`]
 //!   implementing [`std::io::Read`] + [`Send`]. This is suitable for parsers
 //!   that take `Box<dyn Read + Send>`, including `paraseq`.
+//! - [`Decoder::decode_stream`] and [`Decoder::stream_reader`] are the same two
+//!   interfaces for non-seekable input; see below.
 //!
 //! # Example
 //!
@@ -50,6 +53,25 @@
 //! positional reads without a shared cursor. Implementations are supplied for
 //! files on Unix and Windows, in-memory byte storage, [`std::sync::Arc`], and
 //! [`Box`]. The source length and contents must remain stable during decoding.
+//!
+//! # Non-seekable input
+//!
+//! [`Decoder::decode_stream`] and [`Decoder::stream_reader`] accept any
+//! [`std::io::Read`], so standard input, a FIFO, a process substitution, or a
+//! socket can be decoded. [`Decoder::open`] routes non-regular paths accepted by
+//! [`std::fs::File::open`], such as FIFOs and character devices, to the same
+//! sequential engine.
+//!
+//! Verification is identical: such a source runs the same sequential zlib-rs
+//! path that the parallel paths use as their authoritative fallback, sharing its
+//! member framing, footer checks, trailing-garbage detection, and output limit.
+//! It is not decoded in parallel, because every parallel path needs positional
+//! reads. Telemetry retains the builder's configured worker budget while
+//! reporting an effective target of one and zero spawned decoder/auxiliary
+//! threads. Nothing is spooled: input memory is one
+//! [`DecoderBuilder::input_page_size`] window. [`DecoderReader`] advances the
+//! streaming inflater synchronously from [`std::io::Read::read`], so dropping it
+//! immediately drops the source and cannot strand a thread blocked on input.
 //!
 //! [`DecoderBuilder::decoder_threads`] sets a maximum worker budget rather than
 //! eagerly creating that many threads. Parallel paths grow an elastic worker
