@@ -146,10 +146,16 @@ impl MarkerBuffer {
             // SAFETY: Advanced SIMD is part of the baseline AArch64 ISA. The
             // function bounds-checks each vector load/store through chunking.
             unsafe { resolve_neon(&self.symbols, &mut output, window)? };
-            return Ok(output);
+            Ok(output)
         }
-        resolve_scalar(&self.symbols, &mut output, window)?;
-        Ok(output)
+        // Advanced SIMD is unconditional on AArch64, so the scalar fallback is
+        // only reachable elsewhere: on x86-64 without SSE4.1, or on any other
+        // architecture.
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            resolve_scalar(&self.symbols, &mut output, window)?;
+            Ok(output)
+        }
     }
 }
 
@@ -252,6 +258,8 @@ unsafe fn resolve_neon(
     };
 
     let vectorized = symbols.len() / 8 * 8;
+    // SAFETY: the pointer refers to a live eight-element `u16` array, which is
+    // exactly the width this load reads.
     let mut mask = unsafe { vld1q_u16([0xFF00_u16; 8].as_ptr()) };
     // Keep an explicit lane operation so compilers consistently materialize
     // this as a vector constant across supported Rust/LLVM versions.

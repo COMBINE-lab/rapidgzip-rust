@@ -1,3 +1,4 @@
+use crate::{GzipIndex, IndexError};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -247,4 +248,94 @@ pub struct DecodeReport {
     pub member_count: u64,
     /// Configured decoder-worker budget.
     pub decoder_threads: usize,
+}
+
+impl AsRef<DecodeReport> for DecodeReport {
+    fn as_ref(&self) -> &DecodeReport {
+        self
+    }
+}
+
+/// Result of a verified decode that also collected a random-access index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexedDecodeReport {
+    /// Scalar statistics for the verified decode.
+    pub decode: DecodeReport,
+    /// Random-access index built from authoritative decode boundaries.
+    pub index: GzipIndex,
+}
+
+impl IndexedDecodeReport {
+    /// Returns the scalar decode report.
+    #[must_use]
+    pub const fn report(&self) -> &DecodeReport {
+        &self.decode
+    }
+
+    /// Returns the collected random-access index.
+    #[must_use]
+    pub const fn index(&self) -> &GzipIndex {
+        &self.index
+    }
+
+    /// Separates the scalar report from the owning index.
+    #[must_use]
+    pub fn into_parts(self) -> (DecodeReport, GzipIndex) {
+        (self.decode, self.index)
+    }
+}
+
+impl AsRef<DecodeReport> for IndexedDecodeReport {
+    fn as_ref(&self) -> &DecodeReport {
+        &self.decode
+    }
+}
+
+/// Failure of an operation that decodes and builds an index.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum IndexingError {
+    /// The compressed input could not be decoded and verified.
+    Decode(DecodeError),
+    /// The index could not be constructed or finalized.
+    Index(IndexError),
+}
+
+impl IndexingError {
+    pub(crate) fn to_io_error(&self) -> io::Error {
+        match self {
+            Self::Decode(error) => error.to_io_error(),
+            Self::Index(_) => io::Error::other(self.clone()),
+        }
+    }
+}
+
+impl From<DecodeError> for IndexingError {
+    fn from(error: DecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+impl From<IndexError> for IndexingError {
+    fn from(error: IndexError) -> Self {
+        Self::Index(error)
+    }
+}
+
+impl Display for IndexingError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decode(error) => Display::fmt(error, formatter),
+            Self::Index(error) => write!(formatter, "index construction failed: {error}"),
+        }
+    }
+}
+
+impl Error for IndexingError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Decode(error) => Some(error),
+            Self::Index(error) => Some(error),
+        }
+    }
 }

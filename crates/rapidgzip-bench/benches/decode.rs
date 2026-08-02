@@ -1,7 +1,7 @@
 //! Public-reader throughput benchmark.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rapidgzip_core::Decoder;
+use rapidgzip_core::{Decoder, IndexOptions};
 use std::io;
 use std::sync::Arc;
 
@@ -46,6 +46,26 @@ fn decode_reader(criterion: &mut Criterion) {
                 bencher.iter(|| {
                     let mut reader = decoder.reader(Arc::clone(&compressed)).unwrap();
                     io::copy(&mut reader, &mut io::sink()).unwrap()
+                });
+            },
+        );
+    }
+    group.finish();
+
+    let mut group = criterion.benchmark_group("decoder_reader_stored_with_index");
+    group.throughput(Throughput::Bytes(decoded.len() as u64));
+    for threads in [1, 4, 16, 44] {
+        let decoder = Decoder::builder().decoder_threads(threads).build().unwrap();
+        group.bench_with_input(
+            BenchmarkId::from_parameter(threads),
+            &threads,
+            |bencher, _| {
+                bencher.iter(|| {
+                    let mut reader = decoder
+                        .reader_with_index(Arc::clone(&compressed), IndexOptions::default())
+                        .unwrap();
+                    io::copy(&mut reader, &mut io::sink()).unwrap();
+                    reader.finish().unwrap()
                 });
             },
         );

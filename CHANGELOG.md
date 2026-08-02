@@ -7,6 +7,19 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Explicit random-access indexing operations for positional and non-seekable
+  push/pull decoding, returning `IndexedDecodeReport` while preserving the
+  existing `Copy` `DecodeReport` and zero-indexing default path. The new
+  `IndexingDecoderReader` remains `Read + Send` and exposes the same runtime
+  telemetry and worker controls as `DecoderReader`.
+- A validated `GzipIndex` model with explicit member/header/DEFLATE checkpoint
+  provenance, bounded native and external-format parsing, optional compressed
+  32 KiB predecessor windows, and import/export for native version 1,
+  indexed_gzip GZIDX, htslib BGZF `.gzi`, and gztool formats.
+- `IndexedReader`, a `Read + Seek` view that checks source-size provenance,
+  strictly handles truncation and trailing data, fully verifies members entered
+  at member checkpoints, and documents the checksum limitation when a foreign
+  index resumes inside a member.
 - Decoding of non-seekable compressed input through `Decoder::decode_stream`
   and `Decoder::stream_reader`, which accept any `std::io::Read` and mirror
   `Decoder::decode` and `Decoder::reader`. `Decoder::open` and the new push

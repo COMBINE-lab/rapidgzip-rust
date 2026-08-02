@@ -1,7 +1,8 @@
 //! Building blocks for rapidgzip's speculative marker/window algorithm.
 //!
 //! These types are public only as a module for architectural documentation and
-//! focused benchmarking; the stable decoder API does not expose block indexes.
+//! focused benchmarking; the stable decoder API exposes only validated
+//! [`crate::GzipIndex`] checkpoints, not these internal speculative blocks.
 
 pub(crate) mod adaptive;
 pub(crate) mod deflate;

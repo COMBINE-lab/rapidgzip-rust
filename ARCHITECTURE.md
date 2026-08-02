@@ -26,10 +26,12 @@ sequential core as a resumable state machine, described below.
 ## Non-seekable input
 
 `rapidgzip-core` also accepts a plain `std::io::Read`. Such a source cannot be
-indexed, probed, or revisited, so paths 2 through 5 are all unreachable: each
-one begins by reading headers or block boundaries scattered across the file
-before it decodes anything. Path 1 is reachable, because it only ever moves
-forward.
+pre-indexed, probed, or revisited, so paths 2 through 5 are all unreachable:
+each one begins by reading headers or block boundaries scattered across the
+file before it decodes anything. Path 1 is reachable, because it only ever
+moves forward. An explicit indexing operation can nevertheless record member
+boundaries as they are decoded; that coarser index is useful later with a
+stable positional copy of the same compressed bytes.
 
 Both cursors implement one internal `InputCursor` trait, which is the exact set
 of forward operations path 1 and the member-header parser use: current offset,
@@ -69,6 +71,32 @@ semantics while still exposing the concurrency actually in use.
 is insufficient: block and character devices can implement seek while lacking
 the stable, known-length, concurrently readable snapshot required by `ReadAt`.
 Every non-regular path accepted by `File::open` uses the streaming engine.
+
+## Random-access index construction
+
+Indexing is selected by operation (`decode_with_index` or
+`reader_with_index`), not stored as decoder configuration. Existing calls do
+not allocate an index, copy predecessor windows, or change their `Copy`
+`DecodeReport` result. Indexed calls own a decode-local collector that is
+separate from `RuntimeState`, so telemetry and adaptive scheduling do not
+retain or compress checkpoint data.
+
+Each path publishes only boundaries it can prove in output order. Sequential
+decoding records parsed member payload/header pairs. BGZF records every
+non-empty independently framed block. Stored streams additionally record
+zero-history stored-block starts. Dense-member workers expose a member only
+after its footer is authenticated and exact adjacency is accepted by the
+coordinator. The marker/window coordinator records a raw DEFLATE block only
+after resolving its complete 32 KiB predecessor history. Interior candidates
+are thinned by requested decompressed spacing before window compression.
+
+`CheckpointKind` distinguishes gzip-header positions, raw member-payload
+positions with retained header provenance, and interior DEFLATE block
+positions. `IndexedReader` therefore never guesses from gzip-like bytes. It
+fully checks CRC32 and ISIZE when it resumes at a member checkpoint; a foreign
+interior index cannot authenticate the skipped prefix of that member, but every
+later member is fully checked. Index parsers have explicit count and aggregate
+window limits, and source-size metadata is checked before indexed reads begin.
 
 ## Marker/window algorithm
 

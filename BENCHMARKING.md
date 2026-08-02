@@ -9,7 +9,11 @@ cargo bench --locked -p rapidgzip-bench
 
 The Criterion benchmark drains the public `DecoderReader`, so channel
 handoff, ordered assembly, verification, and the unavoidable `Read` copy are
-included.
+included. Its paired `decoder_reader_stored_with_index` group runs the same
+thread cells through `reader_with_index` and finalizes the returned index; the
+ratio between the two groups isolates indexing overhead on identical data.
+Record checkpoint count, serialized native-index size, and peak RSS alongside
+throughput when evaluating a release candidate.
 
 The unpublished telemetry sampler drains the same reader while recording its
 elastic worker state:
