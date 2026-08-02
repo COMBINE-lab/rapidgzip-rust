@@ -46,6 +46,12 @@ pub(crate) trait InputCursor {
     /// there is nothing to re-check.
     fn verify_source_unchanged(&self) -> Result<(), DecodeError>;
 
+    /// Returns the next two bytes without consuming them.
+    ///
+    /// `None` means the input ended before a complete two-byte prefix. Stream
+    /// implementations must continue across legal short reads.
+    fn peek_two(&mut self) -> Result<Option<[u8; 2]>, DecodeError>;
+
     /// Consumes one byte, reporting truncation at `truncated_at` on exhaustion.
     fn byte(&mut self, truncated_at: u64) -> Result<u8, DecodeError> {
         let Some(&byte) = self.available()?.first() else {
@@ -87,6 +93,10 @@ impl<T: InputCursor + ?Sized> InputCursor for &mut T {
 
     fn verify_source_unchanged(&self) -> Result<(), DecodeError> {
         (**self).verify_source_unchanged()
+    }
+
+    fn peek_two(&mut self) -> Result<Option<[u8; 2]>, DecodeError> {
+        (**self).peek_two()
     }
 }
 
@@ -201,6 +211,32 @@ impl<R: ReadAt + ?Sized> InputCursor for SourceCursor<'_, R> {
         }
         Ok(())
     }
+
+    fn peek_two(&mut self) -> Result<Option<[u8; 2]>, DecodeError> {
+        if self.length.saturating_sub(self.position) < 2 {
+            return Ok(None);
+        }
+        let mut prefix = [0_u8; 2];
+        let mut filled = 0;
+        while filled < prefix.len() {
+            let offset = self.position + filled as u64;
+            let read = self
+                .source
+                .read_at(offset, &mut prefix[filled..])
+                .map_err(|error| DecodeError::input_io(offset, error))?;
+            if read == 0 {
+                return Err(DecodeError::input_io(
+                    offset,
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "positional source ended before its snapshotted length",
+                    ),
+                ));
+            }
+            filled += read;
+        }
+        Ok(Some(prefix))
+    }
 }
 
 /// Buffered forward-only cursor over a non-seekable byte stream.
@@ -221,7 +257,9 @@ impl<R: Read> StreamCursor<R> {
     pub(crate) fn new(source: R, page_size: usize) -> Self {
         Self {
             source,
-            buffer: vec![0; page_size.max(1)],
+            // Two bytes are the minimum needed for exact, non-consuming
+            // format detection even when the requested page is one byte.
+            buffer: vec![0; page_size.max(2)],
             consumed: 0,
             filled: 0,
             position: 0,
@@ -266,8 +304,12 @@ impl<R: Read> StreamCursor<R> {
     ///
     /// Only meaningful before anything has been consumed, which is exactly when
     /// [`validate_initial_stream_header`] runs.
-    fn buffered(&self) -> &[u8] {
+    pub(crate) fn buffered(&self) -> &[u8] {
         &self.buffer[self.consumed..self.filled]
+    }
+
+    pub(crate) const fn stream_ended(&self) -> bool {
+        self.at_end
     }
 }
 
@@ -300,6 +342,20 @@ impl<R: Read> InputCursor for StreamCursor<R> {
         // loop has already refused to stop anywhere except a verified member
         // boundary.
         Ok(())
+    }
+
+    fn peek_two(&mut self) -> Result<Option<[u8; 2]>, DecodeError> {
+        while self.filled - self.consumed < 2 && !self.at_end {
+            self.refill()?;
+        }
+        if self.filled - self.consumed < 2 {
+            Ok(None)
+        } else {
+            Ok(Some([
+                self.buffer[self.consumed],
+                self.buffer[self.consumed + 1],
+            ]))
+        }
     }
 }
 
@@ -337,6 +393,11 @@ impl InputCursor for SliceCursor<'_> {
 
     fn verify_source_unchanged(&self) -> Result<(), DecodeError> {
         Ok(())
+    }
+
+    fn peek_two(&mut self) -> Result<Option<[u8; 2]>, DecodeError> {
+        let remaining = &self.bytes[self.position.min(self.bytes.len())..];
+        Ok((remaining.len() >= 2).then(|| [remaining[0], remaining[1]]))
     }
 }
 
@@ -475,14 +536,6 @@ pub(crate) fn parse_member_header<C: InputCursor>(
     })
 }
 
-pub(crate) fn validate_initial_header<R: ReadAt + ?Sized>(
-    source: &R,
-    page_size: usize,
-) -> Result<(), DecodeError> {
-    let mut cursor = SourceCursor::new(source, page_size)?;
-    parse_member_header(&mut cursor, true).map(|_| ())
-}
-
 /// Validates the first member header against a stream's buffered prefix.
 ///
 /// The prefix is inspected in place, so nothing is consumed and the cursor is
@@ -494,6 +547,7 @@ pub(crate) fn validate_initial_header<R: ReadAt + ?Sized>(
 /// here. That case is reported as `Ok(())` and left to the decode itself, which
 /// sees the whole header, rather than being mistaken for truncation. Genuine
 /// truncation is distinguished by the stream having already reached its end.
+#[cfg(test)]
 pub(crate) fn validate_initial_stream_header<R: Read>(
     cursor: &mut StreamCursor<R>,
 ) -> Result<(), DecodeError> {

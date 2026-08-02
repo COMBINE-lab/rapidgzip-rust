@@ -1,10 +1,23 @@
-//! Parallel, verified gzip decompression.
+//! Parallel decoding of gzip, zlib, and raw DEFLATE.
 //!
-//! `rapidgzip-core` decodes single-member gzip, concatenated gzip, and BGZF.
-//! It follows rapidgzip's marker/window algorithm for parallel decoding of
-//! ordinary DEFLATE streams and uses zlib-rs as its inflate backend. Encoding
-//! is outside this crate's current scope. Index construction, persistence, and
-//! decoded-output seeking are available through explicit opt-in APIs.
+//! `rapidgzip-core` decodes single-member and concatenated gzip, BGZF, zlib,
+//! and raw DEFLATE. It follows rapidgzip's marker/window algorithm for parallel
+//! decoding and uses zlib-rs as its inflate backend. Encoding is outside this
+//! crate's current scope. Index construction, persistence, and decoded-output
+//! seeking are available through explicit opt-in APIs.
+//!
+//! # Formats
+//!
+//! Strict [`Format::Gzip`] is the default. [`DecoderBuilder::format`] selects
+//! zlib or raw DEFLATE explicitly; [`DecoderBuilder::auto_detect_format`]
+//! recognizes gzip or zlib without consuming their prefix. Raw DEFLATE has no
+//! identifying header and is never guessed.
+//!
+//! Gzip checks every member's CRC32 and ISIZE. Zlib validates CMF/FLG, enforces
+//! its declared history window, and checks Adler-32. Raw DEFLATE has no
+//! checksum, so success establishes structural validity and exact source
+//! consumption. [`DecoderBuilder::expected_uncompressed_size`] can require an
+//! exact decoded size for any format.
 //!
 //! # Output interfaces
 //!
@@ -37,12 +50,11 @@
 //!
 //! # Verification and errors
 //!
-//! Every member is accepted only after an actual final DEFLATE block and a
-//! matching CRC32 and ISIZE footer. Reaching reader EOF or receiving a
-//! successful [`DecodeReport`] means the complete compressed input was
-//! verified. Dropping a [`DecoderReader`] before EOF cancels the unread work;
+//! Reaching reader EOF or receiving a successful [`DecodeReport`] means the
+//! complete compressed input passed every check carried by its selected
+//! container. Dropping a [`DecoderReader`] before EOF cancels the unread work;
 //! call [`DecoderReader::finish`] when decoded bytes are no longer needed but
-//! complete verification is.
+//! complete validation is.
 //!
 //! Decoding can emit a verified prefix before discovering later corruption or
 //! an I/O failure. Previously written or read bytes are not rolled back.
@@ -62,11 +74,11 @@
 //! [`std::fs::File::open`], such as FIFOs and character devices, to the same
 //! sequential engine.
 //!
-//! Verification is identical: such a source runs the same sequential zlib-rs
-//! path that the parallel paths use as their authoritative fallback, sharing its
-//! member framing, footer checks, trailing-garbage detection, and output limit.
-//! It is not decoded in parallel, because every parallel path needs positional
-//! reads. Telemetry retains the builder's configured worker budget while
+//! Validation is identical: such a source runs the same sequential zlib-rs
+//! path that the parallel paths use as their authoritative fallback, sharing
+//! framing, trailer checks, trailing-data detection, and output bounds. It is
+//! not decoded in parallel, because every parallel path needs positional reads.
+//! Telemetry retains the builder's configured worker budget while
 //! reporting an effective target of one and zero spawned decoder/auxiliary
 //! threads. Nothing is spooled: input memory is one
 //! [`DecoderBuilder::input_page_size`] window. [`DecoderReader`] advances the
@@ -84,16 +96,17 @@
 //! # Random access
 //!
 //! [`Decoder::decode_with_index`] and [`Decoder::reader_with_index`] collect a
-//! [`GzipIndex`] only when requested, leaving [`DecodeReport`] small and
+//! [`DeflateIndex`] only when requested, leaving [`DecodeReport`] small and
 //! [`Copy`]. The streaming counterparts collect a coarser member-boundary index
-//! while reading a forward-only source. Indexes can be persisted in the native,
-//! indexed_gzip GZIDX, htslib BGZF `.gzi`, and gztool formats.
+//! while reading a forward-only source. The native format represents every
+//! supported container; GZIDX, htslib BGZF `.gzi`, and gztool are gzip-family
+//! formats and reject incompatible export.
 //!
 //! [`IndexedReader`] implements [`std::io::Read`] + [`std::io::Seek`] over a
-//! stable [`ReadAt`] source. Member checkpoints permit full footer verification;
-//! an imported interior checkpoint cannot authenticate bytes skipped earlier
-//! in that same member because external formats do not store prefix checksum
-//! state. Later members are fully verified.
+//! stable [`ReadAt`] source. Framing-start checkpoints permit complete gzip or
+//! zlib verification; an interior checkpoint cannot authenticate bytes skipped
+//! earlier because indexes do not store prefix checksum state. Raw DEFLATE has
+//! no checksum to authenticate.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
@@ -101,12 +114,14 @@ mod backend;
 mod config;
 mod crc32;
 mod error;
+mod format;
 mod gzip;
 mod indexed;
 mod inflate;
 mod read_at;
 mod reader;
 mod runtime;
+mod zlib;
 
 pub mod index;
 pub mod parallel;
@@ -114,10 +129,12 @@ pub mod parallel;
 pub use config::{ConfigError, Decoder, DecoderBuilder};
 pub use error::{
     DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, IndexedDecodeReport, IndexingError,
+    ZlibErrorKind,
 };
+pub use format::Format;
 pub use index::{
-    Checkpoint, CheckpointKind, GzipIndex, IndexError, IndexKind, IndexOptions, IndexReadOptions,
-    StoredWindow, WindowMap, WindowStorage,
+    Checkpoint, CheckpointKind, DeflateIndex, IndexError, IndexKind, IndexOptions,
+    IndexReadOptions, StoredWindow, WindowMap, WindowStorage,
 };
 pub use indexed::{IndexedReader, IndexedReaderError};
 pub use read_at::ReadAt;

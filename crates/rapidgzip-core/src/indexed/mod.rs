@@ -1,11 +1,12 @@
-//! Random access to decompressed data through a [`GzipIndex`].
+//! Random access to decompressed data through a [`DeflateIndex`].
 
 mod window;
 
 use crate::crc32::Crc32;
 use crate::gzip::{SourceCursor, parse_member_header};
-use crate::index::{Checkpoint, CheckpointKind, GzipIndex, IndexError, WINDOW_SIZE};
+use crate::index::{Checkpoint, CheckpointKind, DeflateIndex, IndexError, IndexKind, WINDOW_SIZE};
 use crate::inflate::RawInflater;
+use crate::zlib::{self, Adler32};
 use crate::{DecodeError, ReadAt};
 use libz_rs_sys as z;
 use std::error::Error;
@@ -32,7 +33,7 @@ pub enum IndexedReaderError {
 impl Display for IndexedReaderError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Index(error) => write!(formatter, "invalid gzip index: {error}"),
+            Self::Index(error) => write!(formatter, "invalid DEFLATE index: {error}"),
             Self::Decode(error) => {
                 write!(formatter, "could not initialize indexed decode: {error}")
             }
@@ -63,41 +64,48 @@ impl From<DecodeError> for IndexedReaderError {
     }
 }
 
-struct Verification {
-    crc: Crc32,
-    output_size: u32,
+enum Verification {
+    Gzip { crc: Crc32, output_size: u32 },
+    Zlib(Adler32),
 }
 
 impl Verification {
-    const fn new() -> Self {
-        Self {
+    const fn gzip() -> Self {
+        Self::Gzip {
             crc: Crc32::new(),
             output_size: 0,
         }
     }
 
+    const fn zlib() -> Self {
+        Self::Zlib(Adler32::new())
+    }
+
     fn update(&mut self, bytes: &[u8]) {
-        self.crc.update(bytes);
-        self.output_size = self.output_size.wrapping_add(bytes.len() as u32);
+        match self {
+            Self::Gzip { crc, output_size } => {
+                crc.update(bytes);
+                *output_size = output_size.wrapping_add(bytes.len() as u32);
+            }
+            Self::Zlib(checksum) => checksum.update(bytes),
+        }
     }
 }
 
 /// A [`Read`] and [`Seek`] view of decompressed bytes described by an index.
 ///
 /// Seeking resumes at the nearest preceding checkpoint and discards output up
-/// to the requested byte. A member entered through a member checkpoint is
-/// fully CRC32/ISIZE verified, including bytes discarded during seeking. A
-/// member entered through an interior DEFLATE checkpoint cannot authenticate
-/// the skipped prefix because foreign index formats do not store its checksum
-/// state; its footer is still read structurally, and every later member is
-/// fully verified after its header is crossed.
+/// to the requested byte. Gzip-member and zlib-header checkpoints permit full
+/// checksum verification, including discarded bytes. An interior DEFLATE
+/// checkpoint cannot authenticate the skipped prefix because the index does
+/// not store its checksum state. Raw DEFLATE has no container checksum.
 ///
 /// The index is validated and a known compressed size is compared with the
 /// source before construction succeeds. Callers remain responsible for pairing
 /// indexes without a recorded size with the source from which they were built.
 pub struct IndexedReader<R: ReadAt> {
     source: R,
-    index: GzipIndex,
+    index: DeflateIndex,
     source_length: u64,
     inflater: RawInflater,
     windows: WindowCache,
@@ -109,6 +117,7 @@ pub struct IndexedReader<R: ReadAt> {
     position: u64,
     state: State,
     verification: Option<Verification>,
+    window_bits: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,7 +135,7 @@ impl<R: ReadAt> IndexedReader<R> {
     /// Returns an error when the index violates its invariants, the source
     /// length cannot be read or disagrees with a known index size, or the raw
     /// inflate backend cannot be initialized.
-    pub fn new(source: R, index: GzipIndex) -> Result<Self, IndexedReaderError> {
+    pub fn new(source: R, index: DeflateIndex) -> Result<Self, IndexedReaderError> {
         index.validate()?;
         let source_length = source
             .len()
@@ -139,11 +148,18 @@ impl<R: ReadAt> IndexedReader<R> {
                 }));
             }
         }
+        let window_bits = if index.kind() == IndexKind::Zlib {
+            let header = read_exact_from_source::<2, _>(&source, 0)
+                .map_err(|error| IndexedReaderError::Io(Arc::new(error)))?;
+            zlib::parse_header(header, 0)?
+        } else {
+            15
+        };
         Ok(Self {
             source,
             index,
             source_length,
-            inflater: RawInflater::new()?,
+            inflater: RawInflater::new_with_window_bits(window_bits)?,
             windows: WindowCache::new(DEFAULT_BUDGET),
             input: Vec::new(),
             input_position: 0,
@@ -153,6 +169,7 @@ impl<R: ReadAt> IndexedReader<R> {
             position: 0,
             state: State::NeedsResume,
             verification: None,
+            window_bits,
         })
     }
 
@@ -165,7 +182,7 @@ impl<R: ReadAt> IndexedReader<R> {
 
     /// Returns the index backing this reader.
     #[must_use]
-    pub const fn index(&self) -> &GzipIndex {
+    pub const fn index(&self) -> &DeflateIndex {
         &self.index
     }
 
@@ -176,7 +193,7 @@ impl<R: ReadAt> IndexedReader<R> {
     }
 
     /// Returns the source and index, discarding decoding state.
-    pub fn into_inner(self) -> (R, GzipIndex) {
+    pub fn into_inner(self) -> (R, DeflateIndex) {
         (self.source, self.index)
     }
 
@@ -226,7 +243,7 @@ impl<R: ReadAt> IndexedReader<R> {
             if read == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "truncated gzip member footer",
+                    "truncated compressed-stream framing",
                 ));
             }
             filled += read;
@@ -265,16 +282,16 @@ impl<R: ReadAt> IndexedReader<R> {
         }
 
         self.inflater
-            .reset(bit_offset)
+            .reset_with_window_bits(self.window_bits, bit_offset)
             .map_err(|error| error.to_io_error())?;
         let mut start = byte_offset;
         let window = self.expanded_window(&checkpoint)?;
         self.verification = match checkpoint.kind {
-            CheckpointKind::MemberHeader => {
+            CheckpointKind::GzipMemberHeader => {
                 start = self.parse_member_header(byte_offset)?;
-                Some(Verification::new())
+                Some(Verification::gzip())
             }
-            CheckpointKind::MemberDeflate {
+            CheckpointKind::GzipMemberDeflate {
                 header_offset_in_bytes,
             } => {
                 let parsed_start = self.parse_member_header(header_offset_in_bytes)?;
@@ -284,8 +301,22 @@ impl<R: ReadAt> IndexedReader<R> {
                         "member checkpoint does not match the parsed gzip header",
                     ));
                 }
-                Some(Verification::new())
+                Some(Verification::gzip())
             }
+            CheckpointKind::ZlibHeader => {
+                let header = self.read_exact_at::<2>(byte_offset)?;
+                let parsed_window =
+                    zlib::parse_header(header, byte_offset).map_err(|error| error.to_io_error())?;
+                if parsed_window != self.window_bits {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "zlib header window changed after reader construction",
+                    ));
+                }
+                start = byte_offset + 2;
+                Some(Verification::zlib())
+            }
+            CheckpointKind::RawDeflateStart => None,
             CheckpointKind::DeflateBlock => {
                 let remainder = (bit_offset % 8) as u8;
                 if remainder != 0 {
@@ -299,8 +330,10 @@ impl<R: ReadAt> IndexedReader<R> {
             }
         };
         if !window.is_empty() {
+            let allowed = 1_usize << self.window_bits;
+            let window = &window[window.len().saturating_sub(allowed)..];
             self.inflater
-                .set_dictionary_bytes(&window, bit_offset)
+                .set_dictionary_bytes(window, bit_offset)
                 .map_err(|error| error.to_io_error())?;
         }
         self.read_input_page(start)?;
@@ -420,7 +453,7 @@ impl<R: ReadAt> IndexedReader<R> {
                 "DEFLATE decoder made no progress",
             )),
             z::Z_STREAM_END => {
-                self.finish_member()?;
+                self.finish_stream()?;
                 Ok(produced)
             }
             z::Z_DATA_ERROR => Err(io::Error::new(
@@ -435,13 +468,31 @@ impl<R: ReadAt> IndexedReader<R> {
         }
     }
 
-    fn finish_member(&mut self) -> io::Result<()> {
-        let footer_offset = self.next_input - (self.input.len() - self.input_position) as u64;
+    fn finish_stream(&mut self) -> io::Result<()> {
+        let trailer_offset = self.next_input - (self.input.len() - self.input_position) as u64;
+        match self.index.kind() {
+            IndexKind::Gzip | IndexKind::Bgzf => self.finish_gzip_member(trailer_offset),
+            IndexKind::Zlib => self.finish_zlib_stream(trailer_offset),
+            IndexKind::RawDeflate => {
+                if trailer_offset != self.source_length {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "trailing data after raw DEFLATE stream",
+                    ));
+                }
+                self.verification = None;
+                self.state = State::Ended;
+                Ok(())
+            }
+        }
+    }
+
+    fn finish_gzip_member(&mut self, footer_offset: u64) -> io::Result<()> {
         let footer = self.read_exact_at::<8>(footer_offset)?;
-        if let Some(verification) = self.verification.take() {
+        if let Some(Verification::Gzip { crc, output_size }) = self.verification.take() {
             let expected_crc = u32::from_le_bytes(footer[..4].try_into().expect("four bytes"));
             let expected_size = u32::from_le_bytes(footer[4..].try_into().expect("four bytes"));
-            let actual_crc = verification.crc.finish();
+            let actual_crc = crc.finish();
             if expected_crc != actual_crc {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -450,12 +501,12 @@ impl<R: ReadAt> IndexedReader<R> {
                     ),
                 ));
             }
-            if expected_size != verification.output_size {
+            if expected_size != output_size {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "gzip ISIZE mismatch: expected {expected_size}, got {}",
-                        verification.output_size
+                        output_size
                     ),
                 ));
             }
@@ -478,11 +529,57 @@ impl<R: ReadAt> IndexedReader<R> {
         self.inflater
             .reset(deflate_start.saturating_mul(8))
             .map_err(|error| error.to_io_error())?;
-        self.verification = Some(Verification::new());
+        self.verification = Some(Verification::gzip());
         self.read_input_page(deflate_start)?;
         self.state = State::Running;
         Ok(())
     }
+
+    fn finish_zlib_stream(&mut self, trailer_offset: u64) -> io::Result<()> {
+        let trailer = self.read_exact_at::<4>(trailer_offset)?;
+        if let Some(Verification::Zlib(checksum)) = self.verification.take() {
+            let expected = u32::from_be_bytes(trailer);
+            let actual = checksum.finish();
+            if expected != actual {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "zlib Adler-32 mismatch: expected {expected:#010x}, got {actual:#010x}"
+                    ),
+                ));
+            }
+        }
+        let end = trailer_offset.checked_add(4).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "zlib trailer offset overflow")
+        })?;
+        if end != self.source_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trailing data after zlib stream",
+            ));
+        }
+        self.state = State::Ended;
+        Ok(())
+    }
+}
+
+fn read_exact_from_source<const N: usize, R: ReadAt>(
+    source: &R,
+    offset: u64,
+) -> io::Result<[u8; N]> {
+    let mut bytes = [0_u8; N];
+    let mut filled = 0;
+    while filled < N {
+        let read = source.read_at(offset + filled as u64, &mut bytes[filled..])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "compressed source ended before the requested framing bytes",
+            ));
+        }
+        filled += read;
+    }
+    Ok(bytes)
 }
 
 impl<R: ReadAt> Read for IndexedReader<R> {

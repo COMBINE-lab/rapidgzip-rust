@@ -1,6 +1,9 @@
 use crate::config::Config;
 use crate::crc32::Crc32;
-use crate::gzip::{InputCursor, MemberHeader, SourceCursor, StreamCursor, parse_member_header};
+use crate::format::{self, FormatSelection};
+use crate::gzip::{
+    InputCursor, MemberHeader, SliceCursor, SourceCursor, StreamCursor, parse_member_header,
+};
 use crate::index::{
     Checkpoint, CheckpointKind, IndexCollector, IndexKind, IndexOptions, WINDOW_SIZE,
 };
@@ -12,9 +15,10 @@ use crate::parallel::deflate::{
     find_next_structural_candidate,
 };
 use crate::runtime::{DecoderPath, RuntimeState};
+use crate::zlib::{self, Adler32};
 use crate::{
-    DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, IndexedDecodeReport, IndexingError,
-    ReadAt,
+    DecodeError, DecodeReport, DeflateErrorKind, Format, GzipErrorKind, IndexedDecodeReport,
+    IndexingError, ReadAt, ZlibErrorKind,
 };
 use crossbeam_deque::{Injector, Steal};
 use libz_rs_sys as z;
@@ -59,6 +63,100 @@ impl<W: Write> Output for DirectOutput<'_, W> {
         chunk.clear();
         Ok(chunk)
     }
+}
+
+fn resolve_cursor_format<C: InputCursor>(
+    cursor: &mut C,
+    selection: FormatSelection,
+) -> Result<Format, DecodeError> {
+    match selection {
+        FormatSelection::Explicit(format) => Ok(format),
+        FormatSelection::Auto => cursor
+            .peek_two()?
+            .and_then(format::detect)
+            .ok_or(DecodeError::UnrecognizedFormat),
+    }
+}
+
+fn read_zlib_header<C: InputCursor>(cursor: &mut C) -> Result<(u64, u8), DecodeError> {
+    let offset = cursor.position();
+    let mut bytes = [0_u8; 2];
+    for byte in &mut bytes {
+        let Some(&value) = cursor.available()?.first() else {
+            return Err(DecodeError::InvalidZlib {
+                offset,
+                reason: ZlibErrorKind::Truncated,
+            });
+        };
+        cursor.advance(1);
+        *byte = value;
+    }
+    Ok((offset, zlib::parse_header(bytes, offset)?))
+}
+
+/// Performs complete fail-fast framing validation for a positional source.
+pub(crate) fn validate_initial_source<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+) -> Result<(), DecodeError> {
+    let mut cursor = SourceCursor::new(source, config.input_page_size)?;
+    match resolve_cursor_format(&mut cursor, config.format)? {
+        Format::Gzip => parse_member_header(&mut cursor, true).map(|_| ()),
+        Format::Zlib => read_zlib_header(&mut cursor).map(|_| ()),
+        Format::RawDeflate => Ok(()),
+    }
+}
+
+/// Performs best-effort fail-fast validation without consuming a stream.
+pub(crate) fn validate_initial_stream<R: Read>(
+    cursor: &mut StreamCursor<R>,
+    config: &Config,
+) -> Result<(), DecodeError> {
+    // One source read preserves the constructor's best-effort contract. The
+    // authoritative decoder later handles short reads until it has two bytes.
+    cursor.available()?;
+    let ended = cursor.stream_ended();
+    let prefix = cursor.buffered();
+    let format = match config.format {
+        FormatSelection::Explicit(Format::RawDeflate) => return Ok(()),
+        FormatSelection::Explicit(format) => format,
+        FormatSelection::Auto if prefix.len() >= 2 => {
+            format::detect([prefix[0], prefix[1]]).ok_or(DecodeError::UnrecognizedFormat)?
+        }
+        FormatSelection::Auto if ended => return Err(DecodeError::UnrecognizedFormat),
+        FormatSelection::Auto => return Ok(()),
+    };
+
+    match format {
+        Format::RawDeflate => Ok(()),
+        Format::Zlib if prefix.len() >= 2 => {
+            zlib::parse_header([prefix[0], prefix[1]], 0).map(|_| ())
+        }
+        Format::Zlib if ended => Err(DecodeError::InvalidZlib {
+            offset: 0,
+            reason: ZlibErrorKind::Truncated,
+        }),
+        Format::Zlib => Ok(()),
+        Format::Gzip => {
+            let mut buffered = SliceCursor::new(prefix);
+            match parse_member_header(&mut buffered, true) {
+                Ok(_) => Ok(()),
+                Err(DecodeError::InvalidGzip {
+                    reason: GzipErrorKind::Truncated | GzipErrorKind::UnterminatedHeaderField,
+                    ..
+                }) if !ended => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+fn resolve_source_format<R: ReadAt + ?Sized>(
+    source: &R,
+    config: &Config,
+) -> Result<Format, DecodeError> {
+    let mut cursor = SourceCursor::new(source, config.input_page_size.min(256))?;
+    resolve_cursor_format(&mut cursor, config.format)
 }
 
 pub(crate) fn decode_source<R, O>(
@@ -108,6 +206,38 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
+    let format = resolve_source_format(source, config)?;
+    if format != Format::Gzip {
+        if let Some(collector) = collector {
+            collector.set_kind(match format {
+                Format::Zlib => IndexKind::Zlib,
+                Format::RawDeflate => IndexKind::RawDeflate,
+                Format::Gzip => IndexKind::Gzip,
+            });
+        }
+        let source_length = source
+            .len()
+            .map_err(|error| DecodeError::input_io(0, error))?;
+        let parallel_threshold = (config.compressed_chunk_size as u64).saturating_mul(2);
+        if config.decoder_threads > 1 && source_length >= parallel_threshold {
+            runtime.set_path(DecoderPath::MarkerWindow);
+            return decode_estimated(
+                source,
+                config,
+                cancelled,
+                output,
+                runtime,
+                collector,
+                EstimatedDecode {
+                    compressed_chunk_size: config.compressed_chunk_size,
+                    format,
+                },
+            );
+        }
+        runtime.set_path(DecoderPath::Sequential);
+        runtime.set_adaptive_target(1);
+        return decode_source_sequential(source, config, cancelled, output, runtime, collector);
+    }
     // BGZF block starts are normally tens of KiB apart and only their short
     // headers are needed for indexing. A small page avoids reading the
     // complete compressed payload before decoding.
@@ -142,8 +272,17 @@ where
         }
         let grid_size = adjusted_compressed_chunk_size(source, config)?;
         runtime.set_path(DecoderPath::MarkerWindow);
-        return decode_rapidgzip_estimated(
-            source, config, cancelled, output, grid_size, runtime, collector,
+        return decode_estimated(
+            source,
+            config,
+            cancelled,
+            output,
+            runtime,
+            collector,
+            EstimatedDecode {
+                compressed_chunk_size: grid_size,
+                format: Format::Gzip,
+            },
         );
     }
     runtime.set_path(DecoderPath::Sequential);
@@ -231,7 +370,7 @@ fn index_stored_stream<R: ReadAt + ?Sized>(
                 compressed_offset_in_bits: block_start.saturating_mul(8),
                 uncompressed_offset_in_bytes: total_decoded.saturating_add(u64::from(decoded_size)),
                 kind: if first_block {
-                    CheckpointKind::MemberDeflate {
+                    CheckpointKind::GzipMemberDeflate {
                         header_offset_in_bytes: header.start,
                     }
                 } else {
@@ -533,7 +672,9 @@ where
                 emit_accounted(decoded, config, output, &mut accounting, &mut total_output)?;
                 if task.last_in_member {
                     let member = index.members[task.member];
-                    let actual_crc = accounting.crc.finish();
+                    let (actual_crc, actual_size) = accounting
+                        .gzip_values()
+                        .expect("stored path uses gzip accounting");
                     if actual_crc != member.expected_crc {
                         stopped.store(true, Ordering::Relaxed);
                         return Err(DecodeError::ChecksumMismatch {
@@ -542,12 +683,12 @@ where
                             actual: actual_crc,
                         });
                     }
-                    if accounting.size != member.expected_size {
+                    if actual_size != member.expected_size {
                         stopped.store(true, Ordering::Relaxed);
                         return Err(DecodeError::SizeMismatch {
                             member: task.member as u64,
                             expected: member.expected_size,
-                            actual_mod32: accounting.size,
+                            actual_mod32: actual_size,
                         });
                     }
                     accounting = MemberAccounting::new();
@@ -580,11 +721,13 @@ where
         ));
     }
 
+    config.verify_expected_output(total_output)?;
     Ok(DecodeReport {
         compressed_bytes: index.compressed_size,
         decompressed_bytes: total_output,
         member_count: index.members.len() as u64,
         decoder_threads: config.decoder_threads,
+        format: Format::Gzip,
     })
 }
 
@@ -651,7 +794,7 @@ where
     )
 }
 
-/// Decodes a forward-only gzip stream while collecting a seek index.
+/// Decodes a forward-only selected stream while collecting a seek index.
 pub(crate) fn decode_stream_with_index<R, O>(
     cursor: &mut StreamCursor<R>,
     config: &Config,
@@ -688,25 +831,47 @@ where
 /// One increment of a sequential decode.
 ///
 /// The pull reader and the push decoder use the same resumable engine. Keeping
-/// the state transition below the output adapter ensures that member framing,
-/// DEFLATE errors, CRC32, ISIZE, concatenated members, and output limits cannot
+/// the state transition below the output adapter ensures that format
+/// resolution, framing, checksums, DEFLATE errors, and output bounds cannot
 /// diverge between the two public streaming APIs.
 pub(crate) enum SequentialItem {
     Chunk(Vec<u8>),
     Finished(DecodeReport),
 }
 
-struct SequentialMember {
-    header: MemberHeader,
+enum StreamChecksum {
+    Crc32(Crc32),
+    Adler32(Adler32),
+    None,
+}
+
+impl StreamChecksum {
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Crc32(checksum) => checksum.update(bytes),
+            Self::Adler32(checksum) => checksum.update(bytes),
+            Self::None => {}
+        }
+    }
+}
+
+struct SequentialStream {
+    deflate_start: u64,
     inflater: RawInflater,
-    crc: Crc32,
+    checksum: StreamChecksum,
     output_size: u32,
 }
 
 enum SequentialState {
-    Header,
-    Inflating(SequentialMember),
-    Footer { crc: Crc32, output_size: u32 },
+    Resolve,
+    GzipHeader,
+    ZlibHeader,
+    RawDeflateStart,
+    Inflating(SequentialStream),
+    FinishStream {
+        checksum: StreamChecksum,
+        output_size: u32,
+    },
     Failed(DecodeError),
     Finished(DecodeReport),
 }
@@ -725,6 +890,7 @@ pub(crate) struct SequentialDecoder<C> {
     decoder_threads: usize,
     runtime: Arc<RuntimeState>,
     collector: Option<Arc<IndexCollector>>,
+    format: Option<Format>,
     state: SequentialState,
 }
 
@@ -758,8 +924,23 @@ impl<C: InputCursor> SequentialDecoder<C> {
             decoder_threads,
             runtime: Arc::clone(runtime),
             collector: collector.cloned(),
-            state: SequentialState::Header,
+            format: None,
+            state: SequentialState::Resolve,
         }
+    }
+
+    fn finish_report(&mut self, format: Format) -> Result<DecodeReport, DecodeError> {
+        self.config.verify_expected_output(self.total_output)?;
+        self.cursor.verify_source_unchanged()?;
+        let report = DecodeReport {
+            compressed_bytes: self.cursor.position(),
+            decompressed_bytes: self.total_output,
+            member_count: self.member_count,
+            decoder_threads: self.decoder_threads,
+            format,
+        };
+        self.state = SequentialState::Finished(report);
+        Ok(report)
     }
 
     /// Advances until one decoded chunk or the verified terminal report exists.
@@ -777,9 +958,25 @@ impl<C: InputCursor> SequentialDecoder<C> {
                 return Err(DecodeError::Cancelled);
             }
 
-            let state = std::mem::replace(&mut self.state, SequentialState::Header);
+            let state = std::mem::replace(&mut self.state, SequentialState::Resolve);
             match state {
-                SequentialState::Header => {
+                SequentialState::Resolve => {
+                    let format = resolve_cursor_format(&mut self.cursor, self.config.format)?;
+                    self.format = Some(format);
+                    if let Some(collector) = &self.collector {
+                        collector.set_kind(match format {
+                            Format::Gzip => IndexKind::Gzip,
+                            Format::Zlib => IndexKind::Zlib,
+                            Format::RawDeflate => IndexKind::RawDeflate,
+                        });
+                    }
+                    self.state = match format {
+                        Format::Gzip => SequentialState::GzipHeader,
+                        Format::Zlib => SequentialState::ZlibHeader,
+                        Format::RawDeflate => SequentialState::RawDeflateStart,
+                    };
+                }
+                SequentialState::GzipHeader => {
                     if self.cursor.is_at_end()? {
                         if self.member_count == 0 {
                             return Err(DecodeError::InvalidGzip {
@@ -787,14 +984,7 @@ impl<C: InputCursor> SequentialDecoder<C> {
                                 reason: GzipErrorKind::BadMagic,
                             });
                         }
-                        self.cursor.verify_source_unchanged()?;
-                        let report = DecodeReport {
-                            compressed_bytes: self.cursor.position(),
-                            decompressed_bytes: self.total_output,
-                            member_count: self.member_count,
-                            decoder_threads: self.decoder_threads,
-                        };
-                        self.state = SequentialState::Finished(report);
+                        let report = self.finish_report(Format::Gzip)?;
                         return Ok(SequentialItem::Finished(report));
                     }
 
@@ -807,7 +997,7 @@ impl<C: InputCursor> SequentialDecoder<C> {
                             Checkpoint {
                                 compressed_offset_in_bits: header.deflate_start.saturating_mul(8),
                                 uncompressed_offset_in_bytes: self.total_output,
-                                kind: CheckpointKind::MemberDeflate {
+                                kind: CheckpointKind::GzipMemberDeflate {
                                     header_offset_in_bytes: header.start,
                                 },
                                 line_offset: None,
@@ -815,14 +1005,56 @@ impl<C: InputCursor> SequentialDecoder<C> {
                             &[],
                         );
                     }
-                    self.state = SequentialState::Inflating(SequentialMember {
-                        header,
+                    self.state = SequentialState::Inflating(SequentialStream {
+                        deflate_start: header.deflate_start,
                         inflater: RawInflater::new()?,
-                        crc: Crc32::new(),
+                        checksum: StreamChecksum::Crc32(Crc32::new()),
                         output_size: 0,
                     });
                 }
-                SequentialState::Inflating(mut member) => {
+                SequentialState::ZlibHeader => {
+                    let header_offset = self.cursor.position();
+                    let (_, window_bits) = read_zlib_header(&mut self.cursor)?;
+                    if let Some(collector) = &self.collector {
+                        collector.offer(
+                            Checkpoint {
+                                compressed_offset_in_bits: header_offset.saturating_mul(8),
+                                uncompressed_offset_in_bytes: self.total_output,
+                                kind: CheckpointKind::ZlibHeader,
+                                line_offset: None,
+                            },
+                            &[],
+                        );
+                    }
+                    let deflate_start = self.cursor.position();
+                    self.state = SequentialState::Inflating(SequentialStream {
+                        deflate_start,
+                        inflater: RawInflater::new_with_window_bits(window_bits)?,
+                        checksum: StreamChecksum::Adler32(Adler32::new()),
+                        output_size: 0,
+                    });
+                }
+                SequentialState::RawDeflateStart => {
+                    let deflate_start = self.cursor.position();
+                    if let Some(collector) = &self.collector {
+                        collector.offer(
+                            Checkpoint {
+                                compressed_offset_in_bits: deflate_start.saturating_mul(8),
+                                uncompressed_offset_in_bytes: self.total_output,
+                                kind: CheckpointKind::RawDeflateStart,
+                                line_offset: None,
+                            },
+                            &[],
+                        );
+                    }
+                    self.state = SequentialState::Inflating(SequentialStream {
+                        deflate_start,
+                        inflater: RawInflater::new()?,
+                        checksum: StreamChecksum::None,
+                        output_size: 0,
+                    });
+                }
+                SequentialState::Inflating(mut stream) => {
                     let (input_pointer, input_length) = {
                         let input = self.cursor.available()?;
                         if input.is_empty() {
@@ -837,61 +1069,49 @@ impl<C: InputCursor> SequentialDecoder<C> {
                         decoded.reserve_exact(self.config.decoded_chunk_size - decoded.capacity());
                     }
 
-                    member.inflater.stream.next_in = input_pointer;
-                    member.inflater.stream.avail_in = input_length as u32;
-                    member.inflater.stream.next_out =
+                    stream.inflater.stream.next_in = input_pointer;
+                    stream.inflater.stream.avail_in = input_length as u32;
+                    stream.inflater.stream.next_out =
                         decoded.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-                    member.inflater.stream.avail_out = decoded.capacity() as u32;
-                    let input_before = member.inflater.stream.avail_in;
-                    let output_before = member.inflater.stream.avail_out;
+                    stream.inflater.stream.avail_out = decoded.capacity() as u32;
+                    let input_before = stream.inflater.stream.avail_in;
+                    let output_before = stream.inflater.stream.avail_out;
 
                     // SAFETY:
                     // - `member.inflater.stream` is initialized and uniquely borrowed.
                     // - `next_in/avail_in` describe the cursor's stable current window.
                     // - `next_out/avail_out` describe the uniquely owned spare
                     //   capacity of `decoded`; the returned count is checked below.
-                    let status = unsafe { z::inflate(&mut member.inflater.stream, z::Z_NO_FLUSH) };
+                    let status = unsafe { z::inflate(&mut stream.inflater.stream, z::Z_NO_FLUSH) };
 
-                    let consumed = usize::try_from(input_before - member.inflater.stream.avail_in)
+                    let consumed = usize::try_from(input_before - stream.inflater.stream.avail_in)
                         .expect("zlib uInt fits usize");
                     let produced =
-                        usize::try_from(output_before - member.inflater.stream.avail_out)
+                        usize::try_from(output_before - stream.inflater.stream.avail_out)
                             .expect("zlib uInt fits usize");
                     // Do not retain borrowed pointers while the resumable
                     // inflater is idle or moved to another thread.
-                    member.inflater.stream.next_in = std::ptr::null();
-                    member.inflater.stream.avail_in = 0;
-                    member.inflater.stream.next_out = std::ptr::null_mut();
-                    member.inflater.stream.avail_out = 0;
+                    stream.inflater.stream.next_in = std::ptr::null();
+                    stream.inflater.stream.avail_in = 0;
+                    stream.inflater.stream.next_out = std::ptr::null_mut();
+                    stream.inflater.stream.avail_out = 0;
                     self.cursor.advance(consumed);
                     // SAFETY: zlib can reduce `avail_out` only after initializing
                     // those bytes, so exactly the first `produced` bytes are live.
                     unsafe { decoded.set_len(produced) };
 
                     if !decoded.is_empty() {
-                        let new_total = self.total_output.checked_add(decoded.len() as u64).ok_or(
-                            DecodeError::OutputLimitExceeded {
-                                limit: self.config.output_limit.unwrap_or(u64::MAX),
-                            },
-                        )?;
-                        if self
+                        self.total_output = self
                             .config
-                            .output_limit
-                            .is_some_and(|limit| new_total > limit)
-                        {
-                            return Err(DecodeError::OutputLimitExceeded {
-                                limit: self.config.output_limit.expect("checked as some"),
-                            });
-                        }
-                        self.total_output = new_total;
-                        member.output_size = member.output_size.wrapping_add(decoded.len() as u32);
-                        member.crc.update(&decoded);
+                            .checked_output_total(self.total_output, decoded.len())?;
+                        stream.output_size = stream.output_size.wrapping_add(decoded.len() as u32);
+                        stream.checksum.update(&decoded);
                     }
 
                     let transition = match status {
-                        z::Z_STREAM_END => Ok(SequentialState::Footer {
-                            crc: member.crc,
-                            output_size: member.output_size,
+                        z::Z_STREAM_END => Ok(SequentialState::FinishStream {
+                            checksum: stream.checksum,
+                            output_size: stream.output_size,
                         }),
                         z::Z_OK => {
                             if consumed == 0 && produced == 0 {
@@ -900,22 +1120,22 @@ impl<C: InputCursor> SequentialDecoder<C> {
                                     reason: DeflateErrorKind::Stalled,
                                 })
                             } else {
-                                Ok(SequentialState::Inflating(member))
+                                Ok(SequentialState::Inflating(stream))
                             }
                         }
                         z::Z_BUF_ERROR if consumed > 0 || produced > 0 => {
-                            Ok(SequentialState::Inflating(member))
+                            Ok(SequentialState::Inflating(stream))
                         }
                         z::Z_BUF_ERROR => Err(DecodeError::InvalidDeflate {
                             bit_offset: self.cursor.position().saturating_mul(8),
                             reason: DeflateErrorKind::Truncated,
                         }),
                         z::Z_NEED_DICT => Err(DecodeError::InvalidDeflate {
-                            bit_offset: member.header.deflate_start.saturating_mul(8),
+                            bit_offset: stream.deflate_start.saturating_mul(8),
                             reason: DeflateErrorKind::UnexpectedDictionary,
                         }),
                         z::Z_DATA_ERROR => {
-                            let _diagnostic = member.inflater.message();
+                            let _diagnostic = stream.inflater.message();
                             Err(DecodeError::InvalidDeflate {
                                 bit_offset: self.cursor.position().saturating_mul(8),
                                 reason: DeflateErrorKind::InvalidData,
@@ -938,33 +1158,85 @@ impl<C: InputCursor> SequentialDecoder<C> {
                         return Ok(SequentialItem::Chunk(decoded));
                     }
                 }
-                SequentialState::Footer { crc, output_size } => {
-                    let footer_offset = self.cursor.position();
-                    let footer = self.cursor.read_exact::<8>(footer_offset)?;
-                    let expected_crc =
-                        u32::from_le_bytes(footer[0..4].try_into().expect("four bytes"));
-                    let expected_size =
-                        u32::from_le_bytes(footer[4..8].try_into().expect("four bytes"));
-                    let actual_crc = crc.finish();
-                    if expected_crc != actual_crc {
-                        return Err(DecodeError::ChecksumMismatch {
-                            member: self.member_count,
-                            expected: expected_crc,
-                            actual: actual_crc,
-                        });
+                SequentialState::FinishStream {
+                    checksum,
+                    output_size,
+                } => match (
+                    self.format.expect("format resolved before inflation"),
+                    checksum,
+                ) {
+                    (Format::Gzip, StreamChecksum::Crc32(crc)) => {
+                        let footer_offset = self.cursor.position();
+                        let footer = self.cursor.read_exact::<8>(footer_offset)?;
+                        let expected_crc =
+                            u32::from_le_bytes(footer[0..4].try_into().expect("four bytes"));
+                        let expected_size =
+                            u32::from_le_bytes(footer[4..8].try_into().expect("four bytes"));
+                        let actual_crc = crc.finish();
+                        if expected_crc != actual_crc {
+                            return Err(DecodeError::ChecksumMismatch {
+                                member: self.member_count,
+                                expected: expected_crc,
+                                actual: actual_crc,
+                            });
+                        }
+                        if expected_size != output_size {
+                            return Err(DecodeError::SizeMismatch {
+                                member: self.member_count,
+                                expected: expected_size,
+                                actual_mod32: output_size,
+                            });
+                        }
+                        self.member_count += 1;
+                        self.runtime.set_member_count(self.member_count);
+                        self.state = SequentialState::GzipHeader;
                     }
-                    if expected_size != output_size {
-                        return Err(DecodeError::SizeMismatch {
-                            member: self.member_count,
-                            expected: expected_size,
-                            actual_mod32: output_size,
-                        });
+                    (Format::Zlib, StreamChecksum::Adler32(checksum)) => {
+                        let trailer_offset = self.cursor.position();
+                        let mut trailer = [0_u8; 4];
+                        for byte in &mut trailer {
+                            let Some(&value) = self.cursor.available()?.first() else {
+                                return Err(DecodeError::InvalidZlib {
+                                    offset: trailer_offset,
+                                    reason: ZlibErrorKind::Truncated,
+                                });
+                            };
+                            self.cursor.advance(1);
+                            *byte = value;
+                        }
+                        let expected = u32::from_be_bytes(trailer);
+                        let actual = checksum.finish();
+                        if expected != actual {
+                            return Err(DecodeError::InvalidZlib {
+                                offset: trailer_offset,
+                                reason: ZlibErrorKind::ChecksumMismatch { expected, actual },
+                            });
+                        }
+                        if !self.cursor.is_at_end()? {
+                            return Err(DecodeError::InvalidZlib {
+                                offset: self.cursor.position(),
+                                reason: ZlibErrorKind::TrailingGarbage,
+                            });
+                        }
+                        self.member_count = 1;
+                        self.runtime.set_member_count(1);
+                        let report = self.finish_report(Format::Zlib)?;
+                        return Ok(SequentialItem::Finished(report));
                     }
-
-                    self.member_count += 1;
-                    self.runtime.set_member_count(self.member_count);
-                    self.state = SequentialState::Header;
-                }
+                    (Format::RawDeflate, StreamChecksum::None) => {
+                        if !self.cursor.is_at_end()? {
+                            return Err(DecodeError::InvalidDeflate {
+                                bit_offset: self.cursor.position().saturating_mul(8),
+                                reason: DeflateErrorKind::TrailingGarbage,
+                            });
+                        }
+                        self.member_count = 1;
+                        self.runtime.set_member_count(1);
+                        let report = self.finish_report(Format::RawDeflate)?;
+                        return Ok(SequentialItem::Finished(report));
+                    }
+                    _ => unreachable!("checksum policy matches the selected format"),
+                },
                 SequentialState::Failed(error) => return Err(error),
                 SequentialState::Finished(report) => {
                     self.state = SequentialState::Finished(report);
@@ -2045,27 +2317,23 @@ where
                 let mut accepted_bytes = 0_usize;
                 for member_index in 0..decoded.member_count() {
                     let member_size = decoded.member_size(member_index);
-                    let next_total = total_output.checked_add(member_size as u64);
-                    if next_total.is_none()
-                        || config
-                            .output_limit
-                            .is_some_and(|limit| next_total.is_some_and(|next| next > limit))
-                    {
-                        if accepted_bytes != 0 {
-                            decoded.bytes.truncate(accepted_bytes);
-                            output.emit(decoded.bytes)?;
+                    let next_total = match config.checked_output_total(total_output, member_size) {
+                        Ok(total) => total,
+                        Err(error) => {
+                            if accepted_bytes != 0 {
+                                decoded.bytes.truncate(accepted_bytes);
+                                output.emit(decoded.bytes)?;
+                            }
+                            return Err(error);
                         }
-                        return Err(DecodeError::OutputLimitExceeded {
-                            limit: config.output_limit.unwrap_or(u64::MAX),
-                        });
-                    }
+                    };
                     if let Some(collector) = collector {
                         let header = decoded.member_header(member_index);
                         collector.offer(
                             Checkpoint {
                                 compressed_offset_in_bits: header.deflate_start.saturating_mul(8),
                                 uncompressed_offset_in_bytes: total_output,
-                                kind: CheckpointKind::MemberDeflate {
+                                kind: CheckpointKind::GzipMemberDeflate {
                                     header_offset_in_bytes: header.start,
                                 },
                                 line_offset: None,
@@ -2073,8 +2341,7 @@ where
                             &[],
                         );
                     }
-                    total_output =
-                        next_total.expect("the overflow case returned immediately above");
+                    total_output = next_total;
                     member_count += 1;
                     runtime.set_member_count(member_count);
                     accepted_bytes += member_size;
@@ -2133,11 +2400,13 @@ where
         ));
     }
 
+    config.verify_expected_output(total_output)?;
     Ok(DecodeReport {
         compressed_bytes: index.compressed_size,
         decompressed_bytes: total_output,
         member_count,
         decoder_threads: config.decoder_threads,
+        format: Format::Gzip,
     })
 }
 
@@ -2164,7 +2433,7 @@ fn offer_bgzf_checkpoints<R: ReadAt + ?Sized>(
                 Checkpoint {
                     compressed_offset_in_bits: range.deflate_start.saturating_mul(8),
                     uncompressed_offset_in_bytes: uncompressed,
-                    kind: CheckpointKind::MemberDeflate {
+                    kind: CheckpointKind::GzipMemberDeflate {
                         header_offset_in_bytes: range.start,
                     },
                     line_offset: None,
@@ -2214,16 +2483,50 @@ fn read_range_reuse<R: ReadAt + ?Sized>(
     Ok(())
 }
 
-struct MemberAccounting {
-    crc: Crc32,
-    size: u32,
+enum MemberAccounting {
+    Gzip { crc: Crc32, size: u32 },
+    Zlib(Adler32),
+    Raw,
 }
 
 impl MemberAccounting {
     const fn new() -> Self {
-        Self {
+        Self::Gzip {
             crc: Crc32::new(),
             size: 0,
+        }
+    }
+
+    const fn zlib() -> Self {
+        Self::Zlib(Adler32::new())
+    }
+
+    const fn raw() -> Self {
+        Self::Raw
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Gzip { crc, size } => {
+                crc.update(bytes);
+                *size = size.wrapping_add(bytes.len() as u32);
+            }
+            Self::Zlib(checksum) => checksum.update(bytes),
+            Self::Raw => {}
+        }
+    }
+
+    fn gzip_values(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Gzip { crc, size } => Some((crc.finish(), *size)),
+            Self::Zlib(_) | Self::Raw => None,
+        }
+    }
+
+    fn adler32(&self) -> Option<u32> {
+        match self {
+            Self::Zlib(checksum) => Some(checksum.finish()),
+            Self::Gzip { .. } | Self::Raw => None,
         }
     }
 }
@@ -2235,20 +2538,9 @@ fn emit_accounted<O: Output>(
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
 ) -> Result<(), DecodeError> {
-    let next_total =
-        total_output
-            .checked_add(decoded.len() as u64)
-            .ok_or(DecodeError::OutputLimitExceeded {
-                limit: config.output_limit.unwrap_or(u64::MAX),
-            })?;
-    if config.output_limit.is_some_and(|limit| next_total > limit) {
-        return Err(DecodeError::OutputLimitExceeded {
-            limit: config.output_limit.expect("checked as some"),
-        });
-    }
+    let next_total = config.checked_output_total(*total_output, decoded.len())?;
     *total_output = next_total;
-    accounting.size = accounting.size.wrapping_add(decoded.len() as u32);
-    accounting.crc.update(&decoded);
+    accounting.update(&decoded);
     if !decoded.is_empty() {
         output.emit(decoded)?;
     }
@@ -2263,6 +2555,7 @@ fn inflate_from_block<R, O>(
     output: &mut O,
     start_bit: u64,
     window: &Window,
+    window_bits: u8,
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
 ) -> Result<u64, DecodeError>
@@ -2273,14 +2566,16 @@ where
     let mut cursor = SourceCursor::new(source, config.input_page_size)?;
     let byte_offset = start_bit / 8;
     cursor.seek(byte_offset)?;
-    let mut inflater = RawInflater::new()?;
+    let mut inflater = RawInflater::new_with_window_bits(window_bits)?;
     let skipped_bits = (start_bit % 8) as u8;
     if skipped_bits != 0 {
         let byte = cursor.read_exact::<1>(byte_offset)?[0];
         let remaining_bits = 8 - skipped_bits;
         inflater.prime(remaining_bits, byte >> skipped_bits, start_bit)?;
     }
-    inflater.set_dictionary(window, start_bit)?;
+    let allowed = 1_usize << window_bits;
+    let dictionary = &window.as_slice()[window.as_slice().len().saturating_sub(allowed)..];
+    inflater.set_dictionary_bytes(dictionary, start_bit)?;
 
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -2318,7 +2613,15 @@ where
             emit_accounted(decoded, config, output, accounting, total_output)?;
         }
         match status {
-            z::Z_STREAM_END => return Ok(cursor.position()),
+            z::Z_STREAM_END => {
+                let unused_bits = u64::try_from(inflater.stream.data_type & 0x3f)
+                    .expect("the low six data_type bits are non-negative");
+                let end_bit = cursor
+                    .position()
+                    .saturating_mul(8)
+                    .saturating_sub(unused_bits);
+                return Ok(end_bit.div_ceil(8));
+            }
             z::Z_OK if consumed != 0 || produced != 0 => {}
             z::Z_BUF_ERROR if consumed != 0 || produced != 0 => {}
             z::Z_DATA_ERROR => {
@@ -2521,6 +2824,7 @@ fn spawn_estimated_worker<'scope, 'env: 'scope, R>(
     source: &'env R,
     tasks: &'env [EstimatedTask],
     maximum_output: usize,
+    window_bits: u8,
     queue: Arc<Injector<usize>>,
     resolve_queue: Arc<Injector<ResolveTask>>,
     sender: mpsc::SyncSender<NativeResult>,
@@ -2576,7 +2880,13 @@ fn spawn_estimated_worker<'scope, 'env: 'scope, R>(
                     let generation = adaptive_workers.start_work();
                     let result = {
                         let _busy = adaptive_workers.runtime.begin_task();
-                        run_estimated_task(source, &tasks[index], maximum_output, &mut compressed)
+                        run_estimated_task(
+                            source,
+                            &tasks[index],
+                            maximum_output,
+                            window_bits,
+                            &mut compressed,
+                        )
                     };
                     let decoded_bytes = result.as_ref().map_or(0, |chunk| chunk.output.len());
                     if adaptive_workers.observe_work(generation, decoded_bytes) {
@@ -2619,8 +2929,10 @@ fn inflate_tail(
     window: &Window,
     maximum_output: usize,
     exact_stop: bool,
+    window_bits: u8,
 ) -> Result<BackendTail, NativeError> {
-    let mut inflater = RawInflater::new().map_err(|_| NativeError::InvalidSymbol)?;
+    let mut inflater =
+        RawInflater::new_with_window_bits(window_bits).map_err(|_| NativeError::InvalidSymbol)?;
     let byte_offset = start_bit / 8;
     let skipped_bits = (start_bit % 8) as u8;
     let mut input_position = byte_offset;
@@ -2631,8 +2943,10 @@ fn inflate_tail(
             .map_err(|_| NativeError::InvalidSymbol)?;
         input_position += 1;
     }
+    let allowed = 1_usize << window_bits;
+    let dictionary = &window.as_slice()[window.as_slice().len().saturating_sub(allowed)..];
     inflater
-        .set_dictionary(window, start_bit as u64)
+        .set_dictionary_bytes(dictionary, start_bit as u64)
         .map_err(|_| NativeError::InvalidDistance)?;
 
     // Typical 1 MiB compressed grid chunks expand to roughly 1--2 MiB. An
@@ -2740,6 +3054,7 @@ fn run_estimated_task<R: ReadAt + ?Sized>(
     source: &R,
     task: &EstimatedTask,
     maximum_output: usize,
+    window_bits: u8,
     bytes: &mut Vec<u8>,
 ) -> Result<crate::parallel::deflate::Chunk, NativeError> {
     let byte_start = task.search_start_bit / 8;
@@ -2764,6 +3079,7 @@ fn run_estimated_task<R: ReadAt + ?Sized>(
             &Window::empty(),
             maximum_output,
             false,
+            window_bits,
         )?;
         let chunk = crate::parallel::deflate::Chunk {
             start_bit: usize::try_from(task.search_start_bit)
@@ -2790,11 +3106,19 @@ fn run_estimated_task<R: ReadAt + ?Sized>(
                 local_stop,
                 InitialHistory::Unknown,
                 maximum_output,
+                1_usize << window_bits,
             )?;
             if let Some(window) = chunk.backend_continuation.take() {
                 let remaining = maximum_output.saturating_sub(chunk.output.len());
-                let tail =
-                    inflate_tail(bytes, chunk.end_bit, local_stop, &window, remaining, false)?;
+                let tail = inflate_tail(
+                    bytes,
+                    chunk.end_bit,
+                    local_stop,
+                    &window,
+                    remaining,
+                    false,
+                    window_bits,
+                )?;
                 chunk.output.append_clean(tail.output);
                 chunk.end_bit = tail.end_bit;
                 chunk.reached_stream_end = tail.reached_stream_end;
@@ -2924,16 +3248,7 @@ fn enqueue_native_resolution(
         }
     }
     let prepared = prepare_native_chunk(chunk, *next_sequence, window, *current_bit)?;
-    let next_total = prepared_total
-        .checked_add(prepared.decoded_size as u64)
-        .ok_or(DecodeError::OutputLimitExceeded {
-            limit: config.output_limit.unwrap_or(u64::MAX),
-        })?;
-    if config.output_limit.is_some_and(|limit| next_total > limit) {
-        return Err(DecodeError::OutputLimitExceeded {
-            limit: config.output_limit.expect("checked as some"),
-        });
-    }
+    let next_total = config.checked_output_total(*prepared_total, prepared.decoded_size)?;
 
     let reached_stream_end = prepared.reached_stream_end;
     *prepared_total = next_total;
@@ -2978,8 +3293,9 @@ fn validate_footer<R: ReadAt + ?Sized>(
     accounting: &MemberAccounting,
 ) -> Result<u64, DecodeError> {
     const MAX_BACKEND_READ_AHEAD: u64 = 16;
-    let actual_crc = accounting.crc.finish();
-    let actual_size = accounting.size;
+    let (actual_crc, actual_size) = accounting
+        .gzip_values()
+        .expect("gzip footer validation requires gzip accounting");
     let mut reported_footer = None;
     let mut first_error = None;
 
@@ -3032,19 +3348,29 @@ fn validate_footer<R: ReadAt + ?Sized>(
     unreachable!("a matching footer would have returned from the search")
 }
 
-fn decode_rapidgzip_estimated<R, O>(
+#[derive(Clone, Copy)]
+struct EstimatedDecode {
+    compressed_chunk_size: usize,
+    format: Format,
+}
+
+fn decode_estimated<R, O>(
     source: &R,
     config: &Config,
     cancelled: &AtomicBool,
     output: &mut O,
-    compressed_chunk_size: usize,
     runtime: &Arc<RuntimeState>,
     collector: Option<&Arc<IndexCollector>>,
+    options: EstimatedDecode,
 ) -> Result<DecodeReport, DecodeError>
 where
     R: ReadAt + ?Sized,
     O: Output,
 {
+    let EstimatedDecode {
+        compressed_chunk_size,
+        format,
+    } = options;
     const SEARCH_BYTES: u64 = 512 * 1024;
     const LOOKAHEAD_BYTES: u64 = 512 * 1024;
     // This cursor touches only gzip headers and footers. Large pages would
@@ -3056,24 +3382,59 @@ where
             decompressed_bytes: 0,
             member_count: 0,
             decoder_threads: config.decoder_threads,
+            format,
         });
     }
 
-    let first_header = parse_member_header(&mut frame_cursor, true)?;
-    if let Some(collector) = collector {
-        collector.offer(
-            Checkpoint {
-                compressed_offset_in_bits: first_header.deflate_start.saturating_mul(8),
-                uncompressed_offset_in_bytes: 0,
-                kind: CheckpointKind::MemberDeflate {
-                    header_offset_in_bytes: first_header.start,
-                },
-                line_offset: None,
-            },
-            &[],
-        );
-    }
-    let first_deflate_bit = first_header.deflate_start.saturating_mul(8);
+    let (first_deflate_bit, window_bits) = match format {
+        Format::Gzip => {
+            let header = parse_member_header(&mut frame_cursor, true)?;
+            if let Some(collector) = collector {
+                collector.offer(
+                    Checkpoint {
+                        compressed_offset_in_bits: header.deflate_start.saturating_mul(8),
+                        uncompressed_offset_in_bytes: 0,
+                        kind: CheckpointKind::GzipMemberDeflate {
+                            header_offset_in_bytes: header.start,
+                        },
+                        line_offset: None,
+                    },
+                    &[],
+                );
+            }
+            (header.deflate_start.saturating_mul(8), 15)
+        }
+        Format::Zlib => {
+            let header_offset = frame_cursor.position();
+            let (_, window_bits) = read_zlib_header(&mut frame_cursor)?;
+            if let Some(collector) = collector {
+                collector.offer(
+                    Checkpoint {
+                        compressed_offset_in_bits: header_offset.saturating_mul(8),
+                        uncompressed_offset_in_bytes: 0,
+                        kind: CheckpointKind::ZlibHeader,
+                        line_offset: None,
+                    },
+                    &[],
+                );
+            }
+            (frame_cursor.position().saturating_mul(8), window_bits)
+        }
+        Format::RawDeflate => {
+            if let Some(collector) = collector {
+                collector.offer(
+                    Checkpoint {
+                        compressed_offset_in_bits: 0,
+                        uncompressed_offset_in_bytes: 0,
+                        kind: CheckpointKind::RawDeflateStart,
+                        line_offset: None,
+                    },
+                    &[],
+                );
+            }
+            (0, 15)
+        }
+    };
     let length_bits = frame_cursor.length().saturating_mul(8);
     let spacing_bits = (compressed_chunk_size as u64).saturating_mul(8);
     let task_count = usize::try_from(
@@ -3167,7 +3528,11 @@ where
         let mut live_workers = vec![false; worker_pool_count];
 
         let mut window = Window::empty();
-        let mut accounting = MemberAccounting::new();
+        let mut accounting = match format {
+            Format::Gzip => MemberAccounting::new(),
+            Format::Zlib => MemberAccounting::zlib(),
+            Format::RawDeflate => MemberAccounting::raw(),
+        };
         let mut footer_offset = None;
         let mut bridge_compressed = Vec::new();
 
@@ -3191,6 +3556,7 @@ where
                     source,
                     &tasks,
                     maximum_output,
+                    window_bits,
                     Arc::clone(&task_queue),
                     Arc::clone(&resolve_queue),
                     sender_template.clone(),
@@ -3218,6 +3584,50 @@ where
                     &mut accounting,
                     &mut total_output,
                 )?;
+                if format == Format::Zlib {
+                    frame_cursor.seek(offset)?;
+                    let trailer =
+                        frame_cursor
+                            .read_exact::<4>(offset)
+                            .map_err(|error| match error {
+                                DecodeError::InvalidGzip { .. } => DecodeError::InvalidZlib {
+                                    offset,
+                                    reason: ZlibErrorKind::Truncated,
+                                },
+                                other => other,
+                            })?;
+                    let expected = u32::from_be_bytes(trailer);
+                    let actual = accounting
+                        .adler32()
+                        .expect("zlib path uses Adler-32 accounting");
+                    if expected != actual {
+                        return Err(DecodeError::InvalidZlib {
+                            offset,
+                            reason: ZlibErrorKind::ChecksumMismatch { expected, actual },
+                        });
+                    }
+                    if frame_cursor.position() != frame_cursor.length() {
+                        return Err(DecodeError::InvalidZlib {
+                            offset: frame_cursor.position(),
+                            reason: ZlibErrorKind::TrailingGarbage,
+                        });
+                    }
+                    member_count = 1;
+                    runtime.set_member_count(1);
+                    break 'decode;
+                }
+                if format == Format::RawDeflate {
+                    frame_cursor.seek(offset)?;
+                    if frame_cursor.position() != frame_cursor.length() {
+                        return Err(DecodeError::InvalidDeflate {
+                            bit_offset: frame_cursor.position().saturating_mul(8),
+                            reason: DeflateErrorKind::TrailingGarbage,
+                        });
+                    }
+                    member_count = 1;
+                    runtime.set_member_count(1);
+                    break 'decode;
+                }
                 let actual_footer =
                     validate_footer(&mut frame_cursor, offset, member_count, &accounting)?;
                 member_count += 1;
@@ -3232,7 +3642,7 @@ where
                         Checkpoint {
                             compressed_offset_in_bits: header.deflate_start.saturating_mul(8),
                             uncompressed_offset_in_bytes: total_output,
-                            kind: CheckpointKind::MemberDeflate {
+                            kind: CheckpointKind::GzipMemberDeflate {
                                 header_offset_in_bytes: header.start,
                             },
                             line_offset: None,
@@ -3264,6 +3674,7 @@ where
                         output,
                         current_bit,
                         &window,
+                        window_bits,
                         &mut accounting,
                         &mut total_output,
                     )?);
@@ -3299,8 +3710,13 @@ where
                         .min(length_bits),
                     exact_start: true,
                 };
-                let bridge_result =
-                    run_estimated_task(source, &bridge, maximum_output, &mut bridge_compressed);
+                let bridge_result = run_estimated_task(
+                    source,
+                    &bridge,
+                    maximum_output,
+                    window_bits,
+                    &mut bridge_compressed,
+                );
                 match bridge_result {
                     Ok(chunk) if chunk.start_bit as u64 == current_bit => {
                         let reached_stream_end = enqueue_native_resolution(
@@ -3348,6 +3764,7 @@ where
                             output,
                             current_bit,
                             &window,
+                            window_bits,
                             &mut accounting,
                             &mut total_output,
                         )?);
@@ -3449,6 +3866,7 @@ where
                             output,
                             current_bit,
                             &window,
+                            window_bits,
                             &mut accounting,
                             &mut total_output,
                         )?);
@@ -3475,6 +3893,7 @@ where
                         output,
                         current_bit,
                         &window,
+                        window_bits,
                         &mut accounting,
                         &mut total_output,
                     )?);
@@ -3503,11 +3922,13 @@ where
             ),
         ));
     }
+    config.verify_expected_output(total_output)?;
     Ok(DecodeReport {
         compressed_bytes: frame_cursor.position(),
         decompressed_bytes: total_output,
         member_count,
         decoder_threads: config.decoder_threads,
+        format,
     })
 }
 
@@ -3913,17 +4334,7 @@ where
                         return Err(error);
                     }
                 };
-                let next_total = total_output.checked_add(decoded.len() as u64).ok_or(
-                    DecodeError::OutputLimitExceeded {
-                        limit: config.output_limit.unwrap_or(u64::MAX),
-                    },
-                )?;
-                if config.output_limit.is_some_and(|limit| next_total > limit) {
-                    stopped.store(true, Ordering::Relaxed);
-                    return Err(DecodeError::OutputLimitExceeded {
-                        limit: config.output_limit.expect("checked as some"),
-                    });
-                }
+                let next_total = config.checked_output_total(total_output, decoded.len())?;
                 total_output = next_total;
                 if !decoded.is_empty() {
                     output.emit(decoded)?;
@@ -3969,11 +4380,13 @@ where
         ));
     }
 
+    config.verify_expected_output(total_output)?;
     Ok(DecodeReport {
         compressed_bytes,
         decompressed_bytes: total_output,
         member_count: ranges.len() as u64,
         decoder_threads: config.decoder_threads,
+        format: Format::Gzip,
     })
 }
 
@@ -4050,8 +4463,16 @@ mod tests {
             b'l', b'd',
         ];
         let first_block_end = 10 * 8;
-        let tail =
-            inflate_tail(&encoded, 0, first_block_end, &Window::empty(), 1024, true).unwrap();
+        let tail = inflate_tail(
+            &encoded,
+            0,
+            first_block_end,
+            &Window::empty(),
+            1024,
+            true,
+            15,
+        )
+        .unwrap();
         assert_eq!(tail.output, b"hello");
         assert_eq!(tail.end_bit, first_block_end);
         assert!(!tail.reached_stream_end);
@@ -4061,7 +4482,7 @@ mod tests {
     fn zlib_rs_tail_recognizes_final_z_block_boundary() {
         // Empty final fixed-Huffman block. Z_BLOCK reaches its end-of-block
         // before a subsequent inflate call would report Z_STREAM_END.
-        let tail = inflate_tail(&[0x03, 0x00], 0, 1, &Window::empty(), 1024, false).unwrap();
+        let tail = inflate_tail(&[0x03, 0x00], 0, 1, &Window::empty(), 1024, false, 15).unwrap();
         assert!(tail.output.is_empty());
         assert_eq!(tail.end_bit, 16);
         assert!(tail.reached_stream_end);
@@ -4070,12 +4491,12 @@ mod tests {
     #[test]
     fn footer_validation_recovers_backend_read_ahead() {
         let mut accounting = MemberAccounting::new();
-        accounting.crc.update(b"hello");
-        accounting.size = 5;
+        accounting.update(b"hello");
+        let (crc, size) = accounting.gzip_values().unwrap();
 
         let mut encoded = Vec::new();
-        encoded.extend_from_slice(&accounting.crc.finish().to_le_bytes());
-        encoded.extend_from_slice(&accounting.size.to_le_bytes());
+        encoded.extend_from_slice(&crc.to_le_bytes());
+        encoded.extend_from_slice(&size.to_le_bytes());
         encoded.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
 
         let mut cursor = SourceCursor::new(encoded.as_slice(), 4).unwrap();

@@ -1,14 +1,14 @@
 //! Ordered index construction shared by push and pull decode operations.
 
 use super::{
-    Checkpoint, CheckpointKind, GzipIndex, IndexError, IndexKind, IndexOptions, StoredWindow,
+    Checkpoint, CheckpointKind, DeflateIndex, IndexError, IndexKind, IndexOptions, StoredWindow,
     WindowStorage,
 };
 use std::sync::{Arc, Mutex};
 
 /// Mutable ordered state protected by [`IndexCollector`].
 pub(crate) struct IndexBuilder {
-    index: GzipIndex,
+    index: DeflateIndex,
     options: IndexOptions,
     last_kept: Option<Checkpoint>,
     error: Option<IndexError>,
@@ -16,7 +16,7 @@ pub(crate) struct IndexBuilder {
 
 impl IndexBuilder {
     pub(crate) fn new(options: IndexOptions) -> Self {
-        let mut index = GzipIndex::new();
+        let mut index = DeflateIndex::new();
         index.set_checkpoint_spacing(Some(options.checkpoint_spacing.get()));
         Self {
             index,
@@ -71,7 +71,7 @@ impl IndexBuilder {
         kind: IndexKind,
         compressed_size: u64,
         uncompressed_size: u64,
-    ) -> Result<GzipIndex, IndexError> {
+    ) -> Result<DeflateIndex, IndexError> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
@@ -145,7 +145,7 @@ impl IndexCollector {
         &self,
         compressed_size: u64,
         uncompressed_size: u64,
-    ) -> Result<GzipIndex, IndexError> {
+    ) -> Result<DeflateIndex, IndexError> {
         let builder = self
             .builder
             .lock()
@@ -177,7 +177,7 @@ mod tests {
     fn thins_interior_windows_before_storage() {
         let collector = IndexCollector::new(IndexOptions::default());
         let window = vec![7; WINDOW_SIZE];
-        collector.offer(point(0, 0, CheckpointKind::MemberHeader), &[]);
+        collector.offer(point(0, 0, CheckpointKind::GzipMemberHeader), &[]);
         collector.offer(point(80, 1024, CheckpointKind::DeflateBlock), &window);
         collector.offer(
             point(160, 8 * 1024 * 1024, CheckpointKind::DeflateBlock),
@@ -190,8 +190,8 @@ mod tests {
     #[test]
     fn keeps_equal_output_offsets_for_empty_members() {
         let collector = IndexCollector::new(IndexOptions::default());
-        collector.offer(point(0, 0, CheckpointKind::MemberHeader), &[]);
-        collector.offer(point(160, 0, CheckpointKind::MemberHeader), &[]);
+        collector.offer(point(0, 0, CheckpointKind::GzipMemberHeader), &[]);
+        collector.offer(point(160, 0, CheckpointKind::GzipMemberHeader), &[]);
         let index = collector.finish(40, 0).expect("index");
         assert_eq!(index.checkpoint_count(), 2);
         assert_eq!(

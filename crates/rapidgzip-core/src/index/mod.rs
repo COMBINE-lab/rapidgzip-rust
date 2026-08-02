@@ -1,4 +1,4 @@
-//! Random-access gzip index types and on-disk formats.
+//! Random-access indexes for gzip, zlib, and raw-DEFLATE sources.
 //!
 //! This module is independent of the decoder: it defines the index data model,
 //! validates it, and reads and writes the supported on-disk formats. Use an
@@ -36,6 +36,10 @@ pub enum IndexKind {
     Gzip,
     /// A stream proven to consist entirely of BGZF blocks.
     Bgzf,
+    /// One RFC 1950 zlib stream.
+    Zlib,
+    /// One unwrapped RFC 1951 DEFLATE stream.
+    RawDeflate,
 }
 
 /// How inflation resumes at a checkpoint.
@@ -43,14 +47,18 @@ pub enum IndexKind {
 #[non_exhaustive]
 pub enum CheckpointKind {
     /// The offset points at the gzip magic bytes of a complete member.
-    MemberHeader,
+    GzipMemberHeader,
     /// The offset points at raw DEFLATE immediately after a known member
     /// header. Keeping the header offset permits full verification while
     /// retaining compatibility with raw-DEFLATE index formats.
-    MemberDeflate {
+    GzipMemberDeflate {
         /// Absolute byte offset of the gzip member header.
         header_offset_in_bytes: u64,
     },
+    /// The offset points at the two-byte header of the zlib stream.
+    ZlibHeader,
+    /// The offset points at the first bit of an unwrapped DEFLATE stream.
+    RawDeflateStart,
     /// The offset points at the first bit of a raw DEFLATE block.
     DeflateBlock,
 }
@@ -110,12 +118,13 @@ impl Default for IndexReadOptions {
     }
 }
 
-/// A random-access point into a gzip stream.
+/// A random-access point into a DEFLATE-based stream.
 ///
 /// The compressed position is a bit offset because a DEFLATE block boundary is
 /// not generally byte aligned. [`CheckpointKind`] says whether the offset is a
-/// gzip member header, a known member's raw payload, or an interior DEFLATE
-/// block, so a reader never has to infer framing from compressed bytes.
+/// gzip member header, a known member's raw payload, a zlib header, a raw
+/// stream start, or an interior DEFLATE block, so a reader never has to infer
+/// framing from compressed bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Checkpoint {
     /// Absolute compressed bit offset from the start of the source.
@@ -279,9 +288,9 @@ impl WindowMap {
     }
 }
 
-/// An in-memory gzip random-access index.
+/// An in-memory random-access index for a DEFLATE-based stream.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct GzipIndex {
+pub struct DeflateIndex {
     pub(crate) checkpoints: Vec<Checkpoint>,
     pub(crate) windows: WindowMap,
     pub(crate) kind: IndexKind,
@@ -291,7 +300,7 @@ pub struct GzipIndex {
     pub(crate) total_line_count: Option<u64>,
 }
 
-impl GzipIndex {
+impl DeflateIndex {
     /// Returns an empty index.
     #[must_use]
     pub fn new() -> Self {
@@ -358,19 +367,24 @@ impl GzipIndex {
     /// Ordering is not checked here; call [`Self::validate`] once the index is
     /// complete.
     pub fn push(&mut self, checkpoint: Checkpoint, window: StoredWindow) -> Result<(), IndexError> {
-        if matches!(checkpoint.kind, CheckpointKind::MemberHeader) {
+        if matches!(
+            checkpoint.kind,
+            CheckpointKind::GzipMemberHeader
+                | CheckpointKind::ZlibHeader
+                | CheckpointKind::RawDeflateStart
+        ) {
             if !checkpoint.compressed_offset_in_bits.is_multiple_of(8) {
                 return Err(IndexError::InvalidCheckpoint(
-                    "member-header checkpoint is not byte aligned",
+                    "stream-start checkpoint is not byte aligned",
                 ));
             }
             if !window.is_empty() {
                 return Err(IndexError::InvalidCheckpoint(
-                    "member-header checkpoint carries a predecessor window",
+                    "stream-start checkpoint carries a predecessor window",
                 ));
             }
         }
-        if let CheckpointKind::MemberDeflate {
+        if let CheckpointKind::GzipMemberDeflate {
             header_offset_in_bytes,
         } = checkpoint.kind
         {
@@ -551,6 +565,11 @@ impl GzipIndex {
     pub fn validate(&self) -> Result<(), IndexError> {
         let mut previous: Option<&Checkpoint> = None;
         for checkpoint in &self.checkpoints {
+            if !checkpoint_kind_matches_index(self.kind, checkpoint.kind) {
+                return Err(IndexError::InvalidCheckpoint(
+                    "checkpoint framing is incompatible with index provenance",
+                ));
+            }
             if let Some(previous) = previous {
                 if checkpoint.compressed_offset_in_bits <= previous.compressed_offset_in_bits {
                     return Err(IndexError::InvalidCheckpoint(
@@ -584,10 +603,15 @@ impl GzipIndex {
             if let Some(window) = self.windows.get(checkpoint.compressed_offset_in_bits) {
                 validate_expanded_window(&window.decompressed()?)?;
             }
-            if matches!(checkpoint.kind, CheckpointKind::MemberHeader) {
+            if matches!(
+                checkpoint.kind,
+                CheckpointKind::GzipMemberHeader
+                    | CheckpointKind::ZlibHeader
+                    | CheckpointKind::RawDeflateStart
+            ) {
                 if !checkpoint.compressed_offset_in_bits.is_multiple_of(8) {
                     return Err(IndexError::InvalidCheckpoint(
-                        "member-header checkpoint is not byte aligned",
+                        "stream-start checkpoint is not byte aligned",
                     ));
                 }
                 if self
@@ -596,11 +620,11 @@ impl GzipIndex {
                     .is_some()
                 {
                     return Err(IndexError::InvalidCheckpoint(
-                        "member-header checkpoint carries a predecessor window",
+                        "stream-start checkpoint carries a predecessor window",
                     ));
                 }
             }
-            if let CheckpointKind::MemberDeflate {
+            if let CheckpointKind::GzipMemberDeflate {
                 header_offset_in_bytes,
             } = checkpoint.kind
             {
@@ -622,10 +646,50 @@ impl GzipIndex {
                     ));
                 }
             }
+            if matches!(
+                checkpoint.kind,
+                CheckpointKind::ZlibHeader | CheckpointKind::RawDeflateStart
+            ) && (checkpoint.compressed_offset_in_bits != 0
+                || checkpoint.uncompressed_offset_in_bytes != 0)
+            {
+                return Err(IndexError::InvalidCheckpoint(
+                    "single-stream start checkpoint is not at the source origin",
+                ));
+            }
+            if matches!(self.kind, IndexKind::Zlib | IndexKind::RawDeflate)
+                && matches!(checkpoint.kind, CheckpointKind::DeflateBlock)
+                && self
+                    .windows
+                    .get(checkpoint.compressed_offset_in_bits)
+                    .is_none()
+            {
+                return Err(IndexError::InvalidCheckpoint(
+                    "single-stream interior checkpoint has no predecessor window",
+                ));
+            }
 
             previous = Some(checkpoint);
         }
         Ok(())
+    }
+}
+
+const fn checkpoint_kind_matches_index(kind: IndexKind, checkpoint: CheckpointKind) -> bool {
+    match kind {
+        IndexKind::Gzip | IndexKind::Bgzf => matches!(
+            checkpoint,
+            CheckpointKind::GzipMemberHeader
+                | CheckpointKind::GzipMemberDeflate { .. }
+                | CheckpointKind::DeflateBlock
+        ),
+        IndexKind::Zlib => matches!(
+            checkpoint,
+            CheckpointKind::ZlibHeader | CheckpointKind::DeflateBlock
+        ),
+        IndexKind::RawDeflate => matches!(
+            checkpoint,
+            CheckpointKind::RawDeflateStart | CheckpointKind::DeflateBlock
+        ),
     }
 }
 
@@ -674,6 +738,13 @@ pub enum IndexError {
     },
     /// An operation requires metadata not present in this index.
     MissingMetadata(&'static str),
+    /// The selected on-disk representation cannot encode this source format.
+    IncompatibleFormat {
+        /// Operation or on-disk representation that was requested.
+        operation: &'static str,
+        /// Provenance recorded by the index.
+        kind: IndexKind,
+    },
     /// An I/O failure occurred.
     Io {
         /// The original error.
@@ -726,6 +797,9 @@ impl Display for IndexError {
                 write!(formatter, "unsupported index flags {flags:#x}")
             }
             Self::MissingMetadata(what) => write!(formatter, "index is missing {what}"),
+            Self::IncompatibleFormat { operation, kind } => {
+                write!(formatter, "{operation} cannot represent a {kind:?} index")
+            }
             Self::Io { source } => write!(formatter, "index I/O error: {source}"),
         }
     }
@@ -776,6 +850,16 @@ impl PartialEq for IndexError {
                 left == right
             }
             (Self::MissingMetadata(left), Self::MissingMetadata(right)) => left == right,
+            (
+                Self::IncompatibleFormat {
+                    operation: left_operation,
+                    kind: left_kind,
+                },
+                Self::IncompatibleFormat {
+                    operation: right_operation,
+                    kind: right_kind,
+                },
+            ) => left_operation == right_operation && left_kind == right_kind,
             (Self::Io { source: left }, Self::Io { source: right }) => {
                 left.kind() == right.kind() && left.to_string() == right.to_string()
             }
@@ -835,7 +919,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_ordered_checkpoints_with_windows() {
-        let mut index = GzipIndex::new();
+        let mut index = DeflateIndex::new();
         index.set_compressed_size(Some(4096));
         index.set_uncompressed_size(Some(1 << 20));
         index
@@ -854,7 +938,7 @@ mod tests {
 
     #[test]
     fn validate_allows_equal_but_rejects_decreasing_uncompressed_offsets() {
-        let mut index = GzipIndex::new();
+        let mut index = DeflateIndex::new();
         index.set_compressed_size(Some(4096));
         index.set_uncompressed_size(Some(1 << 20));
         index
@@ -875,7 +959,7 @@ mod tests {
             Err(IndexError::InvalidCheckpoint(_))
         ));
 
-        let mut decreasing = GzipIndex::new();
+        let mut decreasing = DeflateIndex::new();
         decreasing
             .push(checkpoint(0, 100), StoredWindow::empty())
             .expect("first");
@@ -898,7 +982,7 @@ mod tests {
 
     #[test]
     fn checkpoint_at_or_before_picks_the_last_not_after_target() {
-        let mut index = GzipIndex::new();
+        let mut index = DeflateIndex::new();
         index.set_compressed_size(Some(4096));
         index.set_uncompressed_size(Some(1 << 20));
         index
@@ -939,6 +1023,6 @@ mod tests {
 
     #[test]
     fn checkpoint_at_or_before_returns_nothing_for_an_empty_index() {
-        assert!(GzipIndex::new().checkpoint_at_or_before(0).is_none());
+        assert!(DeflateIndex::new().checkpoint_at_or_before(0).is_none());
     }
 }

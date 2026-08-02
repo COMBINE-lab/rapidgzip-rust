@@ -15,6 +15,11 @@ ratio between the two groups isolates indexing overhead on identical data.
 Record checkpoint count, serialized native-index size, and peak RSS alongside
 throughput when evaluating a release candidate.
 
+The `decoder_reader_deflate_formats` group compresses one identical payload as
+gzip, zlib, and raw DEFLATE, then decodes each through the public reader at the
+same worker budgets. It is a paired container-overhead regression check, not a
+replacement for the retained FASTQ parity matrix.
+
 The unpublished telemetry sampler drains the same reader while recording its
 elastic worker state:
 
@@ -327,3 +332,26 @@ This deliberately pathological fixture is a scheduling diagnostic rather than
 a throughput or release-parity corpus. High-thread measurements were noisy on
 the shared dual-Xeon host, but every run verified all one million trailers and
 the decoded digest matched GNU gzip.
+
+## 2026-08-02 multi-format implementation baseline
+
+The first zlib/raw implementation was measured with the paired Criterion group
+on the same dual-socket Xeon E5-2699 v4 host. The fixture was 16 MiB of
+deterministic xorshift bytes, independently compressed at level 1 with gzip,
+zlib, and raw wrappers. Ten samples used one-second warmup and at least three
+seconds of measurement. Values are Criterion point estimates in MiB/s:
+
+| configured worker budget | gzip | zlib | raw DEFLATE |
+|---:|---:|---:|---:|
+| 1 | 219.16 | 223.88 | 222.57 |
+| 4 | 199.13 | 206.22 | 205.80 |
+| 16 | 186.47 | 181.01 | 181.65 |
+
+At each budget, the three wrappers are within roughly 4%, showing that zlib
+Adler-32 and raw terminal handling add no material regression relative to the
+same gzip payload. This short, high-entropy fixture does not benefit from the
+marker pipeline—the multi-worker cells are slower than one worker—so these
+numbers validate paired format cost rather than scalability. Large-stream path
+selection and indexed seeking are separately asserted by the integration
+suite; release performance still uses retained FASTQ and representative
+compressible zlib/raw corpora.

@@ -5,14 +5,34 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The unreleased random-access API now uses the format-neutral `DeflateIndex`
+  name instead of `GzipIndex`. This, the new mandatory `DecodeReport::format`
+  field, and multi-format index provenance are planned for the next minor
+  release rather than a patch release.
+
 ### Added
 
+- Explicit zlib and raw-DEFLATE decoding through every push and pull API, plus
+  opt-in gzip/zlib auto-detection that never guesses raw input. Large positional
+  streams share the adaptive rapidgzip marker/window path; non-seekable streams
+  share the resumable sequential engine. Zlib validates CMF/FLG, enforces CINFO
+  history limits, and verifies Adler-32, while raw DEFLATE is structurally
+  validated through its exact final byte.
+- `Format`, `DecoderBuilder::format`, `DecoderBuilder::auto_detect_format`, and
+  concrete `DecodeReport::format`, with `DecodeReport` remaining `Copy`.
+  `DecoderBuilder::expected_uncompressed_size` adds an exact output contract
+  for every format and rejects overruns before output handoff.
+- Format-aware `DeflateIndex` provenance and checkpoint kinds for gzip, BGZF,
+  zlib, and raw DEFLATE. The native version-1 format round-trips every kind;
+  gzip-specific external exporters now reject incompatible indexes.
 - Explicit random-access indexing operations for positional and non-seekable
   push/pull decoding, returning `IndexedDecodeReport` while preserving the
   existing `Copy` `DecodeReport` and zero-indexing default path. The new
   `IndexingDecoderReader` remains `Read + Send` and exposes the same runtime
   telemetry and worker controls as `DecoderReader`.
-- A validated `GzipIndex` model with explicit member/header/DEFLATE checkpoint
+- A validated `DeflateIndex` model with explicit member/header/DEFLATE checkpoint
   provenance, bounded native and external-format parsing, optional compressed
   32 KiB predecessor windows, and import/export for native version 1,
   indexed_gzip GZIDX, htslib BGZF `.gzi`, and gztool formats.

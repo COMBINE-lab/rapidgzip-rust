@@ -1,4 +1,4 @@
-use crate::{GzipIndex, IndexError};
+use crate::{DeflateIndex, Format, IndexError};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -50,6 +50,54 @@ impl Display for GzipErrorKind {
     }
 }
 
+/// The reason an RFC 1950 zlib container was rejected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ZlibErrorKind {
+    /// The header selected a compression method other than DEFLATE.
+    UnsupportedCompressionMethod(u8),
+    /// CINFO requested a window larger than DEFLATE's 32 KiB maximum.
+    UnsupportedWindowSize(u8),
+    /// The CMF/FLG pair did not satisfy the FCHECK residue.
+    BadHeaderCheck,
+    /// Preset dictionaries are not supported by this decoder.
+    PresetDictionary,
+    /// The zlib header or Adler-32 trailer was truncated.
+    Truncated,
+    /// The Adler-32 stored in the trailer did not match the output.
+    ChecksumMismatch {
+        /// Trailer value.
+        expected: u32,
+        /// Computed value.
+        actual: u32,
+    },
+    /// Bytes remained after the one complete zlib stream.
+    TrailingGarbage,
+}
+
+impl Display for ZlibErrorKind {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedCompressionMethod(method) => {
+                write!(formatter, "unsupported zlib compression method {method}")
+            }
+            Self::UnsupportedWindowSize(cinfo) => {
+                write!(formatter, "unsupported zlib CINFO window value {cinfo}")
+            }
+            Self::BadHeaderCheck => formatter.write_str("invalid zlib FCHECK header residue"),
+            Self::PresetDictionary => {
+                formatter.write_str("zlib preset dictionaries are not supported")
+            }
+            Self::Truncated => formatter.write_str("truncated zlib header or trailer"),
+            Self::ChecksumMismatch { expected, actual } => write!(
+                formatter,
+                "zlib Adler-32 mismatch: expected {expected:#010x}, got {actual:#010x}"
+            ),
+            Self::TrailingGarbage => formatter.write_str("trailing data after zlib stream"),
+        }
+    }
+}
+
 /// The reason a DEFLATE stream was rejected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -64,6 +112,8 @@ pub enum DeflateErrorKind {
     Truncated,
     /// The decoder made no progress despite having input and output space.
     Stalled,
+    /// Bytes remained after the final block of a raw DEFLATE stream.
+    TrailingGarbage,
 }
 
 impl Display for DeflateErrorKind {
@@ -71,13 +121,14 @@ impl Display for DeflateErrorKind {
         match self {
             Self::InvalidData => formatter.write_str("invalid DEFLATE data"),
             Self::UnexpectedDictionary => {
-                formatter.write_str("gzip DEFLATE stream requested a preset dictionary")
+                formatter.write_str("DEFLATE stream requested a preset dictionary")
             }
             Self::BackendStatus(status) => {
                 write!(formatter, "unexpected DEFLATE backend status {status}")
             }
             Self::Truncated => formatter.write_str("truncated DEFLATE stream"),
             Self::Stalled => formatter.write_str("DEFLATE decoder made no progress"),
+            Self::TrailingGarbage => formatter.write_str("trailing data after raw DEFLATE stream"),
         }
     }
 }
@@ -102,6 +153,15 @@ pub enum DecodeError {
         offset: u64,
         /// Detailed reason.
         reason: GzipErrorKind,
+    },
+    /// Automatic detection found neither gzip nor zlib framing.
+    UnrecognizedFormat,
+    /// The zlib framing was invalid.
+    InvalidZlib {
+        /// Compressed byte offset.
+        offset: u64,
+        /// Detailed reason.
+        reason: ZlibErrorKind,
     },
     /// The raw DEFLATE payload was invalid.
     InvalidDeflate {
@@ -133,6 +193,13 @@ pub enum DecodeError {
         /// Configured maximum decoded byte count.
         limit: u64,
     },
+    /// Decoded output did not equal the caller's exact expectation.
+    UnexpectedOutputSize {
+        /// Required total output size.
+        expected: u64,
+        /// Observed total, or the total that the next handoff would produce.
+        actual: u64,
+    },
     /// A decoder worker panicked.
     WorkerPanicked,
     /// Decoding was cancelled because the consumer stopped.
@@ -161,14 +228,21 @@ impl DecodeError {
                 reason: GzipErrorKind::Truncated,
                 ..
             }
+            | Self::InvalidZlib {
+                reason: ZlibErrorKind::Truncated,
+                ..
+            }
             | Self::InvalidDeflate {
                 reason: DeflateErrorKind::Truncated,
                 ..
             } => io::ErrorKind::UnexpectedEof,
             Self::InvalidGzip { .. }
+            | Self::UnrecognizedFormat
+            | Self::InvalidZlib { .. }
             | Self::InvalidDeflate { .. }
             | Self::ChecksumMismatch { .. }
-            | Self::SizeMismatch { .. } => io::ErrorKind::InvalidData,
+            | Self::SizeMismatch { .. }
+            | Self::UnexpectedOutputSize { .. } => io::ErrorKind::InvalidData,
             Self::OutputLimitExceeded { .. } => io::ErrorKind::FileTooLarge,
             Self::WorkerPanicked => io::ErrorKind::Other,
             Self::Cancelled => io::ErrorKind::Interrupted,
@@ -197,6 +271,12 @@ impl Display for DecodeError {
             Self::InvalidGzip { offset, reason } => {
                 write!(formatter, "invalid gzip data at byte {offset}: {reason}")
             }
+            Self::UnrecognizedFormat => {
+                formatter.write_str("input is neither recognizable gzip nor zlib data")
+            }
+            Self::InvalidZlib { offset, reason } => {
+                write!(formatter, "invalid zlib data at byte {offset}: {reason}")
+            }
             Self::InvalidDeflate { bit_offset, reason } => {
                 write!(
                     formatter,
@@ -222,6 +302,10 @@ impl Display for DecodeError {
             Self::OutputLimitExceeded { limit } => {
                 write!(formatter, "decoded output exceeded the {limit}-byte limit")
             }
+            Self::UnexpectedOutputSize { expected, actual } => write!(
+                formatter,
+                "decoded output size mismatch: expected {expected} bytes, got {actual}"
+            ),
             Self::WorkerPanicked => formatter.write_str("a decoder worker panicked"),
             Self::Cancelled => formatter.write_str("decoding was cancelled"),
         }
@@ -244,10 +328,15 @@ pub struct DecodeReport {
     pub compressed_bytes: u64,
     /// Decompressed bytes emitted.
     pub decompressed_bytes: u64,
-    /// Number of verified gzip members.
+    /// Number of completed framing units: gzip members, or one zlib/raw stream.
+    ///
+    /// A raw-DEFLATE unit is structurally complete but has no container
+    /// checksum to authenticate it.
     pub member_count: u64,
     /// Configured decoder-worker budget.
     pub decoder_threads: usize,
+    /// Concrete container framing that was decoded.
+    pub format: Format,
 }
 
 impl AsRef<DecodeReport> for DecodeReport {
@@ -262,7 +351,7 @@ pub struct IndexedDecodeReport {
     /// Scalar statistics for the verified decode.
     pub decode: DecodeReport,
     /// Random-access index built from authoritative decode boundaries.
-    pub index: GzipIndex,
+    pub index: DeflateIndex,
 }
 
 impl IndexedDecodeReport {
@@ -274,13 +363,13 @@ impl IndexedDecodeReport {
 
     /// Returns the collected random-access index.
     #[must_use]
-    pub const fn index(&self) -> &GzipIndex {
+    pub const fn index(&self) -> &DeflateIndex {
         &self.index
     }
 
     /// Separates the scalar report from the owning index.
     #[must_use]
-    pub fn into_parts(self) -> (DecodeReport, GzipIndex) {
+    pub fn into_parts(self) -> (DecodeReport, DeflateIndex) {
         (self.decode, self.index)
     }
 }

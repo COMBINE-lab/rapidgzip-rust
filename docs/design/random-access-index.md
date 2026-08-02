@@ -1,8 +1,10 @@
-# Random-access gzip indexing and seeking
+# Random-access DEFLATE indexing and seeking
 
-Status: implementation specification  
-Target: PR #8, rebased onto `main` after PR #7  
-Scope: decoding and decoded-output seeking only
+Status: implemented by PR #8 and generalized by PR #9
+
+Scope: gzip, BGZF, zlib, and raw-DEFLATE decoding and seeking
+
+Companion: `multi-format-decode.md`
 
 ## Goals
 
@@ -12,7 +14,7 @@ Scope: decoding and decoded-output seeking only
 - Resume decoded reads through a `Read + Seek` adapter without decoding from
   the beginning of the archive.
 - Correctly cross ordinary concatenated gzip members, empty members, and BGZF
-  blocks.
+  blocks, and seek within single zlib or raw-DEFLATE streams.
 - Support the native rapidgzip-rust format, indexed_gzip GZIDX, htslib `.gzi`,
   and gztool indexes with bounded parsing of untrusted data.
 - Preserve the pull-driven, zero-background-thread implementation for
@@ -43,6 +45,7 @@ pub struct DecodeReport {
     pub decompressed_bytes: u64,
     pub member_count: u64,
     pub decoder_threads: usize,
+    pub format: Format,
 }
 ```
 
@@ -52,15 +55,15 @@ An indexing operation returns a distinct owning result:
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedDecodeReport {
     pub decode: DecodeReport,
-    pub index: GzipIndex,
+    pub index: DeflateIndex,
 }
 ```
 
 `IndexedDecodeReport` provides:
 
 - `report(&self) -> &DecodeReport`;
-- `index(&self) -> &GzipIndex`;
-- `into_parts(self) -> (DecodeReport, GzipIndex)`;
+- `index(&self) -> &DeflateIndex`;
+- `into_parts(self) -> (DecodeReport, DeflateIndex)`;
 - `AsRef<DecodeReport>`.
 
 `DecodeReport` also implements `AsRef<DecodeReport>`. Generic consumers that
@@ -130,19 +133,24 @@ still a completely verified decode.
 `IndexKind` describes source/container provenance:
 
 - `Gzip`: ordinary gzip, including concatenated members;
-- `Bgzf`: a stream proven to consist of BGZF blocks.
+- `Bgzf`: a stream proven to consist of BGZF blocks;
+- `Zlib`: one RFC 1950 zlib stream;
+- `RawDeflate`: one unwrapped RFC 1951 stream.
 
 Only `Bgzf` indexes may be exported as `.gzi`.
 
 Every `Checkpoint` explicitly carries a `CheckpointKind`:
 
-- `MemberHeader`: the compressed offset is the first gzip magic byte. It must
+- `GzipMemberHeader`: the compressed offset is the first gzip magic byte. It must
   be byte-aligned and requires no predecessor window. Resume parses the header
   before raw inflate.
-- `MemberDeflate`: the compressed offset is the byte-aligned raw-DEFLATE
+- `GzipMemberDeflate`: the compressed offset is the byte-aligned raw-DEFLATE
   payload, and the checkpoint separately retains its member-header byte
   offset. This preserves full CRC32/ISIZE verification while allowing export
   to formats that store raw-DEFLATE positions.
+- `ZlibHeader`: the compressed offset is the zlib CMF byte at source origin;
+- `RawDeflateStart`: the compressed offset is the raw stream's first bit at
+  source origin;
 - `DeflateBlock`: the compressed offset is the first bit of a DEFLATE block.
   It may be bit-aligned and requires a 32 KiB predecessor window unless the
   external format or decoder proves the block independent.
@@ -169,8 +177,9 @@ It is stored raw or as a complete zlib stream. Constructors reject every other
 expanded length. Validation expands compressed windows, checks the exact
 length, and requires the zlib payload to be consumed completely.
 
-The absence of a window is valid for `MemberHeader`, `MemberDeflate`, and an
-explicitly independent `DeflateBlock`. The model records the point kind;
+The absence of a window is valid for every explicit framing start and an
+independently proven `DeflateBlock`. Interior checkpoints in zlib and raw
+streams require a stored predecessor window. The model records the point kind;
 absence alone is never used to infer how to resume.
 
 ### Ordering and empty members
@@ -192,7 +201,8 @@ Decode paths submit only boundaries that have become authoritative in output
 order:
 
 - sequential positional and streaming paths submit every parsed member's raw
-  DEFLATE offset together with its header offset;
+  DEFLATE offset together with its header offset, or the single zlib/raw stream
+  start;
 - BGZF submits every proven non-empty block with both offsets; its conventional
   empty EOF member is decoded and verified but need not be a seek target;
 - dense-member decoding submits a member header only when its preceding chain
@@ -226,12 +236,13 @@ DEFLATE block, and discards decoded bytes until the requested position.
 Compressed input exhaustion before `Z_STREAM_END` is always truncated
 DEFLATE. `Z_BUF_ERROR` with no progress at source EOF is never clean EOF.
 
-At every `Z_STREAM_END`, the reader reads all eight footer bytes. A short
-footer is `UnexpectedEof`; remaining non-gzip bytes are trailing garbage.
+At every `Z_STREAM_END`, the reader applies the index kind's terminal rule:
+eight gzip footer bytes, four zlib Adler-32 bytes, or exact raw source end.
+Short trailers and trailing bytes are errors.
 
 Integrity depends on the resume point:
 
-- From `MemberHeader` or `MemberDeflate`, the reader parses the header and
+- From `GzipMemberHeader` or `GzipMemberDeflate`, the reader parses the header and
   hashes every produced byte (including bytes discarded to reach the seek
   target), tracking member output modulo 2^32. CRC32 and ISIZE must match
   before the member is accepted.
@@ -240,6 +251,8 @@ Integrity depends on the resume point:
   authenticate that member's whole CRC32 or ISIZE and documents this limit.
 - After crossing the next member header, full verification resumes for every
   later member.
+- From `ZlibHeader`, the reader validates CMF/FLG, enforces CINFO, and checks
+  Adler-32. `RawDeflateStart` has no checksum to verify.
 
 The native format reserves room for future prefix-checksum state, but that is
 not required for version 1 interoperability.
@@ -248,8 +261,8 @@ not required for version 1 interoperability.
 
 The native format is finalized before its first release. It is little-endian
 and begins with `RGZIDX01`, a `u16` version, and a `u16` known-flags field.
-Flags encode which optional aggregate fields are present and whether the
-source is BGZF. Unknown flags are rejected.
+Flags encode optional aggregate fields and gzip/BGZF/zlib/raw provenance.
+Unknown or mutually conflicting source-kind flags are rejected.
 
 Each checkpoint stores checkpoint kind, optional member-header offset, and
 window kind. An explicit checkpoint flag records whether line metadata is
@@ -268,8 +281,8 @@ points according to indexed_gzip's format semantics.
 ### htslib `.gzi`
 
 Pairs are BGZF member-header offsets, with origin implicit. Import produces an
-`IndexKind::Bgzf` index with `MemberHeader` points. Export accepts
-`MemberDeflate` points only when their retained header offsets are available,
+`IndexKind::Bgzf` index with `GzipMemberHeader` points. Export accepts
+`GzipMemberDeflate` points only when their retained header offsets are available,
 and otherwise requires member-header points, BGZF provenance, byte alignment,
 and absent windows.
 
@@ -302,7 +315,8 @@ validated rather than ignored or truncated.
 
 Correctness tests cover:
 
-- full and scattered reads from member-header and interior checkpoints;
+- full and scattered reads from gzip-member, zlib/raw-start, and interior
+  checkpoints;
 - truncated DEFLATE, truncated footer, CRC32 mismatch, and ISIZE mismatch;
 - concatenated and empty members, BGZF including its EOF block, stored-only
   streams, dense members, and marker/window streams;

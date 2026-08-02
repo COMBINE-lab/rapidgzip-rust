@@ -14,6 +14,7 @@ rapidgzip-core.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+libz-rs-sys.workspace = true
 paraseq.workspace = true
 
 [[bench]]

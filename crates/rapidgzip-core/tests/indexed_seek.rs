@@ -4,15 +4,15 @@ mod common;
 
 use common::{corpus, gzip};
 use rapidgzip_core::{
-    Checkpoint, CheckpointKind, Decoder, GzipIndex, IndexKind, IndexOptions, IndexedReader,
+    Checkpoint, CheckpointKind, Decoder, DeflateIndex, IndexKind, IndexOptions, IndexedReader,
     StoredWindow,
 };
 use std::io::{Read, Seek, SeekFrom};
 
 /// An index holding only the first member boundary, which every reader can
 /// build without help from the decoder.
-fn origin_index(compressed: &[u8], uncompressed_size: u64) -> GzipIndex {
-    let mut index = GzipIndex::new();
+fn origin_index(compressed: &[u8], uncompressed_size: u64) -> DeflateIndex {
+    let mut index = DeflateIndex::new();
     index.set_compressed_size(Some(compressed.len() as u64));
     index.set_uncompressed_size(Some(uncompressed_size));
     index
@@ -20,7 +20,7 @@ fn origin_index(compressed: &[u8], uncompressed_size: u64) -> GzipIndex {
             Checkpoint {
                 compressed_offset_in_bits: 0,
                 uncompressed_offset_in_bytes: 0,
-                kind: CheckpointKind::MemberHeader,
+                kind: CheckpointKind::GzipMemberHeader,
                 line_offset: None,
             },
             StoredWindow::empty(),
@@ -95,7 +95,7 @@ fn seeking_to_a_member_boundary_checkpoint_skips_its_header() {
             Checkpoint {
                 compressed_offset_in_bits: first_compressed.len() as u64 * 8,
                 uncompressed_offset_in_bytes: first.len() as u64,
-                kind: CheckpointKind::MemberHeader,
+                kind: CheckpointKind::GzipMemberHeader,
                 line_offset: None,
             },
             StoredWindow::empty(),
@@ -192,13 +192,13 @@ fn seeking_relative_to_the_current_position_works() {
 fn an_empty_index_reports_a_useful_error() {
     let plain = corpus(1024);
     let compressed = gzip(&plain, 6);
-    let mut reader = IndexedReader::new(compressed, GzipIndex::new()).expect("indexed reader");
+    let mut reader = IndexedReader::new(compressed, DeflateIndex::new()).expect("indexed reader");
     let mut buffer = [0u8; 16];
     let error = reader.read(&mut buffer).expect_err("no checkpoint");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
-fn built_index(compressed: &[u8], threads: usize) -> GzipIndex {
+fn built_index(compressed: &[u8], threads: usize) -> DeflateIndex {
     let decoder = Decoder::builder()
         .decoder_threads(threads)
         .build()
@@ -276,7 +276,7 @@ fn sequential_and_streaming_apis_build_the_same_member_index() {
             .index
             .checkpoints()
             .iter()
-            .all(|point| matches!(point.kind, CheckpointKind::MemberDeflate { .. }))
+            .all(|point| matches!(point.kind, CheckpointKind::GzipMemberDeflate { .. }))
     );
 }
 
@@ -346,7 +346,7 @@ fn marker_path_builds_seekable_interior_windows() {
 
     let mut bytes = Vec::new();
     index.write_gzidx(&mut bytes).expect("GZIDX write");
-    let restored = GzipIndex::read_gzidx(&mut bytes.as_slice(), Some(compressed.len() as u64))
+    let restored = DeflateIndex::read_gzidx(&mut bytes.as_slice(), Some(compressed.len() as u64))
         .expect("GZIDX read");
     let mut reader = IndexedReader::new(compressed, restored).expect("restored reader");
     reader.seek(SeekFrom::Start(15_000_000)).expect("seek");
@@ -372,8 +372,8 @@ fn bgzf_builds_every_nonempty_block_and_exports_gzi() {
         u64::from_le_bytes(gzi[..8].try_into().expect("pair count")) as usize,
         expected_blocks - 1
     );
-    let restored =
-        GzipIndex::read_gzi(&mut gzi.as_slice(), Some(compressed.len() as u64)).expect("gzi read");
+    let restored = DeflateIndex::read_gzi(&mut gzi.as_slice(), Some(compressed.len() as u64))
+        .expect("gzi read");
     let mut reader = IndexedReader::new(compressed, restored).expect("indexed reader");
     reader.seek(SeekFrom::Start(1_500_000)).expect("seek");
     let mut output = vec![0; 1024];

@@ -1,11 +1,12 @@
 use crate::backend::{
     DirectOutput, decode_source, decode_source_with_index, decode_stream, decode_stream_with_index,
 };
-use crate::gzip::{StreamCursor, validate_initial_header};
+use crate::format::FormatSelection;
+use crate::gzip::StreamCursor;
 use crate::reader;
 use crate::runtime::RuntimeState;
 use crate::{
-    DecodeError, DecodeReport, DecoderReader, IndexOptions, IndexedDecodeReport,
+    DecodeError, DecodeReport, DecoderReader, Format, IndexOptions, IndexedDecodeReport,
     IndexingDecoderReader, IndexingError, ReadAt,
 };
 use std::error::Error;
@@ -38,14 +39,72 @@ pub(crate) struct Config {
     pub(crate) compressed_chunk_size: usize,
     pub(crate) in_flight_chunks: usize,
     pub(crate) output_limit: Option<u64>,
+    pub(crate) expected_uncompressed_size: Option<u64>,
+    pub(crate) format: FormatSelection,
+}
+
+impl Config {
+    /// Checks a proposed decoded-output handoff against both configured bounds.
+    pub(crate) fn checked_output_total(
+        &self,
+        current: u64,
+        additional: usize,
+    ) -> Result<u64, DecodeError> {
+        let Some(actual) = current.checked_add(additional as u64) else {
+            return match (self.expected_uncompressed_size, self.output_limit) {
+                (Some(expected), Some(limit)) if limit < expected => {
+                    Err(DecodeError::OutputLimitExceeded { limit })
+                }
+                (Some(expected), _) => Err(DecodeError::UnexpectedOutputSize {
+                    expected,
+                    actual: u64::MAX,
+                }),
+                (None, limit) => Err(DecodeError::OutputLimitExceeded {
+                    limit: limit.unwrap_or(u64::MAX),
+                }),
+            };
+        };
+        let expectation_crossed = self
+            .expected_uncompressed_size
+            .is_some_and(|expected| actual > expected);
+        let limit_crossed = self.output_limit.is_some_and(|limit| actual > limit);
+
+        if expectation_crossed
+            && (!limit_crossed
+                || self.expected_uncompressed_size.expect("checked as some")
+                    <= self.output_limit.expect("checked as some"))
+        {
+            return Err(DecodeError::UnexpectedOutputSize {
+                expected: self.expected_uncompressed_size.expect("checked as some"),
+                actual,
+            });
+        }
+        if limit_crossed {
+            return Err(DecodeError::OutputLimitExceeded {
+                limit: self.output_limit.unwrap_or(u64::MAX),
+            });
+        }
+        Ok(actual)
+    }
+
+    /// Confirms an exact output expectation after framing verification.
+    pub(crate) fn verify_expected_output(&self, actual: u64) -> Result<(), DecodeError> {
+        if let Some(expected) = self.expected_uncompressed_size {
+            if expected != actual {
+                return Err(DecodeError::UnexpectedOutputSize { expected, actual });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Builder for an immutable, reusable [`Decoder`].
 ///
 /// Defaults use [`std::thread::available_parallelism`] as the maximum decoder
 /// budget, 4 MiB decoded chunks, 1 MiB positional input pages and compressed
-/// grid spacing, `decoder_threads + 2` in-flight chunks, and no output limit.
-/// The defaults favor throughput; applications with tight memory budgets can
+/// grid spacing, `decoder_threads + 2` in-flight chunks, strict gzip framing,
+/// and no output limit or exact-size expectation. The defaults favor
+/// throughput; applications with tight memory budgets can
 /// reduce the worker budget, decoded chunk size, or in-flight count.
 #[derive(Clone, Debug)]
 pub struct DecoderBuilder {
@@ -65,6 +124,8 @@ impl Default for DecoderBuilder {
                 compressed_chunk_size: MIB,
                 in_flight_chunks: decoder_threads.saturating_add(2),
                 output_limit: None,
+                expected_uncompressed_size: None,
+                format: FormatSelection::default(),
             },
         }
     }
@@ -96,7 +157,8 @@ impl DecoderBuilder {
 
     /// Sets the positional input page size in bytes.
     ///
-    /// The value must be non-zero and fit in zlib's `uInt`.
+    /// The value must be non-zero and fit in zlib's `uInt`. A streaming cursor
+    /// retains at least two bytes so format detection can span short reads.
     pub const fn input_page_size(mut self, bytes: usize) -> Self {
         self.config.input_page_size = bytes;
         self
@@ -127,6 +189,35 @@ impl DecoderBuilder {
     /// visible to the caller.
     pub const fn output_limit(mut self, bytes: Option<u64>) -> Self {
         self.config.output_limit = bytes;
+        self
+    }
+
+    /// Requires exactly `bytes` of decoded output, or clears the expectation.
+    ///
+    /// Unlike [`Self::output_limit`], this is both an upper and lower bound.
+    /// An overrun is rejected before the offending chunk is emitted, and an
+    /// underrun is rejected after the selected container is complete.
+    pub const fn expected_uncompressed_size(mut self, bytes: Option<u64>) -> Self {
+        self.config.expected_uncompressed_size = bytes;
+        self
+    }
+
+    /// Selects the container framing explicitly.
+    ///
+    /// The default is [`Format::Gzip`], preserving strict gzip behavior.
+    /// Select [`Format::RawDeflate`] explicitly because an unwrapped stream has
+    /// no magic bytes and is never safe to guess.
+    pub const fn format(mut self, format: Format) -> Self {
+        self.config.format = FormatSelection::Explicit(format);
+        self
+    }
+
+    /// Detects gzip or zlib framing from an exact two-byte prefix.
+    ///
+    /// Raw DEFLATE is never auto-detected. An unrecognized prefix produces
+    /// [`DecodeError::UnrecognizedFormat`].
+    pub const fn auto_detect_format(mut self) -> Self {
+        self.config.format = FormatSelection::Auto;
         self
     }
 
@@ -176,7 +267,8 @@ impl Decoder {
         DecoderBuilder::default()
     }
 
-    /// Decodes and verifies all gzip members into `output`.
+    /// Decodes the selected container into `output` and performs all available
+    /// integrity checks.
     ///
     /// The writer is used only by the calling thread and need not implement
     /// [`Send`].
@@ -195,8 +287,7 @@ impl Decoder {
         decode_source(source, &self.config, &cancelled, &mut sink, &runtime)
     }
 
-    /// Decodes and verifies every gzip member while collecting a random-access
-    /// index.
+    /// Decodes the selected container while collecting a random-access index.
     ///
     /// Index construction is explicit per operation. Ordinary [`Self::decode`]
     /// calls therefore retain their small [`Copy`] report and perform no
@@ -234,15 +325,15 @@ impl Decoder {
     /// Starts decoding an owned positional source and returns `Read + Send`
     /// decompressed output.
     ///
-    /// Initial gzip framing is validated before the background coordinator is
-    /// spawned. Later decoding failures are returned as [`std::io::Error`]
+    /// Initial selected framing is validated before the background coordinator
+    /// is spawned. Later decoding failures are returned as [`std::io::Error`]
     /// values by [`std::io::Read`], or as [`DecodeError`] by
     /// [`DecoderReader::finish`].
     pub fn reader<R>(&self, source: R) -> Result<DecoderReader, DecodeError>
     where
         R: ReadAt + 'static,
     {
-        validate_initial_header(&source, self.config.input_page_size)?;
+        crate::backend::validate_initial_source(&source, &self.config)?;
         reader::spawn(source, self.config.clone())
     }
 
@@ -256,7 +347,7 @@ impl Decoder {
     ///
     /// # Errors
     ///
-    /// Returns an initial source or gzip-framing failure. Later decode and
+    /// Returns an initial source or framing failure. Later decode and
     /// index failures are reported by [`Read::read`] and preserved in typed
     /// form by [`IndexingDecoderReader::finish`].
     pub fn reader_with_index<R>(
@@ -267,22 +358,21 @@ impl Decoder {
     where
         R: ReadAt + 'static,
     {
-        validate_initial_header(&source, self.config.input_page_size)?;
+        crate::backend::validate_initial_source(&source, &self.config)?;
         reader::spawn_indexed(source, self.config.clone(), options)
     }
 
-    /// Decodes and verifies all gzip members from a non-seekable source.
+    /// Decodes the selected format from a non-seekable source.
     ///
     /// This is the push interface for input that cannot be read positionally,
     /// such as standard input, a FIFO, a process substitution, or a socket. It
     /// mirrors [`Decoder::decode`], including the writer being used only by the
     /// calling thread.
     ///
-    /// Verification is identical to [`Decoder::decode`]: a member is accepted
-    /// only after a real final DEFLATE block whose CRC32 and ISIZE both match,
-    /// trailing non-gzip bytes are an error, and [`DecoderBuilder::output_limit`]
-    /// still fails before emitting bytes past the limit. The source is read once
-    /// in order, so decoding uses one calling thread regardless of
+    /// Validation is identical to [`Decoder::decode`], including gzip CRC32 and
+    /// ISIZE, zlib Adler-32, raw-DEFLATE structural completion, trailing-data
+    /// rejection, and configured output bounds. The source is read once in
+    /// order, so decoding uses one calling thread regardless of
     /// [`DecoderBuilder::decoder_threads`]. The returned report retains the
     /// configured worker budget, just like [`Decoder::decode`].
     ///
@@ -298,7 +388,7 @@ impl Decoder {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let decoder = Decoder::default();
     /// let report = decoder.decode_stream(io::stdin(), &mut io::sink())?;
-    /// println!("verified {} gzip members", report.member_count);
+    /// println!("completed {} framing units", report.member_count);
     /// # Ok(())
     /// # }
     /// ```
@@ -324,12 +414,12 @@ impl Decoder {
         decode_stream(&mut cursor, &self.config, &cancelled, &mut sink, &runtime)
     }
 
-    /// Decodes a non-seekable gzip stream while collecting a coarse but valid
-    /// member-boundary index.
+    /// Decodes non-seekable input while collecting a coarse but valid index.
     ///
     /// A forward-only source does not expose independently discoverable
-    /// interior block boundaries, so the resulting index records member starts.
-    /// It can later seek a stable positional copy of the same compressed bytes.
+    /// interior block boundaries, so the resulting index records gzip member
+    /// starts or the single zlib/raw stream start. It can later seek a stable
+    /// positional copy of the same compressed bytes.
     ///
     /// # Errors
     ///
@@ -407,7 +497,7 @@ impl Decoder {
     }
 
     /// Starts pull-driven decoding of a non-seekable source while collecting
-    /// a member-boundary index.
+    /// a framing-start index.
     ///
     /// Like [`Self::stream_reader`], this runs synchronously in the caller's
     /// `read` calls and spawns no coordinator or decoder worker. The returned
@@ -429,7 +519,7 @@ impl Decoder {
         reader::spawn_stream_indexed(source, self.config.clone(), options)
     }
 
-    /// Opens, decodes, and verifies every gzip member from a filesystem path.
+    /// Opens and decodes the selected format from a filesystem path.
     ///
     /// This is the push counterpart to [`Decoder::open`]. A regular file uses
     /// positional decoding; a non-regular path accepted by [`File::open`], such

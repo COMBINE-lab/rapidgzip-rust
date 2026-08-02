@@ -1,17 +1,18 @@
 //! htslib BGZF block index (`.gzi`).
 
 use super::{
-    Checkpoint, CheckpointKind, GzipIndex, IndexError, IndexKind, IndexReadOptions, StoredWindow,
-    read_u64_le, write_u64_le,
+    Checkpoint, CheckpointKind, DeflateIndex, IndexError, IndexKind, IndexReadOptions,
+    StoredWindow, read_u64_le, write_u64_le,
 };
 use std::io::{Read, Write};
 
-pub(crate) fn write_gzi(index: &GzipIndex, writer: &mut impl Write) -> Result<(), IndexError> {
+pub(crate) fn write_gzi(index: &DeflateIndex, writer: &mut impl Write) -> Result<(), IndexError> {
     index.validate()?;
     if index.kind != IndexKind::Bgzf {
-        return Err(IndexError::MissingMetadata(
-            "BGZF provenance for .gzi export",
-        ));
+        return Err(IndexError::IncompatibleFormat {
+            operation: ".gzi export",
+            kind: index.kind,
+        });
     }
 
     let mut pair_count = 0_u64;
@@ -51,11 +52,13 @@ pub(crate) fn write_gzi(index: &GzipIndex, writer: &mut impl Write) -> Result<()
 
 fn member_header_offset(checkpoint: &Checkpoint) -> Result<u64, IndexError> {
     match checkpoint.kind {
-        CheckpointKind::MemberHeader => Ok(checkpoint.compressed_offset_in_bits / 8),
-        CheckpointKind::MemberDeflate {
+        CheckpointKind::GzipMemberHeader => Ok(checkpoint.compressed_offset_in_bits / 8),
+        CheckpointKind::GzipMemberDeflate {
             header_offset_in_bytes,
         } => Ok(header_offset_in_bytes),
-        CheckpointKind::DeflateBlock => Err(IndexError::InvalidCheckpoint(
+        CheckpointKind::DeflateBlock
+        | CheckpointKind::ZlibHeader
+        | CheckpointKind::RawDeflateStart => Err(IndexError::InvalidCheckpoint(
             "BGZF index requires member-boundary checkpoints",
         )),
     }
@@ -65,7 +68,7 @@ pub(crate) fn read_gzi(
     reader: &mut impl Read,
     archive_size: Option<u64>,
     options: IndexReadOptions,
-) -> Result<GzipIndex, IndexError> {
+) -> Result<DeflateIndex, IndexError> {
     let pair_count = read_u64_le(reader)?;
     let pair_count = usize::try_from(pair_count).map_err(|_| IndexError::ExcessiveLength {
         what: "BGZF index pair count",
@@ -78,7 +81,7 @@ pub(crate) fn read_gzi(
         });
     }
 
-    let mut index = GzipIndex::new();
+    let mut index = DeflateIndex::new();
     index.kind = IndexKind::Bgzf;
     index.compressed_size_in_bytes = archive_size;
     index
@@ -91,7 +94,7 @@ pub(crate) fn read_gzi(
         Checkpoint {
             compressed_offset_in_bits: 0,
             uncompressed_offset_in_bytes: 0,
-            kind: CheckpointKind::MemberHeader,
+            kind: CheckpointKind::GzipMemberHeader,
             line_offset: None,
         },
         StoredWindow::empty(),
@@ -110,7 +113,7 @@ pub(crate) fn read_gzi(
             Checkpoint {
                 compressed_offset_in_bits,
                 uncompressed_offset_in_bytes: uncompressed,
-                kind: CheckpointKind::MemberHeader,
+                kind: CheckpointKind::GzipMemberHeader,
                 line_offset: None,
             },
             StoredWindow::empty(),
