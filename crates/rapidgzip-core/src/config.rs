@@ -6,8 +6,8 @@ use crate::gzip::StreamCursor;
 use crate::reader;
 use crate::runtime::RuntimeState;
 use crate::{
-    DecodeError, DecodeReport, DecoderReader, Format, IndexOptions, IndexedDecodeReport,
-    IndexingDecoderReader, IndexingError, ReadAt,
+    DecodeError, DecodeReport, DecoderReader, DeflateIndex, Format, IndexDecodeError, IndexOptions,
+    IndexedDecodeReport, IndexingDecoderReader, IndexingError, ReadAt,
 };
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 const MIB: usize = 1024 * 1024;
@@ -322,6 +323,72 @@ impl Decoder {
         )
     }
 
+    /// Decodes through a caller-supplied random-access index.
+    ///
+    /// Every indexed span runs plain zlib-rs inflation from an authoritative
+    /// checkpoint. The index is validated against the selected format and
+    /// source before workers start; each worker must then reach the next
+    /// checkpoint's exact compressed-bit and decompressed-byte offsets.
+    /// Invalid or mismatched indexes are errors and never silently select an
+    /// unindexed fallback.
+    ///
+    /// Worker output is handed off in bounded chunks, so a sparse index does
+    /// not cause an entire decompressed span to be allocated. Empty gzip
+    /// members remain explicit spans and are fully verified.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rapidgzip_core::{Decoder, DeflateIndex};
+    /// use std::fs::File;
+    /// use std::io;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut serialized = File::open("reads.fastq.gz.rgzidx")?;
+    /// let index = DeflateIndex::read_native(&mut serialized)?;
+    /// let source = File::open("reads.fastq.gz")?;
+    /// let report = Decoder::default().decode_from_index(
+    ///     &source,
+    ///     &mut io::sink(),
+    ///     &index,
+    /// )?;
+    /// assert!(report.member_count >= 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexDecodeError::Index`] for invalid or source-mismatched
+    /// metadata, [`IndexDecodeError::FormatMismatch`] when the builder and
+    /// index select different containers, or [`IndexDecodeError::Decode`] for
+    /// input, DEFLATE, verification, output, limit, or worker failures.
+    pub fn decode_from_index<R, W>(
+        &self,
+        source: &R,
+        output: &mut W,
+        index: &DeflateIndex,
+    ) -> Result<DecodeReport, IndexDecodeError>
+    where
+        R: ReadAt + ?Sized,
+        W: Write,
+    {
+        let plan = crate::indexed_parallel::IndexedPlan::build(source, &self.config, index)?;
+        let cancelled = AtomicBool::new(false);
+        let mut sink = DirectOutput::new(output);
+        let runtime = RuntimeState::new(self.config.decoder_threads);
+        crate::indexed_parallel::decode(
+            source,
+            &self.config,
+            &cancelled,
+            &mut sink,
+            index,
+            &plan,
+            &runtime,
+        )
+        .map_err(IndexDecodeError::from)
+    }
+
     /// Starts decoding an owned positional source and returns `Read + Send`
     /// decompressed output.
     ///
@@ -360,6 +427,54 @@ impl Decoder {
     {
         crate::backend::validate_initial_source(&source, &self.config)?;
         reader::spawn_indexed(source, self.config.clone(), options)
+    }
+
+    /// Starts full-stream decoding through an existing index and returns
+    /// owned `Read + Send` output.
+    ///
+    /// The [`Arc`] permits a large index and its stored windows to be shared
+    /// with the background coordinator without cloning them. Validation is
+    /// completed before any thread is spawned. Later failures are returned by
+    /// [`Read::read`] and preserved by [`DecoderReader::finish`]. The reader's
+    /// [`crate::DecoderHandle`] exposes the same telemetry and dynamic worker
+    /// ceiling as every other positional parallel path.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rapidgzip_core::{Decoder, DeflateIndex};
+    /// use std::fs::File;
+    /// use std::io;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut serialized = File::open("reads.fastq.gz.rgzidx")?;
+    /// let index = Arc::new(DeflateIndex::read_native(&mut serialized)?);
+    /// let mut reader = Decoder::default().reader_from_index(
+    ///     File::open("reads.fastq.gz")?,
+    ///     index,
+    /// )?;
+    /// io::copy(&mut reader, &mut io::sink())?;
+    /// reader.finish()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a strict index, format, or initial source validation error, or
+    /// a coordinator-thread creation failure.
+    pub fn reader_from_index<R>(
+        &self,
+        source: R,
+        index: Arc<DeflateIndex>,
+    ) -> Result<DecoderReader, IndexDecodeError>
+    where
+        R: ReadAt + 'static,
+    {
+        let plan = crate::indexed_parallel::IndexedPlan::build(&source, &self.config, &index)?;
+        reader::spawn_from_index(source, self.config.clone(), index, plan)
+            .map_err(IndexDecodeError::from)
     }
 
     /// Decodes the selected format from a non-seekable source.

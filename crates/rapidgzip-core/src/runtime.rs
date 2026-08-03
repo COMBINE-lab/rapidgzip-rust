@@ -28,6 +28,8 @@ pub enum DecoderPath {
     MarkerWindow,
     /// Independent inflation of indexed BGZF blocks.
     Bgzf,
+    /// Plain zlib-rs inflation resumed from caller-supplied index checkpoints.
+    IndexedParallel,
 }
 
 impl DecoderPath {
@@ -40,6 +42,7 @@ impl DecoderPath {
             Self::MarkerAdmission => 4,
             Self::MarkerWindow => 5,
             Self::Bgzf => 6,
+            Self::IndexedParallel => 7,
         }
     }
 
@@ -51,6 +54,7 @@ impl DecoderPath {
             4 => Self::MarkerAdmission,
             5 => Self::MarkerWindow,
             6 => Self::Bgzf,
+            7 => Self::IndexedParallel,
             _ => Self::Starting,
         }
     }

@@ -5,6 +5,7 @@ use libz_rs_sys as z;
 use rapidgzip_core::{Decoder, Format, IndexOptions};
 use std::io;
 use std::mem::size_of;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -35,13 +36,17 @@ fn stored_member(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn deflate_with(bytes: &[u8], window_bits: i32) -> Vec<u8> {
+    deflate_with_level(bytes, window_bits, 1)
+}
+
+fn deflate_with_level(bytes: &[u8], window_bits: i32, level: i32) -> Vec<u8> {
     let mut stream = z::z_stream::default();
     // SAFETY: `stream` is live and uniquely borrowed, the zlib-rs version
     // string is static and NUL-terminated, and the ABI structure size matches.
     let status = unsafe {
         z::deflateInit2_(
             &mut stream,
-            1,
+            level,
             z::Z_DEFLATED,
             window_bits,
             8,
@@ -80,6 +85,19 @@ fn pseudo_random_bytes(length: usize) -> Vec<u8> {
         .collect()
 }
 
+fn fastq_like_bytes(length: usize) -> Vec<u8> {
+    let mut output = Vec::with_capacity(length + 256);
+    let mut record = 0_u64;
+    while output.len() < length {
+        output.extend_from_slice(format!("@read-{record}\n").as_bytes());
+        output.extend_from_slice(b"ACGTGCTAGCTAGGATCCGATCGATCGTAGCTAGCTAGCTACGATCGATCG\n+\n");
+        output.extend_from_slice(b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n");
+        record += 1;
+    }
+    output.truncate(length);
+    output
+}
+
 fn decode_reader(criterion: &mut Criterion) {
     let decoded = vec![0xA5; 16 * 1024 * 1024];
     let compressed: Arc<[u8]> = stored_member(&decoded).into();
@@ -115,6 +133,45 @@ fn decode_reader(criterion: &mut Criterion) {
                     io::copy(&mut reader, &mut io::sink()).unwrap();
                     reader.finish().unwrap()
                 });
+            },
+        );
+    }
+    group.finish();
+
+    let decoded = fastq_like_bytes(32 * 1024 * 1024);
+    let compressed: Arc<[u8]> = deflate_with_level(&decoded, 31, 6).into();
+    let index_options = IndexOptions {
+        checkpoint_spacing: NonZeroU64::new(1024 * 1024).expect("nonzero"),
+        ..IndexOptions::default()
+    };
+    let index = Decoder::builder()
+        .decoder_threads(1)
+        .build()
+        .unwrap()
+        .decode_with_index(&compressed, &mut io::sink(), index_options)
+        .unwrap()
+        .index;
+    assert!(index.checkpoint_count() > 1);
+    let mut group = criterion.benchmark_group("indexed_parallel_vs_ordinary");
+    group.throughput(Throughput::Bytes(decoded.len() as u64));
+    for threads in [1, 2, 4, 8, 16] {
+        let decoder = Decoder::builder().decoder_threads(threads).build().unwrap();
+        group.bench_with_input(
+            BenchmarkId::new("from_index", threads),
+            &threads,
+            |bencher, _| {
+                bencher.iter(|| {
+                    decoder
+                        .decode_from_index(&compressed, &mut io::sink(), &index)
+                        .unwrap()
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("ordinary", threads),
+            &threads,
+            |bencher, _| {
+                bencher.iter(|| decoder.decode(&compressed, &mut io::sink()).unwrap());
             },
         );
     }

@@ -37,6 +37,22 @@ worker ceiling, and optional consumer delay in microseconds. Output includes
 maximum active, busy, spawned, and auxiliary threads; pressure sample counts;
 and time from sustained consumer backpressure to retirement of excess workers.
 
+Existing-index full-stream decoding has a paired file-backed driver:
+
+```bash
+cargo run --release -p rapidgzip-bench --bin indexed -- \
+  reads.fastq.gz 1,2,4,8,16 5 zlib 1 file
+```
+
+Arguments after the path are thread budgets, repetitions, predecessor-window
+storage (`zlib` or `raw`), checkpoint spacing in MiB, and source mode (`file`
+or `memory`). Index construction is always performed once with one worker and
+reported separately. Each cell warms both paths, then reports the median for
+`decode_from_index` and ordinary `decode` over the same source and decoder
+configuration. The generated Criterion group
+`indexed_parallel_vs_ordinary` provides a repository-local regression fixture;
+the binary is the retained FASTQ check.
+
 For corpus and competitor runs, build the Rust release binary and use the
 matrix driver:
 
@@ -404,3 +420,33 @@ numbers validate paired format cost rather than scalability. Large-stream path
 selection and indexed seeking are separately asserted by the integration
 suite; release performance still uses retained FASTQ and representative
 compressible zlib/raw corpora.
+
+## 2026-08-03 indexed full-stream FASTQ validation
+
+The clean PR #14 successor was measured on the dual-socket Xeon E5-2699 v4
+host (44 physical cores, 88 hardware threads, affinity CPUs 0-87) with the
+file-backed `indexed` driver above. The input was
+`SRR22403185_2.fastq.gz`: 96,754,995 compressed bytes, 361,815,302 decoded
+bytes, SHA-256
+`3794ae8a0cf3a2db49d9814a5243f8c2ff6397b33c0ce6f79adc0ddea4cec0f2`.
+Large input data is not stored in this repository.
+
+One-worker index construction at 1 MiB spacing retained 334 checkpoints in
+1.068 seconds using the default compressed-window policy. After one warmup per
+path, five repetitions produced these median MiB/s values:
+
+| decoder-worker budget | from existing index | ordinary decode |
+|---:|---:|---:|
+| 1 | 553.9 | 687.8 |
+| 2 | 982.2 | 502.8 |
+| 4 | 1,657.1 | 834.1 |
+| 8 | 2,137.9 | 1,291.5 |
+| 16 | 2,964.3 | 1,768.9 |
+
+These values validate scaling and are not a new cross-implementation parity
+claim. The paired run caught an important structural regression before review:
+the first implementation emitted output after every `Z_BLOCK` return. This
+FASTQ contains many small internal DEFLATE blocks, so multi-worker throughput
+fell below 350 MiB/s despite synthetic success. Accumulating internal block
+results into configured output chunks restored scaling; a focused integration
+test now enforces a chunk-plus-span bound on writer handoffs.

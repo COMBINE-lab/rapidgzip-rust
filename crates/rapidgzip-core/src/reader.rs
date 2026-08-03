@@ -4,7 +4,8 @@ use crate::backend::{
 };
 use crate::config::Config;
 use crate::gzip::StreamCursor;
-use crate::index::{IndexCollector, IndexOptions};
+use crate::index::{DeflateIndex, IndexCollector, IndexOptions};
+use crate::indexed_parallel::IndexedPlan;
 use crate::runtime::{AuxiliaryKind, RuntimeState};
 use crate::{
     DecodeError, DecodeReport, DecoderHandle, DecoderStats, IndexedDecodeReport, IndexingError,
@@ -217,6 +218,30 @@ where
         configured_workers,
     )
     .map(|inner| IndexingDecoderReader { inner })
+}
+
+pub(crate) fn spawn_from_index<R>(
+    source: R,
+    config: Config,
+    index: Arc<DeflateIndex>,
+    plan: IndexedPlan,
+) -> Result<DecoderReader, DecodeError>
+where
+    R: ReadAt + 'static,
+{
+    let in_flight_chunks = config.in_flight_chunks;
+    let configured_workers = config.decoder_threads;
+    spawn_coordinator(
+        move |cancelled, output, runtime| {
+            crate::indexed_parallel::decode(
+                &source, &config, cancelled, output, &index, &plan, runtime,
+            )
+            .map(Completion::Decode)
+            .map_err(IndexingError::from)
+        },
+        in_flight_chunks,
+        configured_workers,
+    )
 }
 
 /// Creates a pull-driven decoder for a non-seekable source.

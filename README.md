@@ -271,6 +271,44 @@ collect a coarse member-boundary index while consuming forward-only input. The
 result can be used later only with a stable positional copy of the same
 compressed bytes.
 
+An existing index can also drive a complete parallel decode. The push API
+borrows it; the `Read + Send` API takes an `Arc` so its stored windows are not
+cloned into the background coordinator:
+
+```rust,no_run
+use rapidgzip_core::{Decoder, DeflateIndex};
+use std::fs::File;
+use std::io::{self, Read};
+use std::sync::Arc;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut serialized = File::open("reads.fastq.gz.rgzidx")?;
+    let index = Arc::new(DeflateIndex::read_native(&mut serialized)?);
+    let decoder = Decoder::builder().decoder_threads(16).build()?;
+    let mut reader = decoder.reader_from_index(
+        File::open("reads.fastq.gz")?,
+        Arc::clone(&index),
+    )?;
+
+    let control = reader.handle();
+    control.set_worker_limit(8)?;
+    io::copy(&mut reader, &mut io::sink())?;
+    let report = reader.finish()?;
+    assert!(report.member_count >= 1);
+    Ok(())
+}
+```
+
+`decode_from_index` is the corresponding lower-overhead `Write` operation.
+Both APIs are strict: the index must match the source, selected container,
+compressed bit boundaries, and decompressed offsets. They never hide a bad
+index by falling back to ordinary decoding. Gzip CRC32/ISIZE and zlib Adler-32
+remain fully verified because the operation decodes every indexed span from
+source origin. Concatenated and empty gzip members are preserved, and an
+imported BGZF `.gzi` works even though that format omits the final decompressed
+size. Telemetry identifies `DecoderPath::IndexedParallel` and exposes the same
+dynamic worker ceiling as other parallel readers.
+
 `DeflateIndex` records gzip, BGZF, zlib, or raw-DEFLATE provenance and reads and
 writes:
 
@@ -399,10 +437,10 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 The integration suite covers gzip, zlib, raw DEFLATE, multi-member streams,
 BGZF, corruption, format detection across short/interrupted reads, false header
-candidates, output limits and exact sizes, indexing/seeking, cancellation,
-one-byte consumer buffers, and direct paraseq consumption. Generated benchmark
-corpora and large sequencing files are deliberately not stored in the
-repository.
+candidates, output limits and exact sizes, index construction, indexed
+full-stream parallel decode, seeking, cancellation, one-byte consumer buffers,
+and direct paraseq consumption. Generated benchmark corpora and large
+sequencing files are deliberately not stored in the repository.
 
 ## Releasing
 
@@ -428,11 +466,16 @@ MIT. See [LICENSE-BSD-3-CLAUSE] and [LICENSE-MIT].
 
 [`Decoder::decode`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode
 [`Decoder::decode_path`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode_path
+[`Decoder::decode_from_index`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode_from_index
+[`Decoder::decode_with_index`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode_with_index
 [`Decoder::decode_stream`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode_stream
 [`Decoder::open`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.open
 [`Decoder::reader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.reader
+[`Decoder::reader_from_index`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.reader_from_index
 [`Decoder::stream_reader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.stream_reader
+[`DeflateIndex`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DeflateIndex.html
 [`DecoderHandle`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderHandle.html
+[`DecoderPath::IndexedParallel`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/enum.DecoderPath.html#variant.IndexedParallel
 [`DecoderPath::Sequential`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/enum.DecoderPath.html#variant.Sequential
 [`DecoderReader::handle`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderReader.html#method.handle
 [`DecoderBuilder::input_page_size`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.input_page_size
