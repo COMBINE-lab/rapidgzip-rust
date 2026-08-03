@@ -1,5 +1,5 @@
 use crate::crc32::Crc32;
-use crate::{DecodeError, GzipErrorKind, ReadAt};
+use crate::{AnalysisErrorKind, AnalysisResource, DecodeError, GzipErrorKind, ReadAt};
 use std::io::{self, Read};
 
 const FLAG_HEADER_CRC: u8 = 0x02;
@@ -409,6 +409,108 @@ pub(crate) struct MemberHeader {
     pub(crate) bgzf_block_size: Option<u16>,
 }
 
+/// Complete gzip metadata retained only for structural analysis.
+pub(crate) struct DetailedMemberHeader {
+    pub(crate) member: MemberHeader,
+    pub(crate) flags: u8,
+    pub(crate) modification_time: u32,
+    pub(crate) extra_flags: u8,
+    pub(crate) operating_system: u8,
+    pub(crate) file_name: Option<Vec<u8>>,
+    pub(crate) comment: Option<Vec<u8>>,
+    pub(crate) extra: Option<Vec<u8>>,
+    pub(crate) header_crc16: Option<u16>,
+    pub(crate) retained_metadata_bytes: usize,
+}
+
+struct HeaderDetailsBuilder {
+    maximum_bytes: usize,
+    retained_bytes: usize,
+    flags: u8,
+    modification_time: u32,
+    extra_flags: u8,
+    operating_system: u8,
+    file_name: Option<Vec<u8>>,
+    comment: Option<Vec<u8>>,
+    extra: Option<Vec<u8>>,
+    header_crc16: Option<u16>,
+}
+
+impl HeaderDetailsBuilder {
+    const fn new(maximum_bytes: usize, retained_bytes: usize) -> Self {
+        Self {
+            maximum_bytes,
+            retained_bytes,
+            flags: 0,
+            modification_time: 0,
+            extra_flags: 0,
+            operating_system: 0,
+            file_name: None,
+            comment: None,
+            extra: None,
+            header_crc16: None,
+        }
+    }
+
+    fn reserve_bytes(&mut self, additional: usize) -> Result<(), DecodeError> {
+        if self
+            .retained_bytes
+            .checked_add(additional)
+            .is_none_or(|total| total > self.maximum_bytes)
+        {
+            return Err(DecodeError::Analysis {
+                reason: AnalysisErrorKind::ResourceLimit {
+                    resource: AnalysisResource::HeaderBytes,
+                    limit: self.maximum_bytes,
+                },
+            });
+        }
+        self.retained_bytes += additional;
+        Ok(())
+    }
+
+    fn push_name_byte(&mut self, byte: u8) -> Result<(), DecodeError> {
+        self.reserve_bytes(1)?;
+        let name = self.file_name.get_or_insert_with(Vec::new);
+        name.try_reserve(1).map_err(|_| DecodeError::Analysis {
+            reason: AnalysisErrorKind::AllocationFailed {
+                resource: AnalysisResource::HeaderBytes,
+                additional: 1,
+            },
+        })?;
+        name.push(byte);
+        Ok(())
+    }
+
+    fn push_comment_byte(&mut self, byte: u8) -> Result<(), DecodeError> {
+        self.reserve_bytes(1)?;
+        let comment = self.comment.get_or_insert_with(Vec::new);
+        comment.try_reserve(1).map_err(|_| DecodeError::Analysis {
+            reason: AnalysisErrorKind::AllocationFailed {
+                resource: AnalysisResource::HeaderBytes,
+                additional: 1,
+            },
+        })?;
+        comment.push(byte);
+        Ok(())
+    }
+
+    fn finish(self, member: MemberHeader) -> DetailedMemberHeader {
+        DetailedMemberHeader {
+            member,
+            flags: self.flags,
+            modification_time: self.modification_time,
+            extra_flags: self.extra_flags,
+            operating_system: self.operating_system,
+            file_name: self.file_name,
+            comment: self.comment,
+            extra: self.extra,
+            header_crc16: self.header_crc16,
+            retained_metadata_bytes: self.retained_bytes,
+        }
+    }
+}
+
 fn checked_header_byte<C: InputCursor>(
     cursor: &mut C,
     crc: &mut Option<Crc32>,
@@ -426,6 +528,28 @@ pub(crate) fn parse_member_header<C: InputCursor>(
     cursor: &mut C,
     first_member: bool,
 ) -> Result<MemberHeader, DecodeError> {
+    parse_member_header_inner(cursor, first_member, None).map(|(header, _)| header)
+}
+
+/// Parses and retains every gzip header field within `maximum_metadata_bytes`.
+pub(crate) fn parse_member_header_detailed<C: InputCursor>(
+    cursor: &mut C,
+    first_member: bool,
+    maximum_metadata_bytes: usize,
+    retained_metadata_bytes: usize,
+) -> Result<DetailedMemberHeader, DecodeError> {
+    let details = HeaderDetailsBuilder::new(maximum_metadata_bytes, retained_metadata_bytes);
+    let (member, details) = parse_member_header_inner(cursor, first_member, Some(details))?;
+    Ok(details
+        .expect("the detailed parser preserves its builder")
+        .finish(member))
+}
+
+fn parse_member_header_inner<C: InputCursor>(
+    cursor: &mut C,
+    first_member: bool,
+    mut details: Option<HeaderDetailsBuilder>,
+) -> Result<(MemberHeader, Option<HeaderDetailsBuilder>), DecodeError> {
     let start = cursor.position();
 
     let id1 = cursor.byte(start)?;
@@ -463,9 +587,22 @@ pub(crate) fn parse_member_header<C: InputCursor>(
         None
     };
 
-    // MTIME, XFL, and OS are metadata only.
-    for _ in 0..6 {
-        checked_header_byte(cursor, &mut header_crc, start)?;
+    if let Some(details) = details.as_mut() {
+        details.flags = flags;
+    }
+
+    let mut fixed_metadata = [0_u8; 6];
+    for byte in &mut fixed_metadata {
+        *byte = checked_header_byte(cursor, &mut header_crc, start)?;
+    }
+    if let Some(details) = details.as_mut() {
+        details.modification_time = u32::from_le_bytes(
+            fixed_metadata[..4]
+                .try_into()
+                .expect("the metadata prefix has four bytes"),
+        );
+        details.extra_flags = fixed_metadata[4];
+        details.operating_system = fixed_metadata[5];
     }
 
     let mut bgzf_block_size = None;
@@ -473,7 +610,29 @@ pub(crate) fn parse_member_header<C: InputCursor>(
         let low = checked_header_byte(cursor, &mut header_crc, start)?;
         let high = checked_header_byte(cursor, &mut header_crc, start)?;
         let extra_length = usize::from(u16::from_le_bytes([low, high]));
-        let mut extra = Vec::with_capacity(extra_length);
+        if let Some(details) = details.as_mut() {
+            details.reserve_bytes(extra_length)?;
+        }
+        let analyzing = details.is_some();
+        let mut extra = Vec::new();
+        extra.try_reserve_exact(extra_length).map_err(|_| {
+            if analyzing {
+                DecodeError::Analysis {
+                    reason: AnalysisErrorKind::AllocationFailed {
+                        resource: AnalysisResource::HeaderBytes,
+                        additional: extra_length,
+                    },
+                }
+            } else {
+                DecodeError::input_io(
+                    start,
+                    io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "could not allocate the gzip extra field",
+                    ),
+                )
+            }
+        })?;
         for _ in 0..extra_length {
             extra.push(checked_header_byte(cursor, &mut header_crc, start)?);
         }
@@ -498,10 +657,20 @@ pub(crate) fn parse_member_header<C: InputCursor>(
             }
             offset = data_end;
         }
+        if let Some(details) = details.as_mut() {
+            details.extra = Some(extra);
+        }
     }
 
-    for flag in [FLAG_NAME, FLAG_COMMENT] {
+    for (flag, is_name) in [(FLAG_NAME, true), (FLAG_COMMENT, false)] {
         if flags & flag != 0 {
+            if let Some(details) = details.as_mut() {
+                if is_name {
+                    details.file_name = Some(Vec::new());
+                } else {
+                    details.comment = Some(Vec::new());
+                }
+            }
             loop {
                 if cursor.is_at_end()? {
                     return Err(DecodeError::InvalidGzip {
@@ -509,8 +678,16 @@ pub(crate) fn parse_member_header<C: InputCursor>(
                         reason: GzipErrorKind::UnterminatedHeaderField,
                     });
                 }
-                if checked_header_byte(cursor, &mut header_crc, start)? == 0 {
+                let byte = checked_header_byte(cursor, &mut header_crc, start)?;
+                if byte == 0 {
                     break;
+                }
+                if let Some(details) = details.as_mut() {
+                    if is_name {
+                        details.push_name_byte(byte)?;
+                    } else {
+                        details.push_comment_byte(byte)?;
+                    }
                 }
             }
         }
@@ -527,13 +704,19 @@ pub(crate) fn parse_member_header<C: InputCursor>(
                 reason: GzipErrorKind::HeaderChecksumMismatch { expected, actual },
             });
         }
+        if let Some(details) = details.as_mut() {
+            details.header_crc16 = Some(expected);
+        }
     }
 
-    Ok(MemberHeader {
-        start,
-        deflate_start: cursor.position(),
-        bgzf_block_size,
-    })
+    Ok((
+        MemberHeader {
+            start,
+            deflate_start: cursor.position(),
+            bgzf_block_size,
+        },
+        details,
+    ))
 }
 
 /// Validates the first member header against a stream's buffered prefix.

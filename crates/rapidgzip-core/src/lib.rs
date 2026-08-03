@@ -93,6 +93,16 @@
 //! workers finish their current task and retire; sustained reader backpressure
 //! also reduces admission automatically.
 //!
+//! # Structural analysis
+//!
+//! [`Decoder::analyze`] and [`Decoder::analyze_stream`] verify the complete
+//! input while returning an [`Analysis`] of container streams, DEFLATE blocks,
+//! dynamic Huffman alphabets, symbol composition, and predecessor-window use.
+//! [`AnalyzeOptions`] bounds retained streams, blocks, optional gzip metadata,
+//! and individual back-references. Exact aggregate reference statistics remain
+//! available when detail retention is disabled or exhausted. The causal walk
+//! is single-threaded and keeps only one 32 KiB decoded history window.
+//!
 //! # Random access
 //!
 //! [`Decoder::decode_with_index`] and [`Decoder::reader_with_index`] collect a
@@ -128,6 +138,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
+mod analyze;
 mod backend;
 mod config;
 mod crc32;
@@ -146,10 +157,15 @@ mod zlib;
 pub mod index;
 pub mod parallel;
 
+pub use analyze::{
+    AlphabetShape, Analysis, AnalyzeOptions, Backreference, BlockAnalysis, BlockType,
+    GzipHeaderFields, StreamAnalysis, StreamFooter, StreamHeader, ZlibHeaderFields,
+};
 pub use config::{ConfigError, Decoder, DecoderBuilder};
 pub use error::{
-    DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, IndexDecodeError,
-    IndexedDecodeReport, IndexingError, ZlibErrorKind,
+    AnalysisCounter, AnalysisErrorKind, AnalysisResource, DecodeError, DecodeReport,
+    DeflateErrorKind, GzipErrorKind, IndexDecodeError, IndexedDecodeReport, IndexingError,
+    ZlibErrorKind,
 };
 pub use format::Format;
 pub use index::{

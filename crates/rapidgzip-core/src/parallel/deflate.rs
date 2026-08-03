@@ -10,20 +10,20 @@ use std::array;
 use std::sync::OnceLock;
 
 const MAX_BITS: usize = 15;
-const END_OF_BLOCK: usize = 256;
+pub(crate) const END_OF_BLOCK: usize = 256;
 
-const LENGTH_BASE: [usize; 29] = [
+pub(crate) const LENGTH_BASE: [usize; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
 ];
-const LENGTH_EXTRA: [u8; 29] = [
+pub(crate) const LENGTH_EXTRA: [u8; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
-const DISTANCE_BASE: [usize; 30] = [
+pub(crate) const DISTANCE_BASE: [usize; 30] = [
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
     2049, 3073, 4097, 6145, 8193, 12_289, 16_385, 24_577,
 ];
-const DISTANCE_EXTRA: [u8; 30] = [
+pub(crate) const DISTANCE_EXTRA: [u8; 30] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
     13,
 ];
@@ -42,6 +42,29 @@ pub(crate) enum Error {
     InvalidDistance,
     OutputLimit,
     BoundaryMismatch,
+}
+
+/// Bit operations shared by the speculative decoder and structural analyzer.
+///
+/// The production decoder implements this over an in-memory task slice. The
+/// analyzer implements it over the common bounded input cursor. Generic
+/// monomorphization keeps the existing hot decoder free of dynamic dispatch.
+pub(crate) trait DeflateBits {
+    /// Error type appropriate to the caller's input model.
+    type Error;
+
+    /// Reads `count` little-endian DEFLATE bits and advances the cursor.
+    fn read_bits(&mut self, count: u8) -> Result<u32, Self::Error>;
+
+    /// Peeks up to `count` bits, zero-padding past EOF while reporting how many
+    /// real bits were available.
+    fn peek_bits_padded(&mut self, count: u8) -> Result<(u32, u8), Self::Error>;
+
+    /// Advances over bits already proven available by a preceding peek.
+    fn advance_bits(&mut self, count: u8) -> Result<(), Self::Error>;
+
+    /// Translates a structural decoder failure at the current bit position.
+    fn error(&self, error: Error) -> Self::Error;
 }
 
 #[derive(Clone)]
@@ -130,6 +153,31 @@ impl<'a> BitReader<'a> {
     }
 }
 
+impl DeflateBits for BitReader<'_> {
+    type Error = Error;
+
+    #[inline(always)]
+    fn read_bits(&mut self, count: u8) -> Result<u32, Self::Error> {
+        BitReader::read_bits(self, count)
+    }
+
+    #[inline(always)]
+    fn peek_bits_padded(&mut self, count: u8) -> Result<(u32, u8), Self::Error> {
+        Ok(BitReader::peek_bits_padded(self, count))
+    }
+
+    #[inline(always)]
+    fn advance_bits(&mut self, count: u8) -> Result<(), Self::Error> {
+        self.bit_offset += usize::from(count);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn error(&self, error: Error) -> Self::Error {
+        error
+    }
+}
+
 #[inline(always)]
 fn word_at(bytes: &[u8], byte_offset: usize) -> u64 {
     if bytes.len().saturating_sub(byte_offset) >= 8 {
@@ -148,7 +196,7 @@ fn word_at(bytes: &[u8], byte_offset: usize) -> u64 {
 }
 
 #[derive(Clone)]
-struct Huffman {
+pub(crate) struct Huffman {
     // Packed as `(bit_length << 9) | symbol`, indexed by the next
     // `maximum_length` stream bits.
     table: Vec<u16>,
@@ -223,17 +271,17 @@ impl Huffman {
     }
 
     #[inline(always)]
-    fn decode(&self, reader: &mut BitReader<'_>) -> Result<usize, Error> {
-        let (bits, available) = reader.peek_bits_padded(self.maximum_length);
+    pub(crate) fn decode<B: DeflateBits>(&self, reader: &mut B) -> Result<usize, B::Error> {
+        let (bits, available) = reader.peek_bits_padded(self.maximum_length)?;
         let packed = self.table[bits as usize];
         if packed == u16::MAX {
-            return Err(Error::InvalidSymbol);
+            return Err(reader.error(Error::InvalidSymbol));
         }
         let length = (packed >> 9) as u8;
         if length > available {
-            return Err(Error::UnexpectedEof);
+            return Err(reader.error(Error::UnexpectedEof));
         }
-        reader.bit_offset += usize::from(length);
+        reader.advance_bits(length)?;
         Ok(usize::from(packed & 0x01FF))
     }
 }
@@ -335,7 +383,7 @@ impl History {
     }
 }
 
-fn fixed_trees() -> &'static (Huffman, Huffman) {
+pub(crate) fn fixed_trees() -> &'static (Huffman, Huffman) {
     static TREES: OnceLock<(Huffman, Huffman)> = OnceLock::new();
     TREES.get_or_init(|| {
         let mut literal_lengths = [0_u8; 288];
@@ -352,19 +400,53 @@ fn fixed_trees() -> &'static (Huffman, Huffman) {
     })
 }
 
-fn dynamic_trees(reader: &mut BitReader<'_>) -> Result<(Huffman, Huffman), Error> {
+/// Code lengths retained from one dynamic-Huffman header.
+pub(crate) struct DeclaredCodeLengths {
+    /// All nineteen precode lengths; undeclared suffix entries are zero.
+    pub(crate) precode: [u8; 19],
+    /// Number of precode entries physically present in the header.
+    pub(crate) precode_count: usize,
+    /// Combined literal/length and distance lengths in declaration order.
+    pub(crate) lengths: Vec<u8>,
+    /// Number of literal/length entries at the start of `lengths`.
+    pub(crate) literal_count: usize,
+    /// Number of distance entries at the end of `lengths`.
+    pub(crate) distance_count: usize,
+}
+
+/// Parses a dynamic header while retaining its declared code lengths.
+pub(crate) fn dynamic_trees_with_lengths<B: DeflateBits>(
+    reader: &mut B,
+) -> Result<(Huffman, Huffman, DeclaredCodeLengths), B::Error> {
+    dynamic_trees_inner(reader, true).map(|(literal, distance, declared)| {
+        (
+            literal,
+            distance,
+            declared.expect("the retaining parser always returns code lengths"),
+        )
+    })
+}
+
+fn dynamic_trees<B: DeflateBits>(reader: &mut B) -> Result<(Huffman, Huffman), B::Error> {
+    dynamic_trees_inner(reader, false).map(|(literal, distance, _)| (literal, distance))
+}
+
+fn dynamic_trees_inner<B: DeflateBits>(
+    reader: &mut B,
+    retain_lengths: bool,
+) -> Result<(Huffman, Huffman, Option<DeclaredCodeLengths>), B::Error> {
     let literal_count = 257 + reader.read_bits(5)? as usize;
     let distance_count = 1 + reader.read_bits(5)? as usize;
     let precode_count = 4 + reader.read_bits(4)? as usize;
     if literal_count > 286 || distance_count > 32 {
-        return Err(Error::InvalidCodeLengths);
+        return Err(reader.error(Error::InvalidCodeLengths));
     }
 
     let mut precode_lengths = [0_u8; 19];
     for &symbol in PRECODE_ORDER.iter().take(precode_count) {
         precode_lengths[symbol] = reader.read_bits(3)? as u8;
     }
-    let precode = Huffman::from_lengths(&precode_lengths)?;
+    let precode = Huffman::from_lengths(&precode_lengths).map_err(|error| reader.error(error))?;
 
     let target_count = literal_count + distance_count;
     let mut lengths = Vec::with_capacity(target_count);
@@ -372,44 +454,55 @@ fn dynamic_trees(reader: &mut BitReader<'_>) -> Result<(Huffman, Huffman), Error
         match precode.decode(reader)? {
             value @ 0..=15 => lengths.push(value as u8),
             16 => {
-                let previous = *lengths.last().ok_or(Error::InvalidCodeLengths)?;
+                let previous = *lengths
+                    .last()
+                    .ok_or_else(|| reader.error(Error::InvalidCodeLengths))?;
                 let repetitions = 3 + reader.read_bits(2)? as usize;
                 if lengths.len().saturating_add(repetitions) > target_count {
-                    return Err(Error::InvalidCodeLengths);
+                    return Err(reader.error(Error::InvalidCodeLengths));
                 }
                 lengths.extend(std::iter::repeat_n(previous, repetitions));
             }
             17 => {
                 let repetitions = 3 + reader.read_bits(3)? as usize;
                 if lengths.len().saturating_add(repetitions) > target_count {
-                    return Err(Error::InvalidCodeLengths);
+                    return Err(reader.error(Error::InvalidCodeLengths));
                 }
                 lengths.extend(std::iter::repeat_n(0, repetitions));
             }
             18 => {
                 let repetitions = 11 + reader.read_bits(7)? as usize;
                 if lengths.len().saturating_add(repetitions) > target_count {
-                    return Err(Error::InvalidCodeLengths);
+                    return Err(reader.error(Error::InvalidCodeLengths));
                 }
                 lengths.extend(std::iter::repeat_n(0, repetitions));
             }
-            _ => return Err(Error::InvalidSymbol),
+            _ => return Err(reader.error(Error::InvalidSymbol)),
         }
     }
     if lengths[END_OF_BLOCK] == 0 {
-        return Err(Error::InvalidCodeLengths);
+        return Err(reader.error(Error::InvalidCodeLengths));
     }
     if distance_count > 30
         && lengths[literal_count + 30..]
             .iter()
             .any(|&length| length != 0)
     {
-        return Err(Error::InvalidCodeLengths);
+        return Err(reader.error(Error::InvalidCodeLengths));
     }
 
-    let literal = Huffman::from_lengths(&lengths[..literal_count])?;
-    let distance = Huffman::from_lengths(&lengths[literal_count..])?;
-    Ok((literal, distance))
+    let literal =
+        Huffman::from_lengths(&lengths[..literal_count]).map_err(|error| reader.error(error))?;
+    let distance =
+        Huffman::from_lengths(&lengths[literal_count..]).map_err(|error| reader.error(error))?;
+    let declared = retain_lengths.then_some(DeclaredCodeLengths {
+        precode: precode_lengths,
+        precode_count,
+        lengths,
+        literal_count,
+        distance_count,
+    });
+    Ok((literal, distance, declared))
 }
 
 struct DecodedBuffer {

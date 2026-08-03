@@ -149,7 +149,7 @@ impl<W: Write> Output for DirectOutput<'_, W> {
     }
 }
 
-fn resolve_cursor_format<C: InputCursor>(
+pub(crate) fn resolve_cursor_format<C: InputCursor>(
     cursor: &mut C,
     selection: FormatSelection,
 ) -> Result<Format, DecodeError> {
