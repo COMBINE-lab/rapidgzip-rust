@@ -16,6 +16,8 @@ The project provides:
   stream suitable for parsers such as [paraseq];
 - opt-in random-access index construction, interoperable index formats, and a
   decoded-output `Read + Seek` adapter;
+- opt-in newline counting, line-annotated indexes, and indexed seeking by
+  zero-based line number;
 - decoding of non-seekable compressed input such as standard input, a FIFO, a
   process substitution, or a socket.
 
@@ -323,6 +325,44 @@ export requires an index proven to come from BGZF; GZIDX and gztool export
 require gzip-family provenance; gztool line-aware export requires real line
 counters and never invents them.
 
+Line metadata is collected only when requested. Enabling
+[`DecoderBuilder::count_lines`] adds `DecodeReport::line_count`; combining it
+with an explicit indexing operation also annotates every retained checkpoint:
+
+```rust,no_run
+use rapidgzip_core::{Decoder, IndexOptions, IndexedReader};
+use std::fs::File;
+use std::io;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let decoder = Decoder::builder()
+        .decoder_threads(8)
+        .count_lines(true)
+        .build()?;
+    let source = File::open("reads.fastq.gz")?;
+    let indexed = decoder.decode_with_index(
+        &source,
+        &mut io::sink(),
+        IndexOptions::default(),
+    )?;
+    assert_eq!(indexed.decode.line_count, indexed.index.total_line_count());
+
+    let mut reader = IndexedReader::new(source, indexed.index)?;
+    let byte_offset = reader.seek_to_line(1_000_000)?;
+    println!("line 1000000 begins at decoded byte {byte_offset}");
+    Ok(())
+}
+```
+
+A line offset is the number of `b'\n'` bytes preceding a position. Line zero
+begins at decoded byte zero. A final unterminated line does not increase
+`line_count`, while `seek_to_line` can still reach it after scanning from the
+nearest checkpoint. Counting happens once on final ordered bytes, after marker
+resolution, and is disabled by default. `DecodeReport` remains `Copy` because
+the result is an optional scalar. A line-aware index is published only when
+every retained checkpoint received an exact count; partial metadata is never
+presented as complete.
+
 `IndexedReader` validates the index and any recorded source size before use.
 Resuming at a gzip member or zlib-header checkpoint verifies that complete
 framing unit, including bytes discarded during a seek. A raw stream has no
@@ -346,6 +386,22 @@ rapidgzip-rust -P 16 reads.fastq.gz > reads.fastq
 # Verify every member and discard decoded output.
 rapidgzip-rust -P 16 --test reads.fastq.gz
 
+# Count decoded bytes or newline bytes.
+rapidgzip-rust --count reads.fastq.gz
+rapidgzip-rust --count-lines reads.fastq.gz
+
+# Build a native index, then use it for strict full-stream parallel decoding.
+rapidgzip-rust --test --export-index reads.rgzidx \
+  --index-format native reads.fastq.gz
+rapidgzip-rust --import-index reads.rgzidx -c reads.fastq.gz > reads.fastq
+
+# Extract byte and zero-based line ranges in the requested order.
+rapidgzip-rust --ranges '1KiB@4MiB,10L@1000L' -c reads.fastq.gz
+
+# Export gztool version 1 with real line counters.
+rapidgzip-rust --count-lines --export-index reads.gzi \
+  --index-format gztool-with-lines reads.fastq.gz
+
 # Refuse to overwrite an existing output file.
 rapidgzip-rust -P 16 --output reads.fastq reads.fastq.gz
 
@@ -356,11 +412,28 @@ cat reads.fastq.gz | rapidgzip-rust - > reads.fastq
 rapidgzip-rust <(some_producer) > reads.fastq
 ```
 
-`-P`/`--threads` is a maximum decoder-worker budget. Parallel paths bootstrap
+The CLI auto-detects gzip or zlib by default; raw DEFLATE requires
+`--format raw-deflate`. `--chunk-size` controls the decoded handoff size in
+KiB. Output defaults to stdout when redirected; at a terminal, a regular input
+derives a safe output filename. Existing files require `--force`.
+
+`-P`/`--decoder-parallelism` (`--threads` is an alias) is a maximum
+decoder-worker budget. Parallel paths bootstrap
 from the smaller of the affinity-visible processors and this requested budget,
 then create more workers only while measurements justify them. They may retain
 fewer active workers when the input exposes less parallel work, the consumer is
 backpressured, or additional concurrency reduces throughput.
+
+Imported indexes are never advisory. Full-stream operations use
+`decode_from_index`, and malformed, incomplete, or source-mismatched indexes
+fail without falling back. Range extraction uses `IndexedReader`; a line range
+requires complete line metadata in an imported index or builds a line-aware
+index first. `--no-verify`, `--sparse-windows`, and the `sequential` and
+`locked-read` I/O methods are rejected because the current implementation
+cannot honor their semantics. `--verify`, `--no-sparse-windows`, `-d`, and `-k`
+are accepted compatibility aliases for behavior already in effect. This is a
+deliberately compatible subset, not a claim that every rapidgzip CLI option is
+implemented.
 
 ## Correctness and resource behavior
 
@@ -439,7 +512,8 @@ The integration suite covers gzip, zlib, raw DEFLATE, multi-member streams,
 BGZF, corruption, format detection across short/interrupted reads, false header
 candidates, output limits and exact sizes, index construction, indexed
 full-stream parallel decode, seeking, cancellation, one-byte consumer buffers,
-and direct paraseq consumption. Generated benchmark corpora and large
+line counting and seeking, CLI index/range workflows, and direct paraseq
+consumption. Generated benchmark corpora and large
 sequencing files are deliberately not stored in the repository.
 
 ## Releasing
@@ -481,6 +555,7 @@ MIT. See [LICENSE-BSD-3-CLAUSE] and [LICENSE-MIT].
 [`DecoderBuilder::input_page_size`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.input_page_size
 [`DecoderBuilder::output_limit`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.output_limit
 [`DecoderBuilder::expected_uncompressed_size`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.expected_uncompressed_size
+[`DecoderBuilder::count_lines`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderBuilder.html#method.count_lines
 [`DecoderReader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderReader.html
 [`DecoderStats::path`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderStats.html#structfield.path
 [`DecoderStats::configured_workers`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderStats.html#structfield.configured_workers

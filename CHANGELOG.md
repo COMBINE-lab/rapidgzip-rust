@@ -5,7 +5,19 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Parallel task queues now publish their availability counters before making
+  work visible, preventing a worker from consuming a task before the matching
+  counter increment.
+
 ### Changed
+
+- The `rapidgzip-rust` CLI now exposes rapidgzip-compatible decoding, counting,
+  index import/export, range extraction, output, format, and reporting options.
+  Imported indexes drive strict full-stream indexed decoding. Options whose
+  semantics are not implemented, including disabled verification, sparse
+  windows, and shared-cursor I/O strategies, are rejected instead of ignored.
 
 - Generic gzip, zlib, and raw-DEFLATE path selection now uses a bounded
   machine-, runtime-budget-, task-count-, and input-aware admission screen.
@@ -19,6 +31,21 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   release rather than a patch release.
 
 ### Added
+
+- Opt-in newline counting through `DecoderBuilder::count_lines` and the new
+  `DecodeReport::line_count` scalar, preserving `DecodeReport: Copy`. Combining
+  counting with explicit index construction annotates every retained
+  checkpoint and the index total on final ordered output. Concatenated and
+  empty gzip members, BGZF, zlib, raw DEFLATE, streaming push/pull, marker
+  decoding, and strict indexed decoding share the same semantics.
+- `DeflateIndex::checkpoint_at_or_before_line` and
+  `IndexedReader::seek_to_line` for zero-based line access. gztool version 1
+  import/export translates its one-based checkpoint numbering and refuses
+  incomplete line metadata.
+- CLI byte and line ranges using rapidgzip's comma-separated `SIZE@OFFSET`
+  syntax, including binary byte units, `L`, `inf`, overlaps, and ordered
+  extraction. The CLI can read and write native, GZIDX, gztool, line-aware
+  gztool, and BGZF `.gzi` indexes.
 
 - Strict parallel full-stream reuse of caller-supplied `DeflateIndex` values
   through `Decoder::decode_from_index` and `Decoder::reader_from_index`. Every
