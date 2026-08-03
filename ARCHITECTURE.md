@@ -16,8 +16,8 @@ one of five bounded paths:
 4. Gzip streams with densely spaced members use candidate-header
    discovery and independently verified member workers.
 5. Other sufficiently large gzip, zlib, and raw-DEFLATE streams use a
-   file-wide estimated grid and rapidgzip's marker/window path, with zlib-rs
-   fallback from the last authoritative boundary.
+   bounded empirical admission screen, then either authoritative zlib-rs or a
+   file-wide estimated grid and rapidgzip's marker/window path.
 
 Positional paths return ordered owned chunks to one coordinator. The
 coordinator updates member accounting and calls the user's `Write`, so a writer
@@ -104,6 +104,29 @@ Index parsers have explicit count and aggregate-window limits, and source-size
 metadata is checked before indexed reads begin.
 
 ## Marker/window algorithm
+
+Before the generic marker grid starts, path admission derives a useful worker
+width from the configured budget, current application ceiling,
+affinity-visible processors, the adaptive machine bootstrap, and available
+grid work. Inputs shorter than sixteen normal grid tasks, inputs without two
+complete waves, and effective one-worker runs stay sequential. Specialized
+stored, BGZF, and dense-member paths are classified first and never pay for
+this screen.
+
+Eligible inputs compare the best of three exact zlib-rs service samples over a
+128 KiB compressed prefix with one concurrent adjacent 128 KiB marker task per
+useful worker. The speculative sample includes boundary validation, ordered
+predecessor-window propagation, and worker-parallel full marker resolution.
+Its worker-width-adjusted gate accounts for fixed marker/search setup that a
+normal 1 MiB task amortizes. Ambiguous, invalid, discontinuous, cancelled, or
+too-small samples restart the authoritative sequential decoder; passing
+samples discard the bounded screen and start the unchanged normal marker grid.
+The transient state is reported as `DecoderPath::MarkerAdmission`.
+
+Admission chooses an algorithm; the separate steady-state concurrency
+controller still tunes the active worker count after the marker path wins.
+Index checkpoints are published only after this decision, so discarded probe
+work can never enter an index.
 
 The implementation follows rapidgzip 0.16.0 at upstream commit
 `d2350e9c9ba54398cd64e45bfc8c631beec017f0`, principally:

@@ -138,7 +138,7 @@ fn decode_reader(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("decoder_reader_deflate_formats");
     group.throughput(Throughput::Bytes(decoded.len() as u64));
     for (name, format, compressed) in encoded {
-        for threads in [1, 4, 16] {
+        for threads in [1, 2, 3, 4, 16] {
             let decoder = Decoder::builder()
                 .format(format)
                 .decoder_threads(threads)

@@ -137,6 +137,13 @@ and consumed bytes, average rates, and a high-level pressure classification.
 Snapshots use relaxed atomic loads, are deliberately approximate, and describe
 rapidgzip task activity rather than operating-system CPU utilization.
 
+For ordinary gzip, zlib, and raw-DEFLATE files, telemetry may briefly report
+`DecoderPath::MarkerAdmission`. This bounded input-aware screen compares exact
+zlib-rs work with a useful-width speculative marker wave after applying the
+configured budget, runtime ceiling, visible processors, and available task
+count. Its terminal path is `Sequential` or `MarkerWindow`; BGZF, stored, and
+dense-member inputs retain their specialized routes.
+
 ### Push decoding
 
 [`Decoder::decode`] avoids the final reader copy and calls a `Write` value only

@@ -10,6 +10,9 @@ use crate::index::{
 use crate::inflate::RawInflater;
 use crate::parallel::Window;
 use crate::parallel::adaptive::AdaptiveConcurrency;
+use crate::parallel::admission::{
+    WorkSample, effective_parallelism, screen_admits_marker, should_probe,
+};
 use crate::parallel::deflate::{
     ChunkOutput, Error as NativeError, InitialHistory, ResolvedParts, decode_to_estimated_boundary,
     find_next_structural_candidate,
@@ -215,12 +218,7 @@ where
                 Format::Gzip => IndexKind::Gzip,
             });
         }
-        let source_length = source
-            .len()
-            .map_err(|error| DecodeError::input_io(0, error))?;
-        let parallel_threshold = (config.compressed_chunk_size as u64).saturating_mul(2);
-        if config.decoder_threads > 1 && source_length >= parallel_threshold {
-            runtime.set_path(DecoderPath::MarkerWindow);
+        if config.decoder_threads > 1 {
             return decode_estimated(
                 source,
                 config,
@@ -271,7 +269,6 @@ where
             );
         }
         let grid_size = adjusted_compressed_chunk_size(source, config)?;
-        runtime.set_path(DecoderPath::MarkerWindow);
         return decode_estimated(
             source,
             config,
@@ -3354,6 +3351,203 @@ struct EstimatedDecode {
     format: Format,
 }
 
+enum MarkerAdmission {
+    Unprobed,
+    Sequential,
+    MarkerWindow,
+}
+
+struct AdmissionWave {
+    decoded_bytes: usize,
+    elapsed: Duration,
+}
+
+/// Runs and resolves one concurrent wave exactly as the marker pipeline would.
+#[allow(clippy::too_many_arguments)]
+fn run_admission_wave<R: ReadAt + ?Sized>(
+    source: &R,
+    tasks: &[EstimatedTask],
+    maximum_output: usize,
+    window_bits: u8,
+    mut predecessor: Window,
+    mut previous_end: usize,
+    cancelled: &AtomicBool,
+    runtime: &Arc<RuntimeState>,
+) -> Result<Option<AdmissionWave>, DecodeError> {
+    let results = thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let worker_runtime = Arc::clone(runtime);
+            workers.push(scope.spawn(move || {
+                let _registration = worker_runtime.register_worker();
+                let _busy = worker_runtime.begin_task();
+                let mut compressed = Vec::new();
+                let task_started = Instant::now();
+                let result =
+                    run_estimated_task(source, task, maximum_output, window_bits, &mut compressed);
+                (result, task_started.elapsed())
+            }));
+        }
+        workers
+            .into_iter()
+            .map(|worker| worker.join().map_err(|_| DecodeError::WorkerPanicked))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(DecodeError::Cancelled);
+    }
+
+    let mut decoded_bytes = 0_usize;
+    let mut resolution_work = Duration::ZERO;
+    let mut ordered_window_work = Duration::ZERO;
+    let mut decode_elapsed = Duration::ZERO;
+    for (result, task_elapsed) in results {
+        decode_elapsed = decode_elapsed.max(task_elapsed);
+        let Ok(chunk) = result else {
+            return Ok(None);
+        };
+        if chunk.start_bit != previous_end {
+            return Ok(None);
+        }
+        decoded_bytes = decoded_bytes.saturating_add(chunk.output.len());
+        let resolution_started = Instant::now();
+        if chunk
+            .output
+            .measure_marker_resolution(&predecessor)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        resolution_work = resolution_work.saturating_add(resolution_started.elapsed());
+        let window_started = Instant::now();
+        let Ok(next_window) = chunk.output.window_after(&predecessor) else {
+            return Ok(None);
+        };
+        ordered_window_work = ordered_window_work.saturating_add(window_started.elapsed());
+        predecessor = next_window;
+        previous_end = chunk.end_bit;
+    }
+
+    // Full marker buffers are resolved by the worker pool in production. Only
+    // predecessor-window propagation is ordered on the coordinator.
+    let parallel_resolution = resolution_work.div_f64(tasks.len().max(1) as f64);
+    Ok(Some(AdmissionWave {
+        decoded_bytes,
+        elapsed: decode_elapsed
+            .saturating_add(ordered_window_work)
+            .saturating_add(parallel_resolution),
+    }))
+}
+
+/// Measures a bounded exact prefix and one short marker-worker wave.
+///
+/// The samples are deliberately not concurrent with one another: otherwise
+/// speculative CPU and memory pressure would depress the exact zlib-rs sample
+/// even when the sequential path would run uncontended. The deliberately small
+/// screen is discarded before either terminal decoder starts.
+fn probe_marker_admission<R: ReadAt + ?Sized>(
+    source: &R,
+    screen_tasks: &[EstimatedTask],
+    maximum_output: usize,
+    window_bits: u8,
+    effective_workers: usize,
+    cancelled: &AtomicBool,
+    runtime: &Arc<RuntimeState>,
+) -> Result<MarkerAdmission, DecodeError> {
+    if effective_workers < 2 || screen_tasks.len() <= effective_workers {
+        return Ok(MarkerAdmission::Unprobed);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(DecodeError::Cancelled);
+    }
+
+    const EXACT_SCREEN_SAMPLES: usize = 3;
+    let mut compressed = Vec::new();
+    let exact_started = Instant::now();
+    let exact_result = {
+        let _busy = runtime.begin_task();
+        run_estimated_task(
+            source,
+            &screen_tasks[0],
+            maximum_output,
+            window_bits,
+            &mut compressed,
+        )
+    };
+    let first_exact_elapsed = exact_started.elapsed();
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(DecodeError::Cancelled);
+    }
+
+    let Ok(exact) = exact_result else {
+        return Ok(MarkerAdmission::Unprobed);
+    };
+    if exact.start_bit as u64 != screen_tasks[0].search_start_bit {
+        return Ok(MarkerAdmission::Unprobed);
+    }
+    if exact.reached_stream_end {
+        return Ok(MarkerAdmission::Sequential);
+    }
+    let exact_bytes = exact.output.len();
+    let Ok(predecessor) = exact.output.window_after(&Window::empty()) else {
+        return Ok(MarkerAdmission::Unprobed);
+    };
+    let mut exact_elapsed_samples = [first_exact_elapsed; EXACT_SCREEN_SAMPLES];
+    for elapsed in exact_elapsed_samples.iter_mut().skip(1) {
+        let started = Instant::now();
+        let repeated = {
+            let _busy = runtime.begin_task();
+            run_estimated_task(
+                source,
+                &screen_tasks[0],
+                maximum_output,
+                window_bits,
+                &mut compressed,
+            )
+        };
+        *elapsed = started.elapsed();
+        let Ok(repeated) = repeated else {
+            return Ok(MarkerAdmission::Sequential);
+        };
+        if repeated.start_bit as u64 != screen_tasks[0].search_start_bit
+            || repeated.end_bit != exact.end_bit
+            || repeated.output.len() != exact_bytes
+        {
+            return Ok(MarkerAdmission::Sequential);
+        }
+    }
+    exact_elapsed_samples.sort_unstable();
+    // A scheduling interruption can only make exact decoding look slower and
+    // create a costly false-positive. The best of three hot samples is a
+    // conservative service-time baseline for this admission screen.
+    let exact_elapsed = exact_elapsed_samples[0];
+
+    runtime.set_adaptive_target(effective_workers);
+    let Some(screen) = run_admission_wave(
+        source,
+        &screen_tasks[1..=effective_workers],
+        maximum_output,
+        window_bits,
+        predecessor,
+        exact.end_bit,
+        cancelled,
+        runtime,
+    )?
+    else {
+        return Ok(MarkerAdmission::Sequential);
+    };
+
+    let exact_sample = WorkSample::new(exact_bytes, exact_elapsed);
+    let screen_sample = WorkSample::new(screen.decoded_bytes, screen.elapsed);
+    if runtime.application_worker_limit() < effective_workers
+        || !screen_admits_marker(effective_workers, exact_sample, screen_sample)
+    {
+        return Ok(MarkerAdmission::Sequential);
+    }
+    Ok(MarkerAdmission::MarkerWindow)
+}
+
 fn decode_estimated<R, O>(
     source: &R,
     config: &Config,
@@ -3386,90 +3580,143 @@ where
         });
     }
 
-    let (first_deflate_bit, window_bits) = match format {
+    let (first_deflate_bit, window_bits, initial_checkpoint) = match format {
         Format::Gzip => {
             let header = parse_member_header(&mut frame_cursor, true)?;
-            if let Some(collector) = collector {
-                collector.offer(
-                    Checkpoint {
-                        compressed_offset_in_bits: header.deflate_start.saturating_mul(8),
-                        uncompressed_offset_in_bytes: 0,
-                        kind: CheckpointKind::GzipMemberDeflate {
-                            header_offset_in_bytes: header.start,
-                        },
-                        line_offset: None,
+            (
+                header.deflate_start.saturating_mul(8),
+                15,
+                Checkpoint {
+                    compressed_offset_in_bits: header.deflate_start.saturating_mul(8),
+                    uncompressed_offset_in_bytes: 0,
+                    kind: CheckpointKind::GzipMemberDeflate {
+                        header_offset_in_bytes: header.start,
                     },
-                    &[],
-                );
-            }
-            (header.deflate_start.saturating_mul(8), 15)
+                    line_offset: None,
+                },
+            )
         }
         Format::Zlib => {
             let header_offset = frame_cursor.position();
             let (_, window_bits) = read_zlib_header(&mut frame_cursor)?;
-            if let Some(collector) = collector {
-                collector.offer(
-                    Checkpoint {
-                        compressed_offset_in_bits: header_offset.saturating_mul(8),
-                        uncompressed_offset_in_bytes: 0,
-                        kind: CheckpointKind::ZlibHeader,
-                        line_offset: None,
-                    },
-                    &[],
-                );
-            }
-            (frame_cursor.position().saturating_mul(8), window_bits)
+            (
+                frame_cursor.position().saturating_mul(8),
+                window_bits,
+                Checkpoint {
+                    compressed_offset_in_bits: header_offset.saturating_mul(8),
+                    uncompressed_offset_in_bytes: 0,
+                    kind: CheckpointKind::ZlibHeader,
+                    line_offset: None,
+                },
+            )
         }
-        Format::RawDeflate => {
-            if let Some(collector) = collector {
-                collector.offer(
-                    Checkpoint {
-                        compressed_offset_in_bits: 0,
-                        uncompressed_offset_in_bytes: 0,
-                        kind: CheckpointKind::RawDeflateStart,
-                        line_offset: None,
-                    },
-                    &[],
-                );
-            }
-            (0, 15)
-        }
+        Format::RawDeflate => (
+            0,
+            15,
+            Checkpoint {
+                compressed_offset_in_bits: 0,
+                uncompressed_offset_in_bytes: 0,
+                kind: CheckpointKind::RawDeflateStart,
+                line_offset: None,
+            },
+        ),
     };
     let length_bits = frame_cursor.length().saturating_mul(8);
     let spacing_bits = (compressed_chunk_size as u64).saturating_mul(8);
-    let task_count = usize::try_from(
+    let nominal_task_count = usize::try_from(
         length_bits
             .saturating_sub(first_deflate_bit)
             .div_ceil(spacing_bits),
     )
     .unwrap_or(usize::MAX)
     .max(1);
-    let tasks: Vec<_> = (0..task_count)
+    let machine_parallelism = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let effective_workers = effective_parallelism(
+        config.decoder_threads,
+        runtime.application_worker_limit(),
+        machine_parallelism,
+        nominal_task_count,
+    );
+    if !should_probe(effective_workers, nominal_task_count) {
+        runtime.set_path(DecoderPath::Sequential);
+        runtime.set_adaptive_target(1);
+        return decode_source_sequential(source, config, cancelled, output, runtime, collector);
+    }
+
+    // The screen is intentionally smaller than the steady-state grid so
+    // either terminal decoder discards little classification work.
+    const SCREEN_TASK_BYTES: u64 = 128 * 1024;
+    let screen_spacing_bits = spacing_bits.min(SCREEN_TASK_BYTES.saturating_mul(8));
+    let make_task = |estimated_start: u64, estimated_stop: u64, exact_start: bool| EstimatedTask {
+        search_start_bit: estimated_start,
+        search_end_bit: if exact_start {
+            estimated_start
+        } else {
+            estimated_start
+                .saturating_add(SEARCH_BYTES.saturating_mul(8))
+                .min(estimated_stop)
+                .min(length_bits)
+        },
+        estimated_stop_bit: estimated_stop,
+        read_end_bit: estimated_stop
+            .saturating_add(LOOKAHEAD_BYTES.saturating_mul(8))
+            .min(length_bits),
+        exact_start,
+    };
+    let tasks: Vec<_> = (0..nominal_task_count)
         .map(|index| {
             let estimated_start =
                 first_deflate_bit.saturating_add((index as u64).saturating_mul(spacing_bits));
-            let estimated_stop = estimated_start.saturating_add(spacing_bits);
-            EstimatedTask {
-                search_start_bit: estimated_start,
-                search_end_bit: if index == 0 {
-                    estimated_start
-                } else {
-                    estimated_start
-                        .saturating_add(SEARCH_BYTES.saturating_mul(8))
-                        .min(estimated_stop)
-                        .min(length_bits)
-                },
-                estimated_stop_bit: estimated_stop,
-                read_end_bit: estimated_stop
-                    .saturating_add(LOOKAHEAD_BYTES.saturating_mul(8))
-                    .min(length_bits),
-                exact_start: index == 0,
-            }
+            make_task(
+                estimated_start,
+                estimated_start.saturating_add(spacing_bits),
+                index == 0,
+            )
+        })
+        .collect();
+    let screen_task_count = effective_workers.saturating_add(1);
+    let screen_tasks: Vec<_> = (0..screen_task_count)
+        .map(|index| {
+            let estimated_start = first_deflate_bit
+                .saturating_add((index as u64).saturating_mul(screen_spacing_bits));
+            make_task(
+                estimated_start,
+                estimated_start.saturating_add(screen_spacing_bits),
+                index == 0,
+            )
         })
         .collect();
     let maximum_output = config
         .decoded_chunk_size
         .max(compressed_chunk_size.saturating_mul(20));
+    runtime.set_path(DecoderPath::MarkerAdmission);
+    let admission = probe_marker_admission(
+        source,
+        &screen_tasks,
+        maximum_output,
+        window_bits,
+        effective_workers,
+        cancelled,
+        runtime,
+    )?;
+    match admission {
+        MarkerAdmission::Unprobed => {
+            runtime.set_path(DecoderPath::Sequential);
+            runtime.set_adaptive_target(1);
+            return decode_source_sequential(source, config, cancelled, output, runtime, collector);
+        }
+        MarkerAdmission::Sequential => {
+            runtime.set_path(DecoderPath::Sequential);
+            runtime.set_adaptive_target(1);
+            return decode_source_sequential(source, config, cancelled, output, runtime, collector);
+        }
+        MarkerAdmission::MarkerWindow => {}
+    }
+    runtime.set_path(DecoderPath::MarkerWindow);
+    if let Some(collector) = collector {
+        collector.offer(initial_checkpoint, &[]);
+    }
+
     let task_queue = Arc::new(Injector::new());
     let resolve_queue = Arc::new(Injector::<ResolveTask>::new());
     let stopped = Arc::new(AtomicBool::new(false));
@@ -3477,7 +3724,6 @@ where
     let available_resolve_tasks = Arc::new(AtomicUsize::new(0));
     let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
     let worker_count = config.decoder_threads.min(tasks.len());
-    let machine_parallelism = thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let adaptive_workers = Arc::new(AdaptiveWorkers::new(
         worker_count,
         machine_parallelism,
@@ -3659,13 +3905,8 @@ where
                 // independently discovered boundary where that regular task
                 // begins. Workers can therefore keep useful later-member
                 // tasks in flight while framing and history reset here.
-                let target_index = usize::try_from(
-                    current_bit
-                        .saturating_sub(first_deflate_bit)
-                        .div_euclid(spacing_bits)
-                        .saturating_add(1),
-                )
-                .unwrap_or(usize::MAX);
+                let target_index =
+                    tasks.partition_point(|task| task.search_start_bit <= current_bit);
                 if target_index >= tasks.len() {
                     footer_offset = Some(inflate_from_block(
                         source,

@@ -865,6 +865,15 @@ impl ChunkOutput {
         Ok((self.marked.resolve(window)?, self.clean, self.backend_tail))
     }
 
+    /// Executes the only compute work performed by [`Self::resolve_parts`]
+    /// without consuming the buffer needed to derive its successor window.
+    pub(crate) fn measure_marker_resolution(
+        &self,
+        window: &Window,
+    ) -> Result<(), super::marker::MarkerError> {
+        self.marked.resolve_ref(window).map(drop)
+    }
+
     #[cfg(test)]
     pub(crate) fn resolve(self, window: &Window) -> Result<Vec<u8>, super::marker::MarkerError> {
         let (mut result, clean, backend_tail) = self.resolve_parts(window)?;

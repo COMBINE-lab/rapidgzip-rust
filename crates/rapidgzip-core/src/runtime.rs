@@ -22,6 +22,8 @@ pub enum DecoderPath {
     Stored,
     /// Independent inflation of densely spaced ordinary gzip members.
     DenseMembers,
+    /// Comparing exact and speculative service rates before path selection.
+    MarkerAdmission,
     /// The rapidgzip marker/window pipeline for gzip, zlib, or raw DEFLATE.
     MarkerWindow,
     /// Independent inflation of indexed BGZF blocks.
@@ -35,8 +37,9 @@ impl DecoderPath {
             Self::Sequential => 1,
             Self::Stored => 2,
             Self::DenseMembers => 3,
-            Self::MarkerWindow => 4,
-            Self::Bgzf => 5,
+            Self::MarkerAdmission => 4,
+            Self::MarkerWindow => 5,
+            Self::Bgzf => 6,
         }
     }
 
@@ -45,8 +48,9 @@ impl DecoderPath {
             1 => Self::Sequential,
             2 => Self::Stored,
             3 => Self::DenseMembers,
-            4 => Self::MarkerWindow,
-            5 => Self::Bgzf,
+            4 => Self::MarkerAdmission,
+            5 => Self::MarkerWindow,
+            6 => Self::Bgzf,
             _ => Self::Starting,
         }
     }
@@ -292,6 +296,11 @@ impl RuntimeState {
         self.limit_epoch.load(Ordering::Relaxed)
     }
 
+    /// Current application-controlled ceiling before adaptive throttling.
+    pub(crate) fn application_worker_limit(&self) -> usize {
+        self.worker_limit.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn set_adaptive_target(&self, workers: usize) {
         let workers = workers.clamp(1, self.configured_workers);
         let previous = self.adaptive_target.swap(workers, Ordering::Relaxed);
@@ -471,7 +480,7 @@ impl RuntimeState {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecoderHandle, DecoderPressure, RuntimeState};
+    use super::{DecoderHandle, DecoderPath, DecoderPressure, RuntimeState};
 
     #[test]
     fn runtime_limits_are_validated_and_visible() {
@@ -500,6 +509,16 @@ mod tests {
             DecoderPressure::ConsumerBound { .. }
         ));
         drop(worker);
+    }
+
+    #[test]
+    fn marker_admission_path_is_visible_in_telemetry() {
+        let state = RuntimeState::new(4);
+        state.set_path(DecoderPath::MarkerAdmission);
+        assert_eq!(
+            DecoderHandle::new(state).stats().path,
+            DecoderPath::MarkerAdmission
+        );
     }
 
     use std::sync::Arc;
