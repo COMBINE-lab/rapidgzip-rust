@@ -5,6 +5,7 @@
 //! [`crate::DeflateIndex`] checkpoints, not these internal speculative blocks.
 
 pub(crate) mod adaptive;
+pub(crate) mod admission;
 pub(crate) mod deflate;
 mod marker;
 

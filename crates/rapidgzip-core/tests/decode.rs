@@ -537,7 +537,10 @@ fn telemetry_reports_specialized_and_sequential_paths() {
     for (compressed, workers, expected_path, expected_members) in [
         (stored, 4, DecoderPath::Stored, 1),
         (bgzf, 4, DecoderPath::Bgzf, 33),
-        (marker.clone(), 4, DecoderPath::MarkerWindow, 1),
+        // This fixture is only 147 compressed bytes. It cannot expose two
+        // complete grid-task waves and therefore stays sequential even with a
+        // larger configured budget.
+        (marker.clone(), 4, DecoderPath::Sequential, 1),
         (marker, 1, DecoderPath::Sequential, 1),
     ] {
         let decoder = Decoder::builder().decoder_threads(workers).build().unwrap();

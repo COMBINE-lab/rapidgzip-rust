@@ -207,7 +207,7 @@ fn every_reader_remains_send() {
 }
 
 #[test]
-fn large_zlib_and_raw_streams_use_the_marker_window_path() {
+fn large_zlib_and_raw_streams_validate_after_adaptive_path_selection() {
     let plain = corpus(24 * 1024 * 1024);
     for (compressed, format) in [
         (zlib(&plain, 1), Format::Zlib),
@@ -228,10 +228,10 @@ fn large_zlib_and_raw_streams_use_the_marker_window_path() {
         let mut output = Vec::new();
         reader.read_to_end(&mut output).unwrap();
         assert_eq!(output, plain);
-        assert_eq!(
+        assert!(matches!(
             reader.stats().path,
-            rapidgzip_core::DecoderPath::MarkerWindow
-        );
+            rapidgzip_core::DecoderPath::Sequential | rapidgzip_core::DecoderPath::MarkerWindow
+        ));
         let indexed = reader.finish().unwrap();
         assert_eq!(indexed.decode.format, format);
         assert!(!indexed.index.is_empty());

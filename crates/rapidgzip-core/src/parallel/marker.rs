@@ -128,6 +128,11 @@ impl MarkerBuffer {
 
     /// Resolves marker references without re-decoding the chunk.
     pub fn resolve(self, window: &Window) -> Result<Vec<u8>, MarkerError> {
+        self.resolve_ref(window)
+    }
+
+    /// Resolves marker references while retaining the encoded buffer.
+    pub(crate) fn resolve_ref(&self, window: &Window) -> Result<Vec<u8>, MarkerError> {
         if self.symbols.len() >= 128 * 1024 && window.0.len() == WINDOW_SIZE {
             let output = resolve_lut(&self.symbols, window);
             return Ok(output);

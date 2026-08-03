@@ -7,6 +7,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Generic gzip, zlib, and raw-DEFLATE path selection now uses a bounded
+  machine-, runtime-budget-, task-count-, and input-aware admission screen.
+  It replaces a fixed low-thread marker/window policy, keeps short inputs and
+  unfavorable workloads on zlib-rs, and preserves specialized BGZF, stored,
+  and dense-member routing. `DecoderPath::MarkerAdmission` exposes the
+  transient decision through existing telemetry.
 - The unreleased random-access API now uses the format-neutral `DeflateIndex`
   name instead of `GzipIndex`. This, the new mandatory `DecodeReport::format`
   field, and multi-format index provenance are planned for the next minor

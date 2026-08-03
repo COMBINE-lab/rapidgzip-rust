@@ -318,6 +318,18 @@ fn controller_limits(
     }
 }
 
+/// Initial worker target shared by path admission and steady-state control.
+///
+/// Keeping this derivation in one place ensures that an empirical path probe
+/// never starts more workers than the marker pipeline would initially admit.
+pub(crate) fn initial_parallelism(
+    maximum: usize,
+    machine_parallelism: usize,
+    work_items: usize,
+) -> usize {
+    controller_limits(maximum.max(1), machine_parallelism, work_items).initial
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AdaptiveConcurrency, ControllerLimits, SAMPLES_PER_CANDIDATE, controller_limits};

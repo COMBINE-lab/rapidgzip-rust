@@ -68,6 +68,15 @@ fn built_index(path: &Path) -> DeflateIndex {
         .index
 }
 
+/// Builds an archive whose second authenticated member guarantees a portable
+/// checkpoint without depending on timing-sensitive marker-path admission.
+fn concatenated_gzip(plain: &[u8]) -> Vec<u8> {
+    let split = plain.len() / 2;
+    let mut compressed = gzip(&plain[..split], 6);
+    compressed.extend_from_slice(&gzip(&plain[split..], 6));
+    compressed
+}
+
 fn assert_seeks_match(compressed: &Path, index: DeflateIndex, plain: &[u8], targets: &[usize]) {
     let source = fs::File::open(compressed).expect("open archive");
     let mut reader = IndexedReader::new(source, index).expect("indexed reader");
@@ -175,7 +184,7 @@ fn indexed_gzip_reads_the_gzidx_we_write() {
     let plain = corpus(8 * 1024 * 1024);
     let archive = directory.join("corpus.gz");
     let exported = directory.join("ours.gzidx");
-    write(&archive, &gzip(&plain, 6));
+    write(&archive, &concatenated_gzip(&plain));
     let index = built_index(&archive);
     assert!(index.checkpoint_count() > 1);
     let mut bytes = Vec::new();
@@ -232,7 +241,7 @@ fn gztool_reads_the_index_we_write() {
     let directory = workspace("write-gztool");
     let plain = corpus(8 * 1024 * 1024);
     let archive = directory.join("corpus.gz");
-    write(&archive, &gzip(&plain, 6));
+    write(&archive, &concatenated_gzip(&plain));
     let index = built_index(&archive);
     assert!(index.checkpoint_count() > 1);
     let mut bytes = Vec::new();

@@ -80,6 +80,55 @@ FASTQ integration benchmarks should use paraseq with a fixed total physical-core
 budget. Sweep decompressor/parser thread splits rather than assigning all cores
 to both pools.
 
+## 2026-08-03 adaptive-admission diagnostic
+
+PR #13 identified a low-thread crossover that varied by input. This diagnostic
+uses the same unpinned dual-socket Xeon E5-2699 v4 host and public FASTQ corpus
+described below. It is a controller-tuning run, not a replacement for the
+pinned release parity matrix. The clean implementation was based on `main` at
+`944b6c5`; it did not merge the stacked PR branch.
+
+The unchanged `main` marker policy produced these seven-run medians:
+
+| requested workers | terminal path | decoded MiB/s |
+|---:|---|---:|
+| 1 | Sequential | 658.9 |
+| 2 | MarkerWindow | 475.9 |
+| 3 | MarkerWindow | 643.2 |
+| 4 | MarkerWindow | 801.1 |
+
+After adaptive marker admission, a final nine-run matrix produced:
+
+| requested workers | terminal paths | decoded MiB/s |
+|---:|---|---:|
+| 1 | 9 Sequential | 620.3 |
+| 2 | 9 Sequential | 645.9 |
+| 3 | 8 Sequential, 1 MarkerWindow | 594.5 |
+| 4 | 9 MarkerWindow | 777.0 |
+
+The decisive regression cell therefore moved from 475.9 to 645.9 MiB/s while
+the four-worker marker cell retained 97.0% of its original throughput. The
+one- and three-worker medians reflect two visibly different host-frequency
+bands during these unpinned runs; path counts, user CPU time, and peak RSS were
+used to distinguish controller decisions from that external variance.
+
+The following three-run telemetry medians exercise other route shapes. The
+32 MiB text stream has only thirteen normal compressed-grid tasks and skips
+admission. The sparse archive contains four large ordinary gzip members. Dense
+FASTQ and BGZF are classified before generic admission.
+
+| workload | 1 worker | 2 workers | 4 workers | terminal route(s) |
+|---|---:|---:|---:|---|
+| 32 MiB text | 287.7 | 287.8 | 287.9 | Sequential |
+| four sparse members | 581.3 | 604.1 | 573.9 | Sequential |
+| dense FASTQ members | 603.5 | 878.3 | 1,569.5 | Sequential / DenseMembers |
+| BGZF | 458.1 | 881.7 | 1,525.5 | Bgzf |
+
+These figures validate routing and probe overhead, not portable speed claims.
+The controller uses the useful machine/request/runtime width and observed input
+service rates; the table is deliberately retained so later threshold changes
+must explain both false-positive and false-negative path movement.
+
 ## gzippy
 
 gzippy must remain in the comparison. Its current library exposes
