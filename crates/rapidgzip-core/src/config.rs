@@ -41,6 +41,7 @@ pub(crate) struct Config {
     pub(crate) in_flight_chunks: usize,
     pub(crate) output_limit: Option<u64>,
     pub(crate) expected_uncompressed_size: Option<u64>,
+    pub(crate) count_lines: bool,
     pub(crate) format: FormatSelection,
 }
 
@@ -104,7 +105,7 @@ impl Config {
 /// Defaults use [`std::thread::available_parallelism`] as the maximum decoder
 /// budget, 4 MiB decoded chunks, 1 MiB positional input pages and compressed
 /// grid spacing, `decoder_threads + 2` in-flight chunks, strict gzip framing,
-/// and no output limit or exact-size expectation. The defaults favor
+/// no output limit or exact-size expectation, and no line counting. The defaults favor
 /// throughput; applications with tight memory budgets can
 /// reduce the worker budget, decoded chunk size, or in-flight count.
 #[derive(Clone, Debug)]
@@ -126,6 +127,7 @@ impl Default for DecoderBuilder {
                 in_flight_chunks: decoder_threads.saturating_add(2),
                 output_limit: None,
                 expected_uncompressed_size: None,
+                count_lines: false,
                 format: FormatSelection::default(),
             },
         }
@@ -200,6 +202,21 @@ impl DecoderBuilder {
     /// underrun is rejected after the selected container is complete.
     pub const fn expected_uncompressed_size(mut self, bytes: Option<u64>) -> Self {
         self.config.expected_uncompressed_size = bytes;
+        self
+    }
+
+    /// Enables or disables counting newline bytes in the decoded output.
+    ///
+    /// The final count is returned through [`DecodeReport::line_count`]. When
+    /// an index is collected by the same operation, every retained checkpoint
+    /// is also annotated with the number of preceding newlines and the index
+    /// records the total. This metadata enables
+    /// [`crate::IndexedReader::seek_to_line`] and gztool version 1 export.
+    ///
+    /// Counting is disabled by default. When disabled, output is not scanned
+    /// and reports and newly built indexes carry no line metadata.
+    pub const fn count_lines(mut self, enabled: bool) -> Self {
+        self.config.count_lines = enabled;
         self
     }
 
@@ -335,6 +352,11 @@ impl Decoder {
     /// Worker output is handed off in bounded chunks, so a sparse index does
     /// not cause an entire decompressed span to be allocated. Empty gzip
     /// members remain explicit spans and are fully verified.
+    ///
+    /// When [`DecoderBuilder::count_lines`] is enabled, imported per-checkpoint
+    /// and total line counters are recomputed from final ordered output and a
+    /// mismatch is rejected. Without line counting, line metadata remains
+    /// caller-supplied navigation data and is not authenticated.
     ///
     /// # Examples
     ///

@@ -1,6 +1,6 @@
 use crate::backend::{
-    Output, SequentialDecoder, SequentialItem, decode_source, decode_source_with_index,
-    validate_initial_stream,
+    LineCounter, Output, SequentialDecoder, SequentialItem, decode_source,
+    decode_source_with_index, validate_initial_stream,
 };
 use crate::config::Config;
 use crate::gzip::StreamCursor;
@@ -114,6 +114,7 @@ enum ReaderMode {
     Streaming {
         decoder: Box<SequentialDecoder<StreamCursor<Box<dyn Read + Send>>>>,
         collector: Option<Arc<IndexCollector>>,
+        line_counter: LineCounter,
     },
 }
 
@@ -271,6 +272,7 @@ where
         mode: ReaderMode::Streaming {
             decoder: Box::new(decoder),
             collector: None,
+            line_counter: LineCounter::new(config.count_lines),
         },
         cancelled: Arc::new(AtomicBool::new(false)),
         handle,
@@ -293,7 +295,7 @@ where
     validate_initial_stream(&mut cursor, &config)?;
     let runtime = RuntimeState::new(config.decoder_threads);
     let handle = DecoderHandle::new(Arc::clone(&runtime));
-    let collector = IndexCollector::new(options);
+    let collector = IndexCollector::new(options, config.count_lines);
     let decoder = SequentialDecoder::new(
         cursor,
         &config,
@@ -308,6 +310,7 @@ where
             mode: ReaderMode::Streaming {
                 decoder: Box::new(decoder),
                 collector: Some(collector),
+                line_counter: LineCounter::new(config.count_lines),
             },
             cancelled: Arc::new(AtomicBool::new(false)),
             handle,
@@ -379,7 +382,11 @@ impl DecoderReader {
                 .expect("receiver remains present until shutdown")
                 .recv()
                 .ok(),
-            ReaderMode::Streaming { decoder, collector } => {
+            ReaderMode::Streaming {
+                decoder,
+                collector,
+                line_counter,
+            } => {
                 let runtime = Arc::clone(&self.handle.state);
                 let result = {
                     let _busy = runtime.begin_task();
@@ -387,14 +394,18 @@ impl DecoderReader {
                 };
                 match result {
                     Ok(SequentialItem::Chunk(data)) => {
+                        line_counter.note_output(&data, collector.as_deref());
                         runtime.add_decompressed_bytes(data.len());
                         Some(Message::Data(data))
                     }
                     Ok(SequentialItem::Finished(report)) => {
+                        let report = line_counter.finish_report(report);
                         if let Some(collector) = collector {
-                            match collector
-                                .finish(report.compressed_bytes, report.decompressed_bytes)
-                            {
+                            match collector.finish(
+                                report.compressed_bytes,
+                                report.decompressed_bytes,
+                                report.line_count,
+                            ) {
                                 Ok(index) => Some(Message::Finished(Completion::Indexed(
                                     IndexedDecodeReport {
                                         decode: report,

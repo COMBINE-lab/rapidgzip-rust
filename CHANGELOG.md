@@ -5,7 +5,39 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Parallel task queues now publish their availability counters before making
+  work visible, preventing a worker from consuming a task before the matching
+  counter increment.
+- CLI index import now streams through the core allocation limits, requires an
+  exact format length, and rejects trailing data instead of buffering an
+  untrusted file or treating arbitrary bytes as an empty GZI.
+- Index export now serializes transactionally through a same-directory
+  temporary file, preserving an existing destination after incompatibility or
+  write failures. Normal decode output treats an early closed pipe as a
+  successful consumer exit through wrapped decoder errors as well as direct
+  I/O errors.
+- Output collision checks now compare the already-open input file with the
+  destination by file identity on Unix and Windows, preventing hard-link and
+  symlink aliases from truncating a forced input.
+
 ### Changed
+
+- The `rapidgzip-rust` CLI now exposes rapidgzip-compatible decoding, counting,
+  index import/export, range extraction, output, format, and reporting options.
+  Imported indexes drive strict full-stream indexed decoding. Options whose
+  semantics are not implemented, including disabled verification, sparse
+  windows, and shared-cursor I/O strategies, are rejected instead of ignored.
+- The CLI's format-neutral index default is now native. Payload output can be
+  combined with byte and line counting in one pass; reports move to stderr when
+  stdout carries decoded bytes. Imported range extraction documents its
+  partial-verification boundary, while `--verify` performs a complete strict
+  pass and otherwise-ignored decoder options are rejected.
+- Line-aware index construction annotates the retained checkpoint vector in
+  place instead of duplicating every point in ordered tree structures. Strict
+  indexed decoding with line counting enabled now authenticates imported
+  checkpoint and total line counters.
 
 - Generic gzip, zlib, and raw-DEFLATE path selection now uses a bounded
   machine-, runtime-budget-, task-count-, and input-aware admission screen.
@@ -19,6 +51,21 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   release rather than a patch release.
 
 ### Added
+
+- Opt-in newline counting through `DecoderBuilder::count_lines` and the new
+  `DecodeReport::line_count` scalar, preserving `DecodeReport: Copy`. Combining
+  counting with explicit index construction annotates every retained
+  checkpoint and the index total on final ordered output. Concatenated and
+  empty gzip members, BGZF, zlib, raw DEFLATE, streaming push/pull, marker
+  decoding, and strict indexed decoding share the same semantics.
+- `DeflateIndex::checkpoint_at_or_before_line` and
+  `IndexedReader::seek_to_line` for zero-based line access. gztool version 1
+  import/export translates its one-based checkpoint numbering and refuses
+  incomplete line metadata.
+- CLI byte and line ranges using rapidgzip's comma-separated `SIZE@OFFSET`
+  syntax, including binary byte units, `L`, `inf`, overlaps, and ordered
+  extraction. The CLI can read and write native, GZIDX, gztool, line-aware
+  gztool, and BGZF `.gzi` indexes.
 
 - Strict parallel full-stream reuse of caller-supplied `DeflateIndex` values
   through `Decoder::decode_from_index` and `Decoder::reader_from_index`. Every

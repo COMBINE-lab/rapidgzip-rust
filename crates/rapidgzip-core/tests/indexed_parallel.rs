@@ -6,8 +6,8 @@ use common::{bgzf, corpus, gzip, raw_deflate, zlib};
 use libz_rs_sys as z;
 use rapidgzip_core::index::{WINDOW_SIZE, WithLines};
 use rapidgzip_core::{
-    Checkpoint, CheckpointKind, Decoder, DecoderPath, DeflateIndex, Format, IndexDecodeError,
-    IndexKind, IndexOptions, StoredWindow,
+    Checkpoint, CheckpointKind, DecodeError, Decoder, DecoderPath, DeflateIndex, Format,
+    IndexDecodeError, IndexKind, IndexOptions, StoredWindow,
 };
 use std::io::{self, Read, Write};
 use std::mem::size_of;
@@ -335,6 +335,94 @@ fn declared_checkpoint_output_offsets_are_verified() {
         error,
         IndexDecodeError::Decode(rapidgzip_core::DecodeError::IndexOutputMismatch { .. })
     ));
+}
+
+fn with_changed_checkpoint_line(index: &DeflateIndex, position: usize) -> DeflateIndex {
+    let mut changed = DeflateIndex::new();
+    changed.set_kind(index.kind());
+    changed.set_compressed_size(index.compressed_size());
+    changed.set_uncompressed_size(index.uncompressed_size());
+    changed.set_checkpoint_spacing(index.checkpoint_spacing());
+    changed.set_total_line_count(index.total_line_count());
+    for (current, checkpoint) in index.checkpoints().iter().copied().enumerate() {
+        let window = index
+            .windows()
+            .get(checkpoint.compressed_offset_in_bits)
+            .cloned()
+            .unwrap_or_else(StoredWindow::empty);
+        let line_offset = checkpoint.line_offset.map(|lines| {
+            if current == position {
+                lines.saturating_add(1)
+            } else {
+                lines
+            }
+        });
+        changed
+            .push(
+                Checkpoint {
+                    line_offset,
+                    ..checkpoint
+                },
+                window,
+            )
+            .expect("copy checkpoint");
+    }
+    changed.validate().expect("structurally valid line index");
+    changed
+}
+
+#[test]
+fn requested_line_count_authenticates_imported_line_metadata() {
+    let plain = corpus(8 * 1024 * 1024);
+    let compressed: Arc<[u8]> = gzip(&plain, 6).into();
+    let options = IndexOptions {
+        checkpoint_spacing: NonZeroU64::new(512 * 1024).expect("nonzero"),
+        ..IndexOptions::default()
+    };
+    let index = Decoder::builder()
+        .decoder_threads(1)
+        .count_lines(true)
+        .build()
+        .expect("decoder")
+        .decode_with_index(&compressed, &mut io::sink(), options)
+        .expect("index build")
+        .index;
+    assert!(index.checkpoint_count() > 2);
+
+    let changed = with_changed_checkpoint_line(&index, 1);
+    let error = Decoder::builder()
+        .decoder_threads(4)
+        .count_lines(true)
+        .build()
+        .expect("decoder")
+        .decode_from_index(&compressed, &mut io::sink(), &changed)
+        .expect_err("wrong checkpoint line offset");
+    assert!(matches!(
+        error,
+        IndexDecodeError::Decode(DecodeError::IndexLineMismatch { .. })
+    ));
+
+    let mut wrong_total = index.clone();
+    wrong_total.set_total_line_count(index.total_line_count().map(|lines| lines + 1));
+    let error = Decoder::builder()
+        .decoder_threads(4)
+        .count_lines(true)
+        .build()
+        .expect("decoder")
+        .decode_from_index(&compressed, &mut io::sink(), &wrong_total)
+        .expect_err("wrong total line count");
+    assert!(matches!(
+        error,
+        IndexDecodeError::Decode(DecodeError::IndexTotalLineMismatch { .. })
+    ));
+
+    // Line metadata is navigation data unless callers opt into counting.
+    Decoder::builder()
+        .decoder_threads(4)
+        .build()
+        .expect("decoder")
+        .decode_from_index(&compressed, &mut io::sink(), &changed)
+        .expect("decode without line authentication");
 }
 
 #[derive(Default)]

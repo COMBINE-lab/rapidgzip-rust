@@ -233,6 +233,55 @@ fn reads_the_index_written_by_gztool() {
 
 #[test]
 #[ignore = "requires gztool"]
+fn reads_line_aware_index_written_by_gztool() {
+    if !available("gztool", &["-h"]) {
+        println!("skipped: gztool is not installed");
+        return;
+    }
+    let directory = workspace("read-gztool-lines");
+    let mut plain = corpus(8 * 1024 * 1024);
+    if !plain.ends_with(b"\n") {
+        plain.push(b'\n');
+    }
+    let archive = directory.join("corpus.gz");
+    let index_path = directory.join("external.gzi");
+    write(&archive, &gzip(&plain, 6));
+    run(Command::new("gztool")
+        .args(["-i", "-x", "-s", "1", "-I"])
+        .arg(&index_path)
+        .arg(&archive));
+
+    let bytes = fs::read(index_path).expect("read line-aware gztool index");
+    let archive_size = fs::metadata(&archive).expect("stat archive").len();
+    let index = DeflateIndex::read_gztool(&mut bytes.as_slice(), Some(archive_size))
+        .expect("gztool line import");
+    let expected_lines = plain.iter().filter(|&&byte| byte == b'\n').count() as u64;
+    assert_eq!(index.total_line_count(), Some(expected_lines));
+    assert!(
+        index
+            .checkpoints()
+            .iter()
+            .all(|checkpoint| checkpoint.line_offset.is_some())
+    );
+
+    let target_line = 50_000_u64;
+    let expected = plain
+        .iter()
+        .enumerate()
+        .filter(|&(_, &byte)| byte == b'\n')
+        .nth(target_line as usize - 1)
+        .map(|(offset, _)| offset as u64 + 1)
+        .expect("target line");
+    let mut reader = IndexedReader::new(fs::File::open(archive).expect("source"), index)
+        .expect("indexed reader");
+    assert_eq!(
+        reader.seek_to_line(target_line).expect("line seek"),
+        expected
+    );
+}
+
+#[test]
+#[ignore = "requires gztool"]
 fn gztool_reads_the_index_we_write() {
     if !available("gztool", &["-h"]) {
         println!("skipped: gztool is not installed");
@@ -252,4 +301,55 @@ fn gztool_reads_the_index_we_write() {
 
     let extracted = run(Command::new("gztool").args(["-b", "5000000"]).arg(&archive));
     assert_eq!(&extracted[..1024], &plain[5_000_000..5_001_024]);
+}
+
+#[test]
+#[ignore = "requires gztool"]
+fn gztool_extracts_lines_from_the_index_we_write() {
+    if !available("gztool", &["-h"]) {
+        println!("skipped: gztool is not installed");
+        return;
+    }
+    let directory = workspace("write-gztool-lines");
+    let plain = corpus(8 * 1024 * 1024);
+    let archive = directory.join("corpus.gz");
+    write(&archive, &concatenated_gzip(&plain));
+
+    let decoder = Decoder::builder()
+        .decoder_threads(4)
+        .count_lines(true)
+        .build()
+        .expect("builder");
+    let source = fs::File::open(&archive).expect("open archive");
+    let index = decoder
+        .decode_with_index(&source, &mut std::io::sink(), IndexOptions::default())
+        .expect("indexed decode")
+        .index;
+    let mut bytes = Vec::new();
+    index
+        .write_gztool(&mut bytes, WithLines::Yes)
+        .expect("gztool line export");
+    write(&directory.join("corpus.gzi"), &bytes);
+
+    let external_line = 50_000_usize;
+    let extracted = run(Command::new("gztool")
+        .args(["-L", &external_line.to_string()])
+        .arg(&archive));
+    let internal_line = external_line - 1;
+    let start = plain
+        .iter()
+        .enumerate()
+        .filter(|&(_, &byte)| byte == b'\n')
+        .nth(internal_line - 1)
+        .map(|(offset, _)| offset + 1)
+        .expect("target line exists");
+    assert_eq!(&extracted[..512], &plain[start..start + 512]);
+
+    let mut reader = IndexedReader::new(source, index).expect("indexed reader");
+    assert_eq!(
+        reader
+            .seek_to_line(internal_line as u64)
+            .expect("seek line"),
+        start as u64
+    );
 }

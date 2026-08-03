@@ -133,7 +133,7 @@ pub struct Checkpoint {
     pub uncompressed_offset_in_bytes: u64,
     /// How a decoder resumes at this compressed position.
     pub kind: CheckpointKind,
-    /// Number of lines preceding this point, when supplied by the index.
+    /// Number of newline bytes preceding this point, when supplied by the index.
     pub line_offset: Option<u64>,
 }
 
@@ -447,6 +447,40 @@ impl DeflateIndex {
             .map(|index| &self.checkpoints[index])
     }
 
+    /// Returns the latest checkpoint proven not to be after zero-based `line`'s start.
+    ///
+    /// A line offset is the number of newline bytes preceding a checkpoint.
+    /// A checkpoint with the same offset as `line` may already be inside that
+    /// line, so targets after line zero resume from the last checkpoint with a
+    /// strictly smaller line offset. Line zero resumes from a checkpoint at
+    /// decoded offset zero. This returns `None` unless the index has a total
+    /// line count and every checkpoint is annotated, because selecting from
+    /// partially annotated metadata could skip past the requested line.
+    #[must_use]
+    pub fn checkpoint_at_or_before_line(&self, line: u64) -> Option<&Checkpoint> {
+        self.total_line_count?;
+        if self
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.line_offset.is_none())
+        {
+            return None;
+        }
+        if line == 0 {
+            return self
+                .checkpoints
+                .iter()
+                .take_while(|checkpoint| checkpoint.uncompressed_offset_in_bytes == 0)
+                .last();
+        }
+        let position = self.checkpoints.partition_point(|checkpoint| {
+            checkpoint.line_offset.expect("completeness checked above") < line
+        });
+        position
+            .checked_sub(1)
+            .map(|index| &self.checkpoints[index])
+    }
+
     /// Writes this index in the crate's native versioned format.
     ///
     /// The native format is the only one that round-trips every field,
@@ -564,6 +598,15 @@ impl DeflateIndex {
     /// recorded sizes when those are known.
     pub fn validate(&self) -> Result<(), IndexError> {
         let mut previous: Option<&Checkpoint> = None;
+        let mut previous_line_offset = None;
+        if self.total_line_count.is_some_and(|lines| {
+            self.uncompressed_size_in_bytes
+                .is_some_and(|bytes| lines > bytes)
+        }) {
+            return Err(IndexError::InvalidCheckpoint(
+                "total line count exceeds the uncompressed size",
+            ));
+        }
         for checkpoint in &self.checkpoints {
             if !checkpoint_kind_matches_index(self.kind, checkpoint.kind) {
                 return Err(IndexError::InvalidCheckpoint(
@@ -598,6 +641,30 @@ impl DeflateIndex {
                 return Err(IndexError::InvalidCheckpoint(
                     "checkpoint uncompressed offset is after the source end",
                 ));
+            }
+            if checkpoint
+                .line_offset
+                .is_some_and(|lines| lines > checkpoint.uncompressed_offset_in_bytes)
+            {
+                return Err(IndexError::InvalidCheckpoint(
+                    "checkpoint line offset exceeds its uncompressed offset",
+                ));
+            }
+            if let Some(line_offset) = checkpoint.line_offset {
+                if previous_line_offset.is_some_and(|previous| line_offset < previous) {
+                    return Err(IndexError::InvalidCheckpoint(
+                        "checkpoint line offsets are decreasing",
+                    ));
+                }
+                if self
+                    .total_line_count
+                    .is_some_and(|total| line_offset > total)
+                {
+                    return Err(IndexError::InvalidCheckpoint(
+                        "checkpoint line offset exceeds the total line count",
+                    ));
+                }
+                previous_line_offset = Some(line_offset);
             }
 
             if let Some(window) = self.windows.get(checkpoint.compressed_offset_in_bits) {
@@ -1024,5 +1091,39 @@ mod tests {
     #[test]
     fn checkpoint_at_or_before_returns_nothing_for_an_empty_index() {
         assert!(DeflateIndex::new().checkpoint_at_or_before(0).is_none());
+    }
+
+    #[test]
+    fn line_checkpoint_never_starts_inside_the_requested_line() {
+        let mut index = DeflateIndex::new();
+        index.set_total_line_count(Some(2));
+        for (compressed_bits, uncompressed, line_offset) in
+            [(0, 0, 0), (80, 1000, 0), (160, 2000, 1)]
+        {
+            let mut point = checkpoint(compressed_bits, uncompressed);
+            point.line_offset = Some(line_offset);
+            index
+                .push(point, StoredWindow::empty())
+                .expect("line checkpoint");
+        }
+
+        assert_eq!(
+            index
+                .checkpoint_at_or_before_line(0)
+                .map(|point| point.uncompressed_offset_in_bytes),
+            Some(0),
+        );
+        assert_eq!(
+            index
+                .checkpoint_at_or_before_line(1)
+                .map(|point| point.uncompressed_offset_in_bytes),
+            Some(1000),
+        );
+        assert_eq!(
+            index
+                .checkpoint_at_or_before_line(2)
+                .map(|point| point.uncompressed_offset_in_bytes),
+            Some(2000),
+        );
     }
 }

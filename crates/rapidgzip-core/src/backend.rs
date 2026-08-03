@@ -8,6 +8,7 @@ use crate::index::{
     Checkpoint, CheckpointKind, IndexCollector, IndexKind, IndexOptions, WINDOW_SIZE,
 };
 use crate::inflate::RawInflater;
+use crate::line::count_newlines;
 use crate::parallel::Window;
 use crate::parallel::adaptive::AdaptiveWorkers;
 use crate::parallel::admission::{
@@ -39,6 +40,86 @@ pub(crate) trait Output {
     fn emit_reusable(&mut self, chunk: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
         self.emit(chunk)?;
         Ok(Vec::new())
+    }
+}
+
+/// Decode-local state for optional newline counting.
+///
+/// Bytes reach this state only after marker resolution and in final output
+/// order. The same state is used by the push adapters and the pull-driven
+/// streaming reader so every public decode surface has identical semantics.
+pub(crate) struct LineCounter {
+    enabled: bool,
+    emitted_bytes: u64,
+    line_count: u64,
+}
+
+impl LineCounter {
+    pub(crate) const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            emitted_bytes: 0,
+            line_count: 0,
+        }
+    }
+
+    /// Returns the newline count preceding the next output byte.
+    pub(crate) const fn line_count(&self) -> u64 {
+        self.line_count
+    }
+
+    /// Records one final, ordered run of decoded output.
+    pub(crate) fn note_output(&mut self, bytes: &[u8], collector: Option<&IndexCollector>) {
+        if !self.enabled {
+            return;
+        }
+        let newlines = collector
+            .and_then(|collector| collector.note_output(self.emitted_bytes, self.line_count, bytes))
+            .unwrap_or_else(|| count_newlines(bytes));
+        self.emitted_bytes = self.emitted_bytes.saturating_add(bytes.len() as u64);
+        self.line_count = self.line_count.saturating_add(newlines);
+    }
+
+    /// Attaches the count to a successful terminal report.
+    pub(crate) fn finish_report(&self, mut report: DecodeReport) -> DecodeReport {
+        if self.enabled {
+            debug_assert_eq!(self.emitted_bytes, report.decompressed_bytes);
+            report.line_count = Some(self.line_count);
+        }
+        report
+    }
+}
+
+/// Counts final ordered bytes before forwarding them to another output.
+struct LineCountingOutput<'a, O> {
+    inner: &'a mut O,
+    counter: LineCounter,
+    collector: Option<&'a IndexCollector>,
+}
+
+impl<'a, O> LineCountingOutput<'a, O> {
+    const fn new(inner: &'a mut O, enabled: bool, collector: Option<&'a IndexCollector>) -> Self {
+        Self {
+            inner,
+            counter: LineCounter::new(enabled),
+            collector,
+        }
+    }
+
+    fn finish_report(self, report: DecodeReport) -> DecodeReport {
+        self.counter.finish_report(report)
+    }
+}
+
+impl<O: Output> Output for LineCountingOutput<'_, O> {
+    fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError> {
+        self.counter.note_output(&chunk, self.collector);
+        self.inner.emit(chunk)
+    }
+
+    fn emit_reusable(&mut self, chunk: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
+        self.counter.note_output(&chunk, self.collector);
+        self.inner.emit_reusable(chunk)
     }
 }
 
@@ -173,7 +254,9 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    decode_source_inner(source, config, cancelled, output, runtime, None)
+    let mut counted = LineCountingOutput::new(output, config.count_lines, None);
+    let report = decode_source_inner(source, config, cancelled, &mut counted, runtime, None)?;
+    Ok(counted.finish_report(report))
 }
 
 pub(crate) fn decode_source_with_index<R, O>(
@@ -188,9 +271,22 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    let collector = IndexCollector::new(options);
-    let report = decode_source_inner(source, config, cancelled, output, runtime, Some(&collector))?;
-    let index = collector.finish(report.compressed_bytes, report.decompressed_bytes)?;
+    let collector = IndexCollector::new(options, config.count_lines);
+    let mut counted = LineCountingOutput::new(output, config.count_lines, Some(collector.as_ref()));
+    let report = decode_source_inner(
+        source,
+        config,
+        cancelled,
+        &mut counted,
+        runtime,
+        Some(&collector),
+    )?;
+    let report = counted.finish_report(report);
+    let index = collector.finish(
+        report.compressed_bytes,
+        report.decompressed_bytes,
+        report.line_count,
+    )?;
     Ok(IndexedDecodeReport {
         decode: report,
         index,
@@ -693,8 +789,10 @@ where
                 }
                 next_to_emit += 1;
                 if next_to_schedule < index.tasks.len() {
-                    task_queue.push(next_to_schedule);
+                    // A worker may steal immediately after `push`, so publish
+                    // the matching count first to keep its decrement valid.
                     available_tasks.fetch_add(1, Ordering::Release);
+                    task_queue.push(next_to_schedule);
                     next_to_schedule += 1;
                 }
             }
@@ -725,6 +823,7 @@ where
         member_count: index.members.len() as u64,
         decoder_threads: config.decoder_threads,
         format: Format::Gzip,
+        line_count: None,
     })
 }
 
@@ -778,17 +877,19 @@ where
 {
     runtime.set_path(DecoderPath::Sequential);
     runtime.set_adaptive_target(1);
-    decode_members_sequential(
+    let mut counted = LineCountingOutput::new(output, config.count_lines, None);
+    let report = decode_members_sequential(
         cursor,
         config,
         cancelled,
-        output,
+        &mut counted,
         0,
         0,
         config.decoder_threads,
         runtime,
         None,
-    )
+    )?;
+    Ok(counted.finish_report(report))
 }
 
 /// Decodes a forward-only selected stream while collecting a seek index.
@@ -806,19 +907,25 @@ where
 {
     runtime.set_path(DecoderPath::Sequential);
     runtime.set_adaptive_target(1);
-    let collector = IndexCollector::new(options);
+    let collector = IndexCollector::new(options, config.count_lines);
+    let mut counted = LineCountingOutput::new(output, config.count_lines, Some(collector.as_ref()));
     let report = decode_members_sequential(
         cursor,
         config,
         cancelled,
-        output,
+        &mut counted,
         0,
         0,
         config.decoder_threads,
         runtime,
         Some(&collector),
     )?;
-    let index = collector.finish(report.compressed_bytes, report.decompressed_bytes)?;
+    let report = counted.finish_report(report);
+    let index = collector.finish(
+        report.compressed_bytes,
+        report.decompressed_bytes,
+        report.line_count,
+    )?;
     Ok(IndexedDecodeReport {
         decode: report,
         index,
@@ -952,6 +1059,7 @@ impl<C: InputCursor> SequentialDecoder<C> {
             member_count: self.member_count,
             decoder_threads: self.decoder_threads,
             format,
+            line_count: None,
         };
         self.state = SequentialState::Finished(report);
         Ok(report)
@@ -2251,8 +2359,11 @@ where
                     }
                     unresolved_candidates.fetch_add(candidate_count, Ordering::AcqRel);
                     pending_candidates.fetch_add(candidate_count, Ordering::AcqRel);
-                    queue.push(task);
+                    let _guard = work_signal.0.lock().expect("member work mutex poisoned");
+                    // Keep the availability count ahead of queue visibility;
+                    // workers decrement only after a successful steal.
                     let queued = available_tasks.fetch_add(1, Ordering::Release) + 1;
+                    queue.push(task);
                     scanner_runtime.set_queued_tasks(queued);
                     work_signal.1.notify_one();
                 };
@@ -2468,6 +2579,7 @@ where
         member_count,
         decoder_threads: config.decoder_threads,
         format: Format::Gzip,
+        line_count: None,
     })
 }
 
@@ -3216,8 +3328,10 @@ fn enqueue_native_resolution(
     *outstanding += 1;
     let (lock, signal) = work_signal;
     let _guard = lock.lock().expect("estimated work mutex poisoned");
-    queue.push(prepared.task);
+    // A successful steal decrements this count, so increment before the task
+    // becomes visible in the injector.
     available_resolve_tasks.fetch_add(1, Ordering::Release);
+    queue.push(prepared.task);
     signal.notify_all();
     Ok(reached_stream_end)
 }
@@ -3538,6 +3652,7 @@ where
             member_count: 0,
             decoder_threads: config.decoder_threads,
             format,
+            line_count: None,
         });
     }
 
@@ -3895,8 +4010,10 @@ where
                     let (lock, signal) = &*work_signal;
                     let _guard = lock.lock().expect("estimated work mutex poisoned");
                     while next_to_schedule < schedule_end {
-                        task_queue.push(next_to_schedule);
+                        // Publish the count before queue visibility so a fast
+                        // worker cannot decrement zero.
                         available_decode_tasks.fetch_add(1, Ordering::Release);
+                        task_queue.push(next_to_schedule);
                         next_to_schedule += 1;
                     }
                     signal.notify_all();
@@ -4040,8 +4157,10 @@ where
                         let (lock, signal) = &*work_signal;
                         let _guard = lock.lock().expect("estimated work mutex poisoned");
                         while next_to_schedule < schedule_end {
-                            task_queue.push(next_to_schedule);
+                            // Publish the count before queue visibility so a
+                            // fast worker cannot decrement zero.
                             available_decode_tasks.fetch_add(1, Ordering::Release);
+                            task_queue.push(next_to_schedule);
                             next_to_schedule += 1;
                         }
                         signal.notify_all();
@@ -4131,6 +4250,7 @@ where
         member_count,
         decoder_threads: config.decoder_threads,
         format,
+        line_count: None,
     })
 }
 
@@ -4554,8 +4674,10 @@ where
             {
                 let (lock, signal) = &*work_signal;
                 let _guard = lock.lock().expect("BGZF work mutex poisoned");
-                task_queue.push(next_to_schedule);
+                // A worker decrements after stealing, so make its matching
+                // count visible before the queued task.
                 let queued = available_tasks.fetch_add(1, Ordering::Release) + 1;
+                task_queue.push(next_to_schedule);
                 runtime.set_queued_tasks(queued);
                 next_to_schedule += 1;
                 running += 1;
@@ -4589,6 +4711,7 @@ where
         member_count: ranges.len() as u64,
         decoder_threads: config.decoder_threads,
         format: Format::Gzip,
+        line_count: None,
     })
 }
 

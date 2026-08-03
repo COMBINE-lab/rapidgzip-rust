@@ -35,6 +35,30 @@ fn stored_member(bytes: &[u8]) -> Vec<u8> {
     encoded
 }
 
+fn stored_bgzf(bytes: &[u8], block_payload: usize) -> Vec<u8> {
+    assert!(block_payload <= 60 * 1024);
+    let mut encoded = Vec::new();
+    for chunk in bytes.chunks(block_payload) {
+        let mut deflate = Vec::with_capacity(chunk.len() + 5);
+        deflate.push(1);
+        let length = chunk.len() as u16;
+        deflate.extend_from_slice(&length.to_le_bytes());
+        deflate.extend_from_slice(&(!length).to_le_bytes());
+        deflate.extend_from_slice(chunk);
+        let total = 18 + deflate.len() + 8;
+        let mut block = b"\x1f\x8b\x08\x04\0\0\0\0\x00\xff\x06\x00BC\x02\x00".to_vec();
+        block.extend_from_slice(&((total - 1) as u16).to_le_bytes());
+        block.extend_from_slice(&deflate);
+        block.extend_from_slice(&crc32(chunk).to_le_bytes());
+        block.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(&block);
+    }
+    encoded.extend_from_slice(&[
+        31, 139, 8, 4, 0, 0, 0, 0, 0, 255, 6, 0, 66, 67, 2, 0, 27, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    encoded
+}
+
 fn deflate_with(bytes: &[u8], window_bits: i32) -> Vec<u8> {
     deflate_with_level(bytes, window_bits, 1)
 }
@@ -137,6 +161,41 @@ fn decode_reader(criterion: &mut Criterion) {
         );
     }
     group.finish();
+
+    let decoded = fastq_like_bytes(32 * 1024 * 1024);
+    let compressed: Arc<[u8]> = stored_bgzf(&decoded, 4 * 1024).into();
+    for (name, build_index) in [("count", false), ("count_with_index", true)] {
+        let mut group = criterion.benchmark_group(format!("bgzf_line_{name}"));
+        group.throughput(Throughput::Bytes(decoded.len() as u64));
+        for threads in [1, 4, 16] {
+            let decoder = Decoder::builder()
+                .decoder_threads(threads)
+                .count_lines(true)
+                .build()
+                .unwrap();
+            group.bench_with_input(
+                BenchmarkId::from_parameter(threads),
+                &threads,
+                |bencher, _| {
+                    bencher.iter(|| {
+                        if build_index {
+                            decoder
+                                .decode_with_index(
+                                    &compressed,
+                                    &mut io::sink(),
+                                    IndexOptions::default(),
+                                )
+                                .unwrap()
+                                .decode
+                        } else {
+                            decoder.decode(&compressed, &mut io::sink()).unwrap()
+                        }
+                    });
+                },
+            );
+        }
+        group.finish();
+    }
 
     let decoded = fastq_like_bytes(32 * 1024 * 1024);
     let compressed: Arc<[u8]> = deflate_with_level(&decoded, 31, 6).into();

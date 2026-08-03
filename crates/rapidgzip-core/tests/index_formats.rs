@@ -584,6 +584,9 @@ fn gztool_round_trips_with_lines() {
         .write_gztool(&mut bytes, WithLines::Yes)
         .expect("write");
     assert_eq!(&bytes[8..16], b"gzipindX");
+    // Header and counts occupy 36 bytes. The first point's fixed fields and
+    // empty payload occupy another 24, followed by gztool's one-based line.
+    assert_eq!(u64::from_be_bytes(bytes[60..68].try_into().unwrap()), 1);
 
     let restored = DeflateIndex::read_gztool(&mut bytes.as_slice(), Some(1_000_000)).expect("read");
     let restored_fields: Vec<_> = restored
@@ -611,6 +614,31 @@ fn gztool_round_trips_with_lines() {
     assert_eq!(restored_fields, expected_fields);
     assert_eq!(restored.total_line_count(), Some(1234));
     assert_same_windows(&index, &restored);
+}
+
+#[test]
+fn gztool_with_lines_requires_complete_nonzero_external_line_numbers() {
+    use rapidgzip_core::index::WithLines;
+
+    let mut incomplete = sample_index();
+    incomplete.set_total_line_count(None);
+    let error = incomplete
+        .write_gztool(&mut Vec::new(), WithLines::Yes)
+        .expect_err("missing total line count");
+    assert_eq!(
+        error,
+        IndexError::MissingMetadata("complete line counters for gztool version 1 export")
+    );
+
+    let mut bytes = Vec::new();
+    sample_index()
+        .write_gztool(&mut bytes, WithLines::Yes)
+        .expect("write");
+    bytes[60..68].copy_from_slice(&0_u64.to_be_bytes());
+    assert_eq!(
+        DeflateIndex::read_gztool(&mut bytes.as_slice(), None).unwrap_err(),
+        IndexError::InvalidCheckpoint("gztool line number is zero")
+    );
 }
 
 #[test]

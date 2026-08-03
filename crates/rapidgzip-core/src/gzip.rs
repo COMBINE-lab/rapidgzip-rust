@@ -303,7 +303,7 @@ impl<R: Read> StreamCursor<R> {
     /// Returns the buffered prefix without consuming it.
     ///
     /// Only meaningful before anything has been consumed, which is exactly when
-    /// [`validate_initial_stream_header`] runs.
+    /// the test-only initial stream-header validation runs.
     pub(crate) fn buffered(&self) -> &[u8] {
         &self.buffer[self.consumed..self.filled]
     }

@@ -93,12 +93,18 @@ pub(crate) fn write_gztool(
             None => write_u32_be(writer, 0)?,
         }
         if lines == WithLines::Yes {
-            write_u64_be(
-                writer,
-                checkpoint
-                    .line_offset
-                    .ok_or(IndexError::MissingMetadata("checkpoint line counter"))?,
-            )?;
+            // gztool uses one-based line numbers. Internally, zero means that
+            // no newline precedes this checkpoint, so the representation is
+            // shifted by one at the format boundary.
+            let line_number = checkpoint
+                .line_offset
+                .ok_or(IndexError::MissingMetadata("checkpoint line counter"))?
+                .checked_add(1)
+                .ok_or(IndexError::ExcessiveLength {
+                    what: "gztool line number",
+                    value: u64::MAX,
+                })?;
+            write_u64_be(writer, line_number)?;
         }
     }
     write_u64_be(writer, uncompressed_size)?;
@@ -207,7 +213,11 @@ pub(crate) fn read_gztool(
             StoredWindow::from_compressed(payload)?
         };
         let line_offset = if with_lines {
-            Some(read_u64_be(reader)?)
+            Some(
+                read_u64_be(reader)?
+                    .checked_sub(1)
+                    .ok_or(IndexError::InvalidCheckpoint("gztool line number is zero"))?,
+            )
         } else {
             None
         };

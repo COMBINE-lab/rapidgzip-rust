@@ -15,6 +15,43 @@ ratio between the two groups isolates indexing overhead on identical data.
 Record checkpoint count, serialized native-index size, and peak RSS alongside
 throughput when evaluating a release candidate.
 
+The paired `bgzf_line_count` and `bgzf_line_count_with_index` groups use a
+32 MiB FASTQ-like stream split into 4 KiB BGZF blocks (more than eight thousand
+retained checkpoints). Their ratio isolates checkpoint annotation from SIMD
+newline counting, while peak RSS from the benchmark process exposes growth per
+checkpoint. The index builder annotates its checkpoint vector in place and
+must not recreate the former tree-node allocation per checkpoint.
+
+For a larger peak-RSS diagnostic without Criterion's sampling allocations:
+
+```bash
+cargo build --release -p rapidgzip-bench --bin line_index
+/usr/bin/time -v target/release/line_index count 8 128
+/usr/bin/time -v target/release/line_index index 8 128
+```
+
+Both modes generate the same 128 MiB stored-BGZF fixture with 4 KiB blocks and
+discard generation scratch before timing. The index mode retains more than
+32,000 line-annotated checkpoints. Compare elapsed time and maximum resident
+set size across repeated, alternating invocations.
+
+### 2026-08-03 line-index diagnostic
+
+On the dual-socket Xeon E5-2699 v4 host described below, five alternating
+un-pinned runs of the command above at eight workers produced these medians:
+
+| mode | decoded bytes | checkpoints | timed decode | peak RSS |
+|---|---:|---:|---:|---:|
+| line count | 134,217,728 | 0 | 48.362 ms | 136,700 KiB |
+| line count + index | 134,217,728 | 32,768 | 51.518 ms | 138,088 KiB |
+
+In-place annotation therefore added 6.5% elapsed time and 1,388 KiB peak RSS,
+or about 43 bytes per retained checkpoint, on this deliberately dense index.
+The larger quick Criterion sweep measured count-plus-index overhead of 11.9%,
+11.9%, and 5.9% at 1, 4, and 16 workers respectively; those single-sample
+figures are retained as a routing diagnostic rather than a portable speed
+claim.
+
 The `decoder_reader_deflate_formats` group compresses one identical payload as
 gzip, zlib, and raw DEFLATE, then decodes each through the public reader at the
 same worker budgets. It is a paired container-overhead regression check, not a
@@ -450,3 +487,23 @@ FASTQ contains many small internal DEFLATE blocks, so multi-worker throughput
 fell below 350 MiB/s despite synthetic success. Accumulating internal block
 results into configured output chunks restored scaling; a focused integration
 test now enforces a chunk-plus-span bound on writer handoffs.
+
+## 2026-08-03 line-counting FASTQ diagnostic
+
+The line-aware CLI successor was checked on the same public FASTQ file and
+dual-socket host described above. This was an unpinned implementation
+diagnostic, not a release parity matrix. The release CLI used a 16-worker
+budget, one warmup per mode, and five alternating `/usr/bin/time` runs. Both
+modes decoded and verified the full stream to a sink; the counted mode reported
+4,320,920 newline bytes.
+
+| mode | five wall times (s) | median (s) | decoded MiB/s |
+|---|---|---:|---:|
+| counting disabled (`--test`) | 0.25, 0.27, 0.25, 0.25, 0.24 | 0.25 | 1,380.2 |
+| counting enabled (`--count-lines`) | 0.28, 0.28, 0.28, 0.27, 0.27 | 0.28 | 1,232.3 |
+
+The first scalar implementation measured 0.52 seconds in the counted mode on
+the same warm cache, more than twice the 0.25-second control. Runtime-dispatched
+AVX2 with SSE2 and NEON baselines reduced the measured optional cost to roughly
+12%. The ordinary disabled path still performs no scan and only tests the
+decode-local enabled flag at each ordered output chunk.

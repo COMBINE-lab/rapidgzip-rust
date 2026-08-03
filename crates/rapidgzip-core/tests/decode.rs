@@ -553,6 +553,34 @@ fn telemetry_reports_specialized_and_sequential_paths() {
 }
 
 #[test]
+fn specialized_task_queue_publication_is_stable_under_repetition() {
+    let stored = member(&vec![1; 10 * 1024 * 1024]);
+    let mut bgzf = Vec::new();
+    for _ in 0..64 {
+        bgzf.extend(bgzf_member(b"ACGT\n"));
+    }
+    bgzf.extend(bgzf_eof());
+    let (dense_member, _) = dynamic_multiblock_fixture();
+    let dense = dense_member.repeat(64);
+
+    for _ in 0..12 {
+        for (compressed, expected_path, expected_members) in [
+            (&stored, DecoderPath::Stored, 1),
+            (&bgzf, DecoderPath::Bgzf, 65),
+            (&dense, DecoderPath::DenseMembers, 64),
+        ] {
+            let decoder = Decoder::builder().decoder_threads(8).build().unwrap();
+            let mut reader = decoder.reader(compressed.clone()).unwrap();
+            let handle = reader.handle();
+            io::copy(&mut reader, &mut io::sink()).unwrap();
+            let report = reader.finish().unwrap();
+            assert_eq!(report.member_count, expected_members);
+            assert_eq!(handle.stats().path, expected_path);
+        }
+    }
+}
+
+#[test]
 fn runtime_limit_lazily_grows_and_retires_dense_workers() {
     let visible = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     if visible < 2 {

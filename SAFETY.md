@@ -87,6 +87,19 @@ boundary or bypasses full member inflation and trailer verification.
 The AArch64 NEON implementation similarly guards each 16-byte input load and
 stores its comparison lanes only into a live local 16-byte array.
 
+## SIMD newline counting
+
+Optional line counting scans only final ordered byte slices. On x86-64, AVX2
+is called only after runtime detection; otherwise the SSE2 implementation is
+valid because SSE2 is part of the architecture baseline. Their unaligned loads
+are guarded by `offset + width <= bytes.len()`, and comparison masks are only
+counted, never used for memory access. On AArch64, Advanced SIMD is baseline and
+the NEON loop applies the same 16-byte bound before each unaligned load. Every
+implementation sends its shorter tail through safe scalar Rust and is
+differentially tested against that scalar implementation across vector edges,
+randomized contents, and every starting-address displacement from zero through
+63 bytes.
+
 ## Native DEFLATE bit loads
 
 The hot bit reader and Huffman peek perform an unaligned `u64` load only after
