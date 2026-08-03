@@ -112,4 +112,26 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn dispatched_count_matches_scalar_for_misaligned_randomized_slices() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut bytes = vec![0_u8; 8192 + 64];
+        for byte in &mut bytes {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        for start in 0..64 {
+            for length in [0, 1, 15, 16, 17, 31, 32, 33, 127, 1024, 4097, 8192] {
+                let slice = &bytes[start..start + length];
+                assert_eq!(
+                    count_newlines(slice),
+                    count_newlines_scalar(slice),
+                    "start {start}, length {length}",
+                );
+            }
+        }
+    }
 }

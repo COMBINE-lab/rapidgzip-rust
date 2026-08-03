@@ -13,6 +13,7 @@ use crate::format::FormatSelection;
 use crate::gzip::{MemberHeader, SourceCursor, parse_member_header};
 use crate::index::{Checkpoint, CheckpointKind, DeflateIndex, IndexError, IndexKind};
 use crate::inflate::RawInflater;
+use crate::line::count_newlines;
 use crate::parallel::adaptive::AdaptiveWorkers;
 use crate::runtime::{DecoderPath, RuntimeState};
 use crate::zlib::{self, Adler32};
@@ -35,6 +36,102 @@ struct Span {
     start: Checkpoint,
     end: Option<Checkpoint>,
     expected_output: Option<u64>,
+}
+
+/// Checks caller-supplied line annotations while output is in final order.
+///
+/// This remains inactive unless line counting was requested and the imported
+/// index actually carries line metadata. It deliberately lives outside worker
+/// tasks so speculative or out-of-order bytes can never affect the result.
+struct ImportedLineVerifier<'a> {
+    checkpoints: &'a [Checkpoint],
+    total: Option<u64>,
+    next: usize,
+    active: bool,
+}
+
+impl<'a> ImportedLineVerifier<'a> {
+    fn new(index: &'a DeflateIndex, enabled: bool) -> Self {
+        let checkpoints = index.checkpoints();
+        Self {
+            checkpoints,
+            total: index.total_line_count(),
+            next: 0,
+            active: enabled
+                && (index.total_line_count().is_some()
+                    || checkpoints
+                        .iter()
+                        .any(|checkpoint| checkpoint.line_offset.is_some())),
+        }
+    }
+
+    fn note_output(
+        &mut self,
+        start: u64,
+        lines_before: u64,
+        bytes: &[u8],
+    ) -> Result<(), DecodeError> {
+        if !self.active {
+            return Ok(());
+        }
+        let end = start.saturating_add(bytes.len() as u64);
+        let mut scanned = 0_usize;
+        let mut lines = lines_before;
+        while let Some(checkpoint) = self.checkpoints.get(self.next) {
+            let offset = checkpoint.uncompressed_offset_in_bytes;
+            if offset >= end {
+                break;
+            }
+            if offset < start {
+                return Err(DecodeError::IndexLineMismatch {
+                    checkpoint_byte_offset: offset,
+                    expected_lines: checkpoint.line_offset.unwrap_or(lines),
+                    actual_lines: lines,
+                });
+            }
+            if let Some(expected_lines) = checkpoint.line_offset {
+                let target = usize::try_from(offset - start)
+                    .expect("checkpoint is inside the current output slice");
+                lines = lines.saturating_add(count_newlines(&bytes[scanned..target]));
+                scanned = target;
+                if expected_lines != lines {
+                    return Err(DecodeError::IndexLineMismatch {
+                        checkpoint_byte_offset: offset,
+                        expected_lines,
+                        actual_lines: lines,
+                    });
+                }
+            }
+            self.next += 1;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, bytes: u64, lines: u64) -> Result<(), DecodeError> {
+        if !self.active {
+            return Ok(());
+        }
+        while let Some(checkpoint) = self.checkpoints.get(self.next) {
+            let expected_lines = checkpoint.line_offset.unwrap_or(lines);
+            if checkpoint.uncompressed_offset_in_bytes != bytes || expected_lines != lines {
+                return Err(DecodeError::IndexLineMismatch {
+                    checkpoint_byte_offset: checkpoint.uncompressed_offset_in_bytes,
+                    expected_lines,
+                    actual_lines: lines,
+                });
+            }
+            self.next += 1;
+        }
+        if let Some(expected_lines) = self.total {
+            if expected_lines != lines {
+                return Err(DecodeError::IndexTotalLineMismatch {
+                    expected_lines,
+                    actual_lines: lines,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Source-validated work description built before any worker is created.
@@ -1169,6 +1266,7 @@ where
     let mut verifier = OrderedVerifier::new(plan.kind);
     let mut total_output = 0_u64;
     let mut line_counter = LineCounter::new(config.count_lines);
+    let mut line_verifier = ImportedLineVerifier::new(index, config.count_lines);
 
     let result = thread::scope(|scope| -> Result<(), DecodeError> {
         let _stop = StopGuard {
@@ -1249,8 +1347,10 @@ where
                 SpanEvent::Data { bytes, checksum } => {
                     let next_total = config.checked_output_total(total_output, bytes.len())?;
                     verifier.accept_chunk(checksum, bytes.len())?;
-                    total_output = next_total;
+                    let lines_before = line_counter.line_count();
                     line_counter.note_output(&bytes, None);
+                    line_verifier.note_output(total_output, lines_before, &bytes)?;
+                    total_output = next_total;
                     let reusable = output.emit_reusable(bytes)?;
                     if reusable.capacity() != 0 {
                         recycled.push(reusable);
@@ -1292,12 +1392,14 @@ where
     }
     let members = verifier.finish()?;
     config.verify_expected_output(total_output)?;
-    Ok(line_counter.finish_report(DecodeReport {
+    let report = line_counter.finish_report(DecodeReport {
         compressed_bytes: plan.source_length,
         decompressed_bytes: total_output,
         member_count: members,
         decoder_threads: config.decoder_threads,
         format: plan.format,
         line_count: None,
-    }))
+    });
+    line_verifier.finish(total_output, report.line_count.unwrap_or(0))?;
+    Ok(report)
 }

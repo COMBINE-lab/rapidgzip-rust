@@ -353,6 +353,11 @@ impl Decoder {
     /// not cause an entire decompressed span to be allocated. Empty gzip
     /// members remain explicit spans and are fully verified.
     ///
+    /// When [`DecoderBuilder::count_lines`] is enabled, imported per-checkpoint
+    /// and total line counters are recomputed from final ordered output and a
+    /// mismatch is rejected. Without line counting, line metadata remains
+    /// caller-supplied navigation data and is not authenticated.
+    ///
     /// # Examples
     ///
     /// ```no_run

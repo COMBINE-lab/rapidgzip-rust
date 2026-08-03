@@ -63,6 +63,11 @@ impl LineCounter {
         }
     }
 
+    /// Returns the newline count preceding the next output byte.
+    pub(crate) const fn line_count(&self) -> u64 {
+        self.line_count
+    }
+
     /// Records one final, ordered run of decoded output.
     pub(crate) fn note_output(&mut self, bytes: &[u8], collector: Option<&IndexCollector>) {
         if !self.enabled {

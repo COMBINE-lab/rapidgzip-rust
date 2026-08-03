@@ -216,6 +216,22 @@ pub enum DecodeError {
         /// Decompressed bytes actually produced for that span.
         actual_bytes: u64,
     },
+    /// A checkpoint's imported line counter disagreed with decoded output.
+    IndexLineMismatch {
+        /// Decompressed checkpoint whose line counter was checked.
+        checkpoint_byte_offset: u64,
+        /// Newline count declared by the index.
+        expected_lines: u64,
+        /// Newline count observed in ordered decoded output.
+        actual_lines: u64,
+    },
+    /// An imported index's total line counter disagreed with decoded output.
+    IndexTotalLineMismatch {
+        /// Newline count declared by the index.
+        expected_lines: u64,
+        /// Newline count observed in the complete decoded output.
+        actual_lines: u64,
+    },
     /// A decoder worker panicked.
     WorkerPanicked,
     /// Decoding was cancelled because the consumer stopped.
@@ -260,7 +276,9 @@ impl DecodeError {
             | Self::SizeMismatch { .. }
             | Self::UnexpectedOutputSize { .. }
             | Self::IndexBoundaryMismatch { .. }
-            | Self::IndexOutputMismatch { .. } => io::ErrorKind::InvalidData,
+            | Self::IndexOutputMismatch { .. }
+            | Self::IndexLineMismatch { .. }
+            | Self::IndexTotalLineMismatch { .. } => io::ErrorKind::InvalidData,
             Self::OutputLimitExceeded { .. } => io::ErrorKind::FileTooLarge,
             Self::WorkerPanicked => io::ErrorKind::Other,
             Self::Cancelled => io::ErrorKind::Interrupted,
@@ -338,6 +356,21 @@ impl Display for DecodeError {
             } => write!(
                 formatter,
                 "index span ending at bit {checkpoint_bit_offset} declared {expected_bytes} output bytes but produced {actual_bytes}"
+            ),
+            Self::IndexLineMismatch {
+                checkpoint_byte_offset,
+                expected_lines,
+                actual_lines,
+            } => write!(
+                formatter,
+                "index checkpoint at decoded byte {checkpoint_byte_offset} declared {expected_lines} preceding newlines but output contains {actual_lines}"
+            ),
+            Self::IndexTotalLineMismatch {
+                expected_lines,
+                actual_lines,
+            } => write!(
+                formatter,
+                "index declared {expected_lines} total newlines but output contains {actual_lines}"
             ),
             Self::WorkerPanicked => formatter.write_str("a decoder worker panicked"),
             Self::Cancelled => formatter.write_str("decoding was cancelled"),

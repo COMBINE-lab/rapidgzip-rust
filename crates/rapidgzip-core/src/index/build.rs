@@ -5,7 +5,6 @@ use super::{
     WindowStorage,
 };
 use crate::line::count_newlines;
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 /// Mutable ordered state protected by [`IndexCollector`].
@@ -15,8 +14,8 @@ pub(crate) struct IndexBuilder {
     last_kept: Option<Checkpoint>,
     error: Option<IndexError>,
     annotate_lines: bool,
-    pending_line_offsets: BTreeSet<u64>,
-    resolved_line_offsets: BTreeMap<u64, u64>,
+    next_line_checkpoint: usize,
+    line_metadata_incomplete: bool,
 }
 
 impl IndexBuilder {
@@ -29,8 +28,8 @@ impl IndexBuilder {
             last_kept: None,
             error: None,
             annotate_lines,
-            pending_line_offsets: BTreeSet::new(),
-            resolved_line_offsets: BTreeMap::new(),
+            next_line_checkpoint: 0,
+            line_metadata_incomplete: false,
         }
     }
 
@@ -58,15 +57,26 @@ impl IndexBuilder {
             >= self.options.checkpoint_spacing.get()
     }
 
-    fn commit(&mut self, checkpoint: Checkpoint, window: StoredWindow) {
+    fn commit(&mut self, mut checkpoint: Checkpoint, window: StoredWindow) {
         if !self.should_keep(checkpoint, !window.is_empty()) {
             return;
         }
+        if self.annotate_lines {
+            checkpoint.line_offset = self
+                .index
+                .checkpoints
+                .last()
+                .filter(|previous| {
+                    previous.uncompressed_offset_in_bytes == checkpoint.uncompressed_offset_in_bytes
+                })
+                .and_then(|previous| previous.line_offset);
+        }
         match self.index.push(checkpoint, window) {
             Ok(()) => {
-                if self.annotate_lines {
-                    self.pending_line_offsets
-                        .insert(checkpoint.uncompressed_offset_in_bytes);
+                if checkpoint.line_offset.is_some()
+                    && self.next_line_checkpoint + 1 == self.index.checkpoints.len()
+                {
+                    self.next_line_checkpoint += 1;
                 }
                 self.last_kept = Some(checkpoint);
             }
@@ -82,18 +92,35 @@ impl IndexBuilder {
 
     /// Resolves retained checkpoint line offsets covered by one output run.
     fn note_output(&mut self, start: u64, lines_before: u64, bytes: &[u8]) -> Option<u64> {
-        if !self.annotate_lines || self.pending_line_offsets.is_empty() {
+        if !self.annotate_lines {
             return None;
         }
         let end = start.saturating_add(bytes.len() as u64);
         let mut scanned = 0_usize;
         let mut lines = lines_before;
-        while let Some(offset) = self.pending_line_offsets.range(start..end).next().copied() {
+        while let Some(checkpoint) = self.index.checkpoints.get_mut(self.next_line_checkpoint) {
+            if checkpoint.line_offset.is_some() {
+                self.next_line_checkpoint += 1;
+                continue;
+            }
+            let offset = checkpoint.uncompressed_offset_in_bytes;
+            if offset < start {
+                // A checkpoint arrived after ordered output had already passed
+                // it. There is no retained byte history from which to recover
+                // its exact line count, so preserve the existing all-or-none
+                // fallback rather than publishing partial metadata.
+                self.line_metadata_incomplete = true;
+                self.next_line_checkpoint += 1;
+                continue;
+            }
+            if offset >= end {
+                break;
+            }
             let target = usize::try_from(offset - start).expect("offset falls inside this slice");
             lines = lines.saturating_add(count_newlines(&bytes[scanned..target]));
             scanned = target;
-            self.pending_line_offsets.remove(&offset);
-            self.resolved_line_offsets.insert(offset, lines);
+            checkpoint.line_offset = Some(lines);
+            self.next_line_checkpoint += 1;
         }
         Some(
             lines
@@ -116,24 +143,25 @@ impl IndexBuilder {
         self.index.set_compressed_size(Some(compressed_size));
         self.index.set_uncompressed_size(Some(uncompressed_size));
         if let Some(lines) = line_count {
-            if self.pending_line_offsets.remove(&uncompressed_size) {
-                self.resolved_line_offsets.insert(uncompressed_size, lines);
+            while let Some(checkpoint) = self.index.checkpoints.get_mut(self.next_line_checkpoint) {
+                if checkpoint.uncompressed_offset_in_bytes != uncompressed_size {
+                    self.line_metadata_incomplete = true;
+                    break;
+                }
+                checkpoint.line_offset = Some(lines);
+                self.next_line_checkpoint += 1;
             }
         }
         let fully_annotated = self.annotate_lines
             && line_count.is_some()
-            && self.pending_line_offsets.is_empty()
-            && self.index.checkpoints.iter().all(|checkpoint| {
-                self.resolved_line_offsets
-                    .contains_key(&checkpoint.uncompressed_offset_in_bytes)
-            });
+            && !self.line_metadata_incomplete
+            && self.next_line_checkpoint == self.index.checkpoints.len()
+            && self
+                .index
+                .checkpoints
+                .iter()
+                .all(|checkpoint| checkpoint.line_offset.is_some());
         if fully_annotated {
-            for checkpoint in &mut self.index.checkpoints {
-                checkpoint.line_offset = self
-                    .resolved_line_offsets
-                    .get(&checkpoint.uncompressed_offset_in_bytes)
-                    .copied();
-            }
             self.index.set_total_line_count(line_count);
         } else {
             for checkpoint in &mut self.index.checkpoints {

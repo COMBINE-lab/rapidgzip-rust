@@ -3,7 +3,7 @@
 mod common;
 
 use common::{bgzf, corpus, gzip, raw_deflate, zlib};
-use rapidgzip_core::{Decoder, Format, IndexOptions, IndexedReader};
+use rapidgzip_core::{Decoder, DecoderPath, Format, IndexOptions, IndexedReader};
 use std::io::{self, Cursor, Read};
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -73,6 +73,72 @@ fn sequential_parallel_bgzf_and_streaming_counts_agree() {
         .expect("streaming reader");
     io::copy(&mut reader, &mut io::sink()).expect("read");
     assert_eq!(reader.finish().expect("finish").line_count, Some(expected));
+}
+
+#[test]
+fn every_pull_reader_surface_reports_the_same_line_count() {
+    let decoded = corpus(2 * 1024 * 1024);
+    let expected = newline_count(&decoded);
+    let compressed: Arc<[u8]> = gzip(&decoded, 6).into();
+    let decoder = counting_decoder(4);
+
+    let mut reader = decoder
+        .reader(Arc::clone(&compressed))
+        .expect("positional reader");
+    io::copy(&mut reader, &mut io::sink()).expect("read positional");
+    assert_eq!(reader.finish().expect("finish").line_count, Some(expected));
+
+    let mut indexing = decoder
+        .reader_with_index(Arc::clone(&compressed), IndexOptions::default())
+        .expect("indexing reader");
+    io::copy(&mut indexing, &mut io::sink()).expect("read indexing");
+    let indexed = indexing.finish().expect("finish indexing");
+    assert_eq!(indexed.decode.line_count, Some(expected));
+    assert_eq!(indexed.index.total_line_count(), Some(expected));
+
+    let mut from_index = decoder
+        .reader_from_index(Arc::clone(&compressed), Arc::new(indexed.index))
+        .expect("reader from index");
+    io::copy(&mut from_index, &mut io::sink()).expect("read from index");
+    assert_eq!(
+        from_index.finish().expect("finish from index").line_count,
+        Some(expected)
+    );
+
+    let mut stream_indexing = decoder
+        .stream_reader_with_index(Cursor::new(compressed), IndexOptions::default())
+        .expect("stream indexing reader");
+    io::copy(&mut stream_indexing, &mut io::sink()).expect("read stream indexing");
+    let streamed = stream_indexing.finish().expect("finish stream indexing");
+    assert_eq!(streamed.decode.line_count, Some(expected));
+    assert_eq!(streamed.index.total_line_count(), Some(expected));
+}
+
+#[test]
+fn specialized_positional_paths_count_only_final_ordered_output() {
+    let stored_plain = corpus(10 * 1024 * 1024);
+    let bgzf_plain = corpus(4 * 1024 * 1024);
+    let dense_plain = corpus(4 * 1024 * 1024);
+    let mut dense = Vec::new();
+    for member in dense_plain.chunks(64 * 1024) {
+        dense.extend_from_slice(&gzip(member, 6));
+    }
+
+    for (compressed, plain, expected_path) in [
+        (gzip(&stored_plain, 0), stored_plain, DecoderPath::Stored),
+        (bgzf(&bgzf_plain, 16 * 1024), bgzf_plain, DecoderPath::Bgzf),
+        (dense, dense_plain, DecoderPath::DenseMembers),
+    ] {
+        let expected = newline_count(&plain);
+        let mut reader = counting_decoder(8)
+            .reader(compressed)
+            .expect("specialized reader");
+        let handle = reader.handle();
+        io::copy(&mut reader, &mut io::sink()).expect("read specialized path");
+        let report = reader.finish().expect("finish specialized path");
+        assert_eq!(report.line_count, Some(expected));
+        assert_eq!(handle.stats().path, expected_path);
+    }
 }
 
 #[test]
