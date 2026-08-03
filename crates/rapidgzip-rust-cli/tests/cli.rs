@@ -325,6 +325,80 @@ fn test_count_and_line_count_are_complete_stream_actions() {
 }
 
 #[test]
+fn analyze_reports_structure_for_files_and_standard_input() {
+    let directory = workspace("analyze");
+    let plain = corpus(3_000);
+    let archive = directory.join("data.gz");
+    write(&archive, &gzip(&plain));
+
+    let output = run(&["--analyze", archive.to_str().expect("path")]);
+    assert_ok(&output);
+    let report = stdout(&output);
+    assert!(report.contains("Gzip header:"));
+    assert!(report.contains("Deflate block:"));
+    assert!(report.contains("Gzip footer:"));
+    assert!(report.contains("== Benchmark Profile (Cumulative Times) =="));
+    assert!(report.contains("== Deflate Block Compression Types =="));
+    assert!(output.stderr.is_empty());
+
+    let mut child = Command::new(BINARY)
+        .args(["--analyze", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn analyze");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(&gzip(&plain))
+        .expect("write archive");
+    let output = child.wait_with_output().expect("wait");
+    assert_ok(&output);
+    assert!(stdout(&output).contains("Bit reader EOF reached at"));
+}
+
+#[test]
+fn analyze_limits_and_irrelevant_decoder_options_are_explicit() {
+    let directory = workspace("analyze-limits");
+    let archive = directory.join("multi.gz");
+    let mut compressed = gzip(b"first");
+    compressed.extend_from_slice(&gzip(b"second"));
+    write(&archive, &compressed);
+
+    let output = run(&[
+        "--analyze",
+        "--analysis-max-streams",
+        "1",
+        archive.to_str().expect("path"),
+    ]);
+    assert_failed(&output);
+    assert!(stderr(&output).contains("configured limit of 1"));
+
+    for arguments in [
+        vec!["--analyze", "--decoder-parallelism", "2"],
+        vec!["--analyze", "--chunk-size", "64"],
+        vec!["--analyze", "--analysis-reference-limit", "2"],
+        vec!["--analyze", "--count"],
+    ] {
+        let mut complete = arguments;
+        complete.push(archive.to_str().expect("path"));
+        assert_failed(&run(&complete));
+    }
+
+    let output = run(&[
+        "--analyze",
+        "--verbose",
+        "--analysis-reference-limit",
+        "2",
+        archive.to_str().expect("path"),
+    ]);
+    assert_ok(&output);
+    assert!(stdout(&output).contains("Back-references to the preceding window:"));
+}
+
+#[test]
 fn payload_and_counts_share_one_decode_without_mixing_stdout() {
     let directory = workspace("combined-actions");
     let plain = corpus(300);
