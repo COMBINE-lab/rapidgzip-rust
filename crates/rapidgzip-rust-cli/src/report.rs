@@ -45,17 +45,25 @@ pub fn print_test_result(name: &str, report: &DecodeReport, volume: Volume) -> i
     )
 }
 
-/// Prints the decompressed byte count.
-pub fn print_count(report: &DecodeReport) -> io::Result<()> {
-    writeln!(io::stdout(), "{}", report.decompressed_bytes)
+/// Prints the decompressed byte count to the selected diagnostic stream.
+pub fn print_count(report: &DecodeReport, to_stderr: bool) -> io::Result<()> {
+    if to_stderr {
+        writeln!(io::stderr(), "{}", report.decompressed_bytes)
+    } else {
+        writeln!(io::stdout(), "{}", report.decompressed_bytes)
+    }
 }
 
-/// Prints the newline count requested from the decoder.
-pub fn print_line_count(report: &DecodeReport) -> io::Result<()> {
+/// Prints the newline count requested from the decoder to the selected stream.
+pub fn print_line_count(report: &DecodeReport, to_stderr: bool) -> io::Result<()> {
     let count = report.line_count.ok_or_else(|| {
         io::Error::other("line counting was requested but the report has no count")
     })?;
-    writeln!(io::stdout(), "{count}")
+    if to_stderr {
+        writeln!(io::stderr(), "{count}")
+    } else {
+        writeln!(io::stdout(), "{count}")
+    }
 }
 
 /// Prints verified stream statistics and elapsed throughput.

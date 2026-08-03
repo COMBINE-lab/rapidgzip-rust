@@ -28,6 +28,25 @@ impl Source {
             Self::Stream(_) => "standard input".to_owned(),
         }
     }
+
+    /// Returns whether `candidate` aliases the already opened positional input.
+    ///
+    /// Comparing against the open handle, rather than reopening only the
+    /// original pathname, closes the most important rename race between input
+    /// classification and output safety checks.
+    pub fn refers_to_path(&self, candidate: &Path) -> bool {
+        match self {
+            Self::Positional(file, original) => {
+                original == candidate
+                    || std::fs::canonicalize(original)
+                        .ok()
+                        .zip(std::fs::canonicalize(candidate).ok())
+                        .is_some_and(|(left, right)| left == right)
+                    || file_and_path_refer_to_same_file(file, candidate)
+            }
+            Self::Stream(_) => false,
+        }
+    }
 }
 
 /// Opens `path` using the same regular-file rule as the core decoder.
@@ -83,7 +102,11 @@ pub fn derived_output_path(input: &Path) -> PathBuf {
     if input
         .extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| SUFFIXES.contains(&extension))
+        .is_some_and(|extension| {
+            SUFFIXES
+                .iter()
+                .any(|suffix| extension.eq_ignore_ascii_case(suffix))
+        })
     {
         return input.with_extension("");
     }
@@ -107,10 +130,7 @@ pub fn open_destination(
         if path.as_os_str() == "-" {
             return Ok(Destination::Stdout);
         }
-        if source
-            .path()
-            .is_some_and(|input| paths_refer_to_same_file(input, path))
-        {
+        if source.refers_to_path(path) {
             return Err("the output path refers to the compressed input".into());
         }
         return Ok(Destination::File(create_output(path, force)?));
@@ -147,6 +167,18 @@ pub fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     false
 }
 
+fn file_and_path_refer_to_same_file(file: &File, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Some((left, right)) = file.metadata().ok().zip(std::fs::metadata(path).ok()) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+    let _ = (file, path);
+    false
+}
+
 fn create_output(path: &Path, force: bool) -> Result<File, Box<dyn std::error::Error>> {
     let mut options = OpenOptions::new();
     options.write(true);
@@ -177,7 +209,10 @@ mod tests {
         for (input, expected) in [
             ("reads.fastq.gz", "reads.fastq"),
             ("reads.fastq.bgz", "reads.fastq"),
+            ("reads.fastq.GZ", "reads.fastq"),
+            ("reads.fastq.BgZ", "reads.fastq"),
             ("payload.zlib", "payload"),
+            ("payload.ZLIB", "payload"),
             ("payload.z", "payload"),
         ] {
             assert_eq!(

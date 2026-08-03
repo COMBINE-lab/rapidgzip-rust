@@ -1,7 +1,7 @@
 //! End-to-end tests for the installed command-line surface.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -36,6 +36,14 @@ fn crc32(bytes: &[u8]) -> u32 {
 
 fn gzip(bytes: &[u8]) -> Vec<u8> {
     let mut encoded = b"\x1f\x8b\x08\x00\0\0\0\0\x00\xff".to_vec();
+    encoded.extend_from_slice(&raw_deflate(bytes));
+    encoded.extend_from_slice(&crc32(bytes).to_le_bytes());
+    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    encoded
+}
+
+fn raw_deflate(bytes: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
         vec![&[]]
     } else {
@@ -48,8 +56,24 @@ fn gzip(bytes: &[u8]) -> Vec<u8> {
         encoded.extend_from_slice(&(!length).to_le_bytes());
         encoded.extend_from_slice(chunk);
     }
-    encoded.extend_from_slice(&crc32(bytes).to_le_bytes());
-    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    encoded
+}
+
+fn adler32(bytes: &[u8]) -> u32 {
+    const MODULUS: u32 = 65_521;
+    let mut first = 1_u32;
+    let mut second = 0_u32;
+    for &byte in bytes {
+        first = (first + u32::from(byte)) % MODULUS;
+        second = (second + first) % MODULUS;
+    }
+    (second << 16) | first
+}
+
+fn zlib(bytes: &[u8]) -> Vec<u8> {
+    let mut encoded = vec![0x78, 0x01];
+    encoded.extend_from_slice(&raw_deflate(bytes));
+    encoded.extend_from_slice(&adler32(bytes).to_be_bytes());
     encoded
 }
 
@@ -199,6 +223,33 @@ fn output_and_index_paths_cannot_destroy_the_input_or_each_other() {
     assert!(!shared.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn hard_link_and_symlink_aliases_cannot_destroy_the_input() {
+    use std::os::unix::fs::symlink;
+
+    let directory = workspace("filesystem-aliases");
+    let plain = corpus(30);
+    let archive = directory.join("data.gz");
+    let hard_link = directory.join("hard-link.gz");
+    let symbolic_link = directory.join("symbolic-link.gz");
+    let original = gzip(&plain);
+    write(&archive, &original);
+    fs::hard_link(&archive, &hard_link).expect("hard link");
+    symlink(&archive, &symbolic_link).expect("symbolic link");
+
+    for alias in [&hard_link, &symbolic_link] {
+        let output = run(&[
+            "--force",
+            "--output",
+            alias.to_str().expect("path"),
+            archive.to_str().expect("path"),
+        ]);
+        assert_failed(&output);
+        assert_eq!(fs::read(&archive).expect("input survives"), original);
+    }
+}
+
 #[test]
 fn an_existing_index_requires_force() {
     let directory = workspace("index-force");
@@ -249,6 +300,41 @@ fn test_count_and_line_count_are_complete_stream_actions() {
 
     let output = run(&["--count-lines", archive.to_str().expect("path")]);
     assert_ok(&output);
+    assert_eq!(stdout(&output).trim(), "300");
+}
+
+#[test]
+fn payload_and_counts_share_one_decode_without_mixing_stdout() {
+    let directory = workspace("combined-actions");
+    let plain = corpus(300);
+    let archive = directory.join("data.gz");
+    let target = directory.join("decoded.txt");
+    write(&archive, &gzip(&plain));
+
+    let output = run(&[
+        "--stdout",
+        "--count",
+        "--count-lines",
+        archive.to_str().expect("path"),
+    ]);
+    assert_ok(&output);
+    assert_eq!(output.stdout, plain);
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic
+            .lines()
+            .any(|line| line == plain.len().to_string())
+    );
+    assert!(diagnostic.lines().any(|line| line == "300"));
+
+    let output = run(&[
+        "--output",
+        target.to_str().expect("path"),
+        "--count-lines",
+        archive.to_str().expect("path"),
+    ]);
+    assert_ok(&output);
+    assert_eq!(fs::read(target).expect("decoded file"), plain);
     assert_eq!(stdout(&output).trim(), "300");
 }
 
@@ -317,6 +403,249 @@ fn indexes_round_trip_through_byte_ranges_and_full_decode() {
         assert_ok(&output);
         assert_eq!(output.stdout, plain, "full indexed decode for {format}");
     }
+}
+
+#[test]
+fn native_index_is_the_format_neutral_default() {
+    let directory = workspace("native-default");
+    let plain = corpus(20_000);
+    for (name, format, compressed) in [
+        ("zlib", "zlib", zlib(&plain)),
+        ("raw", "raw-deflate", raw_deflate(&plain)),
+    ] {
+        let archive = directory.join(format!("data.{name}"));
+        let index = directory.join(format!("data.{name}.idx"));
+        write(&archive, &compressed);
+        assert_ok(&run(&[
+            "--format",
+            format,
+            "--export-index",
+            index.to_str().expect("path"),
+            "--test",
+            archive.to_str().expect("path"),
+        ]));
+        assert!(fs::read(&index).expect("index").starts_with(b"RGZIDX01"));
+        let output = run(&[
+            "--format",
+            format,
+            "--import-index",
+            index.to_str().expect("path"),
+            "--stdout",
+            archive.to_str().expect("path"),
+        ]);
+        assert_ok(&output);
+        assert_eq!(output.stdout, plain, "format {name}");
+    }
+}
+
+#[test]
+fn failed_index_conversion_never_damages_the_destination() {
+    let directory = workspace("transactional-index");
+    let plain = corpus(1_000);
+    let archive = directory.join("data.gz");
+    let existing = directory.join("existing.gzi");
+    let absent = directory.join("absent.gzi");
+    write(&archive, &gzip(&plain));
+    write(&existing, b"preserve me");
+
+    for destination in [&existing, &absent] {
+        let output = run(&[
+            "--force",
+            "--export-index",
+            destination.to_str().expect("path"),
+            "--index-format",
+            "gzi",
+            "--test",
+            archive.to_str().expect("path"),
+        ]);
+        assert_failed(&output);
+    }
+    assert_eq!(fs::read(existing).expect("preserved"), b"preserve me");
+    assert!(!absent.exists());
+    assert!(fs::read_dir(directory).expect("directory").all(|entry| {
+        !entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .contains("rapidgzip-rust-index")
+    }));
+}
+
+#[test]
+fn imported_indexes_reject_trailing_bytes_and_ambiguous_gzi_fallback() {
+    let directory = workspace("strict-index-file");
+    let plain = corpus(2_000);
+    let archive = directory.join("data.gz");
+    let index = directory.join("data.idx");
+    write(&archive, &gzip(&plain));
+    assert_ok(&run(&[
+        "--export-index",
+        index.to_str().expect("path"),
+        "--test",
+        archive.to_str().expect("path"),
+    ]));
+
+    let mut bytes = fs::read(&index).expect("index");
+    bytes.extend_from_slice(b"trailing");
+    write(&index, &bytes);
+    let output = run(&[
+        "--import-index",
+        index.to_str().expect("path"),
+        "--test",
+        archive.to_str().expect("path"),
+    ]);
+    assert_failed(&output);
+    assert!(stderr(&output).contains("trailing bytes"));
+
+    write(&index, &[0; 8]);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&index)
+        .expect("open")
+        .write_all(b"garbage")
+        .expect("append");
+    let output = run(&[
+        "--import-index",
+        index.to_str().expect("path"),
+        "--test",
+        archive.to_str().expect("path"),
+    ]);
+    assert_failed(&output);
+    assert!(stderr(&output).contains("unrecognized index format"));
+}
+
+#[test]
+fn sparse_hostile_gzi_is_rejected_before_checkpoint_allocation() {
+    let directory = workspace("bounded-gzi");
+    let plain = corpus(10);
+    let archive = directory.join("data.gz");
+    let index = directory.join("hostile.gzi");
+    write(&archive, &gzip(&plain));
+    let count = 4_u64 * 1024 * 1024 + 1;
+    let file = fs::File::create(&index).expect("create sparse index");
+    file.set_len(8 + count * 16).expect("make sparse");
+    drop(file);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(&index)
+        .expect("open sparse");
+    file.write_all(&count.to_le_bytes()).expect("write count");
+    drop(file);
+
+    let output = run(&[
+        "--import-index",
+        index.to_str().expect("path"),
+        "--test",
+        archive.to_str().expect("path"),
+    ]);
+    assert_failed(&output);
+    assert!(stderr(&output).contains("excessive BGZF index pair count"));
+}
+
+#[test]
+fn imported_ranges_reject_ignored_decoder_options_without_verify() {
+    let directory = workspace("range-options");
+    let plain = corpus(20_000);
+    let archive = directory.join("data.gz");
+    let index = directory.join("data.idx");
+    write(&archive, &gzip(&plain));
+    assert_ok(&run(&[
+        "--export-index",
+        index.to_str().expect("path"),
+        "--test",
+        archive.to_str().expect("path"),
+    ]));
+
+    for option in [
+        &["--threads", "2"][..],
+        &["--chunk-size", "64"][..],
+        &["--expected-size", "720000"][..],
+        &["--format", "gzip"][..],
+    ] {
+        let mut arguments = option.to_vec();
+        arguments.extend([
+            "--import-index",
+            index.to_str().expect("path"),
+            "--ranges",
+            "16@32",
+            "--stdout",
+            archive.to_str().expect("path"),
+        ]);
+        let output = run(&arguments);
+        assert_failed(&output);
+        assert!(stderr(&output).contains("--verify"));
+    }
+
+    let output = run(&[
+        "--verify",
+        "--threads",
+        "2",
+        "--format",
+        "gzip",
+        "--expected-size",
+        &plain.len().to_string(),
+        "--import-index",
+        index.to_str().expect("path"),
+        "--ranges",
+        "16@32",
+        "--stdout",
+        archive.to_str().expect("path"),
+    ]);
+    assert_ok(&output);
+    assert_eq!(output.stdout, &plain[32..48]);
+}
+
+#[test]
+fn imported_range_verify_authenticates_bytes_skipped_by_random_access() {
+    let directory = workspace("range-verification");
+    let first = corpus(128 * 1024);
+    let second = corpus(128 * 1024);
+    let mut plain = first.clone();
+    plain.extend_from_slice(&second);
+    let archive = directory.join("data.gz");
+    let index = directory.join("data.idx");
+    let mut compressed = gzip(&first);
+    compressed.extend_from_slice(&gzip(&second));
+    write(&archive, &compressed);
+    assert_ok(&run(&[
+        "--export-index",
+        index.to_str().expect("path"),
+        "--test",
+        archive.to_str().expect("path"),
+    ]));
+
+    // Stored-DEFLATE bytes map directly to output. Change a byte in the first
+    // member, then seek from the authenticated second-member checkpoint. The
+    // random read can verify the second member but cannot authenticate the
+    // skipped first one without the explicit complete pass.
+    compressed[100] ^= 1;
+    write(&archive, &compressed);
+    let offset = first.len() + 32;
+    let specification = format!("32@{offset}");
+
+    let partial = run(&[
+        "--import-index",
+        index.to_str().expect("path"),
+        "--ranges",
+        &specification,
+        "--stdout",
+        archive.to_str().expect("path"),
+    ]);
+    assert_ok(&partial);
+    assert_eq!(partial.stdout, &plain[offset..offset + 32]);
+
+    let verified = run(&[
+        "--verify",
+        "--import-index",
+        index.to_str().expect("path"),
+        "--ranges",
+        &specification,
+        "--stdout",
+        archive.to_str().expect("path"),
+    ]);
+    assert_failed(&verified);
+    assert!(stderr(&verified).contains("CRC32 mismatch"));
+    assert!(verified.stdout.is_empty());
 }
 
 #[test]
@@ -498,6 +827,28 @@ fn stdin_is_decoded_sequentially() {
     let output = child.wait_with_output().expect("wait");
     assert_ok(&output);
     assert_eq!(output.stdout, plain);
+}
+
+#[test]
+fn closed_output_pipe_is_a_successful_early_consumer_exit() {
+    let directory = workspace("broken-pipe");
+    let plain = corpus(500_000);
+    let archive = directory.join("data.gz");
+    write(&archive, &gzip(&plain));
+    let mut child = Command::new(BINARY)
+        .args(["--stdout", archive.to_str().expect("path")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut pipe = child.stdout.take().expect("stdout pipe");
+    let mut byte = [0_u8; 1];
+    pipe.read_exact(&mut byte).expect("first output byte");
+    drop(pipe);
+    let output = child.wait_with_output().expect("wait");
+    assert_ok(&output);
+    assert!(output.stderr.is_empty(), "stderr: {}", stderr(&output));
 }
 
 #[test]

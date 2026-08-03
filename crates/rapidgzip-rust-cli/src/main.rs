@@ -67,11 +67,16 @@ struct Arguments {
     threads: Option<usize>,
 
     /// Write decoded bytes to standard output.
-    #[arg(short = 'c', long = "stdout", action = ArgAction::SetTrue, conflicts_with_all = ["output", "test", "count", "count_lines"])]
+    #[arg(short = 'c', long = "stdout", action = ArgAction::SetTrue, conflicts_with = "output")]
     stdout: bool,
 
     /// Write decoded bytes to this path.
-    #[arg(short = 'o', long = "output", value_name = "PATH", conflicts_with_all = ["stdout", "test", "count", "count_lines"])]
+    #[arg(
+        short = 'o',
+        long = "output",
+        value_name = "PATH",
+        conflicts_with = "stdout"
+    )]
     output: Option<PathBuf>,
 
     /// Replace an existing output file.
@@ -113,7 +118,7 @@ struct Arguments {
     import_index: Option<PathBuf>,
 
     /// Format written by --export-index.
-    #[arg(long = "index-format", value_enum, default_value_t = IndexFormat::IndexedGzip)]
+    #[arg(long = "index-format", value_enum, default_value_t = IndexFormat::Native)]
     index_format: IndexFormat,
 
     /// Input container framing.
@@ -128,7 +133,7 @@ struct Arguments {
     #[arg(long = "chunk-size", value_name = "KIB")]
     chunk_size: Option<usize>,
 
-    /// Compatibility alias; verification is already unconditional.
+    /// Require complete verification, including a full pass before imported range extraction.
     #[arg(long = "verify", action = ArgAction::SetTrue)]
     verify: bool,
 
@@ -171,11 +176,19 @@ struct Arguments {
 
 impl Arguments {
     const fn discards_output(&self) -> bool {
-        self.test || self.count || self.count_lines
+        (self.test || self.count || self.count_lines) && !self.stdout && self.output.is_none()
     }
 
     const fn builds_index(&self) -> bool {
         self.export_index.is_some() && self.import_index.is_none()
+    }
+
+    fn payload_uses_stdout(&self) -> bool {
+        self.stdout
+            || self
+                .output
+                .as_deref()
+                .is_some_and(|path| path.as_os_str() == "-")
     }
 }
 
@@ -261,12 +274,38 @@ fn validate_options(arguments: &Arguments) -> Result<(), Box<dyn std::error::Err
                 .into(),
         );
     }
+    if arguments.ranges.is_some() && arguments.import_index.is_some() && !arguments.verify {
+        if arguments.expected_size.is_some() {
+            return Err(
+                "--expected-size with imported --ranges requires --verify so the complete output is checked"
+                    .into(),
+            );
+        }
+        if arguments.threads.is_some() {
+            return Err(
+                "--decoder-parallelism does not affect imported random access; add --verify to use it for the full verification pass"
+                    .into(),
+            );
+        }
+        if arguments.chunk_size.is_some() {
+            return Err(
+                "--chunk-size does not affect imported random access; add --verify to use it for the full verification pass"
+                    .into(),
+            );
+        }
+        if arguments.format != CliFormat::Auto {
+            return Err(
+                "--format does not select imported random-access framing; add --verify to check it against the index"
+                    .into(),
+            );
+        }
+    }
 
-    // These aliases describe behavior that is already unconditional.
+    // These aliases describe behavior that is already unconditional outside
+    // the explicitly partial imported-range path handled above.
     let _ = (
         arguments.keep,
         arguments.decompress,
-        arguments.verify,
         arguments.no_sparse_windows,
     );
     Ok(())
@@ -289,6 +328,7 @@ fn run_ranges(
     };
     let archive_size = file.metadata()?.len();
 
+    let imported = arguments.import_index.is_some();
     let index = if let Some(index_path) = &arguments.import_index {
         let index = index::import(index_path, Some(archive_size))?;
         if needs_lines && index.checkpoint_at_or_before_line(0).is_none() {
@@ -305,6 +345,18 @@ fn run_ranges(
             .decode_with_index(file, &mut io::sink(), IndexOptions::default())?
             .index
     };
+
+    if imported && arguments.verify {
+        let decoder = build_decoder(arguments, needs_lines)?;
+        let report = decoder.decode_from_index(file, &mut io::sink(), &index)?;
+        if needs_lines
+            && index
+                .total_line_count()
+                .is_some_and(|expected| report.line_count != Some(expected))
+        {
+            return Err("imported index total line count disagrees with verified output".into());
+        }
+    }
 
     if let Some(export_path) = &arguments.export_index {
         index::export(&index, export_path, arguments.index_format, arguments.force)?;
@@ -377,10 +429,7 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let volume = Volume::from_flags(arguments.quiet, arguments.verbose);
 
     if let Some(export_path) = &arguments.export_index {
-        if source
-            .path()
-            .is_some_and(|path| paths_refer_to_same_file(path, export_path))
-        {
+        if source.refers_to_path(export_path) {
             return Err("the index output path refers to the compressed input".into());
         }
         if arguments
@@ -404,7 +453,13 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let imported = imported_index(&arguments, &source)?;
-    let decoder = build_decoder(&arguments, arguments.count_lines)?;
+    let authenticate_imported_lines = imported.is_some()
+        && arguments.export_index.is_some()
+        && arguments.index_format.needs_line_counts();
+    let decoder = build_decoder(
+        &arguments,
+        arguments.count_lines || authenticate_imported_lines,
+    )?;
     let mut destination = open_destination(
         &source,
         arguments.output.as_deref(),
@@ -435,11 +490,12 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("--export-index requested but no index was available")?;
         index::export(index, export_path, arguments.index_format, arguments.force)?;
     }
+    let report_to_stderr = arguments.payload_uses_stdout();
     if arguments.count {
-        report::print_count(&report)?;
+        report::print_count(&report, report_to_stderr)?;
     }
     if arguments.count_lines {
-        report::print_line_count(&report)?;
+        report::print_line_count(&report, report_to_stderr)?;
     }
     if arguments.test {
         report::print_test_result(&name, &report, volume)?;
@@ -453,16 +509,43 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
 fn main() -> ExitCode {
     match run(Arguments::parse()) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error)
-            if error
-                .downcast_ref::<io::Error>()
-                .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe) =>
-        {
-            ExitCode::SUCCESS
-        }
+        Err(error) if error_chain_has_broken_pipe(error.as_ref()) => ExitCode::SUCCESS,
         Err(error) => {
             let _ = writeln!(io::stderr(), "rapidgzip-rust: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn error_chain_has_broken_pipe(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+        {
+            return true;
+        }
+        let Some(source) = error.source() else {
+            return false;
+        };
+        error = source;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_chain_has_broken_pipe;
+    use rapidgzip_core::DecodeError;
+    use std::io;
+    use std::sync::Arc;
+
+    #[test]
+    fn broken_pipe_is_found_through_decode_error_sources() {
+        let error = DecodeError::Io {
+            offset: None,
+            source: Arc::new(io::Error::new(io::ErrorKind::BrokenPipe, "closed pipe")),
+        };
+        assert!(error_chain_has_broken_pipe(&error));
+        assert!(!error_chain_has_broken_pipe(&io::Error::other("other")));
     }
 }
