@@ -250,6 +250,27 @@ fn hard_link_and_symlink_aliases_cannot_destroy_the_input() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_hard_link_alias_cannot_destroy_the_input() {
+    let directory = workspace("windows-hard-link-alias");
+    let plain = corpus(30);
+    let archive = directory.join("data.gz");
+    let hard_link = directory.join("hard-link.gz");
+    let original = gzip(&plain);
+    write(&archive, &original);
+    fs::hard_link(&archive, &hard_link).expect("hard link");
+
+    let output = run(&[
+        "--force",
+        "--output",
+        hard_link.to_str().expect("path"),
+        archive.to_str().expect("path"),
+    ]);
+    assert_failed(&output);
+    assert_eq!(fs::read(&archive).expect("input survives"), original);
+}
+
 #[test]
 fn an_existing_index_requires_force() {
     let directory = workspace("index-force");

@@ -11,6 +11,7 @@ pub const DEPENDENCY_NAMES: &[&str] = &[
     "anstyle",
     "anstyle-parse",
     "anstyle-query",
+    "anstyle-wincon",
     "clap",
     "clap_builder",
     "clap_derive",
@@ -22,13 +23,18 @@ pub const DEPENDENCY_NAMES: &[&str] = &[
     "heck",
     "is_terminal_polyfill",
     "libz-rs-sys",
+    "once_cell_polyfill",
     "proc-macro2",
     "quote",
     "rapidgzip-core",
+    "same-file",
     "strsim",
     "syn",
     "unicode-ident",
     "utf8parse",
+    "winapi-util",
+    "windows-link",
+    "windows-sys",
     "zlib-rs",
 ];
 
@@ -58,9 +64,25 @@ anstream, anstyle, anstyle-parse, anstyle-query, and colorchoice
     MIT OR Apache-2.0
     https://github.com/rust-cli/anstyle
 
+anstyle-wincon
+    MIT OR Apache-2.0
+    https://github.com/rust-cli/anstyle
+
 is_terminal_polyfill
     MIT OR Apache-2.0
     https://github.com/polyfill-rs/is_terminal_polyfill
+
+once_cell_polyfill
+    MIT OR Apache-2.0
+    https://github.com/polyfill-rs/once_cell_polyfill
+
+same-file and winapi-util
+    Unlicense OR MIT
+    https://github.com/BurntSushi/same-file
+
+windows-link and windows-sys
+    MIT OR Apache-2.0
+    https://github.com/microsoft/windows-rs
 
 utf8parse
     Apache-2.0 OR MIT
@@ -136,9 +158,27 @@ third_party_libraries:
   - name: colorchoice
     license: MIT OR Apache-2.0
     url: https://github.com/rust-cli/anstyle
+  - name: anstyle-wincon
+    license: MIT OR Apache-2.0
+    url: https://github.com/rust-cli/anstyle
   - name: is_terminal_polyfill
     license: MIT OR Apache-2.0
     url: https://github.com/polyfill-rs/is_terminal_polyfill
+  - name: once_cell_polyfill
+    license: MIT OR Apache-2.0
+    url: https://github.com/polyfill-rs/once_cell_polyfill
+  - name: same-file
+    license: Unlicense OR MIT
+    url: https://github.com/BurntSushi/same-file
+  - name: winapi-util
+    license: Unlicense OR MIT
+    url: https://github.com/BurntSushi/winapi-util
+  - name: windows-link
+    license: MIT OR Apache-2.0
+    url: https://github.com/microsoft/windows-rs
+  - name: windows-sys
+    license: MIT OR Apache-2.0
+    url: https://github.com/microsoft/windows-rs
   - name: utf8parse
     license: Apache-2.0 OR MIT
     url: https://github.com/alacritty/vte

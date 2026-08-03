@@ -143,6 +143,9 @@ pub fn open_destination(
 }
 
 /// Returns whether two paths name the same existing file or exact pathname.
+///
+/// Existing files are compared by stable file identity on Unix and Windows so
+/// hard-link aliases cannot evade the CLI's input-preservation checks.
 pub fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
@@ -164,15 +167,32 @@ pub fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
             return left.dev() == right.dev() && left.ino() == right.ino();
         }
     }
+    #[cfg(windows)]
+    if same_file::is_same_file(left, right).unwrap_or(false) {
+        return true;
+    }
     false
 }
 
 fn file_and_path_refer_to_same_file(file: &File, path: &Path) -> bool {
+    // Compare the already-open input handle with the candidate path. This
+    // closes the path-replacement window between opening the input and opening
+    // a forced output. `same-file` supplies the safe Windows handle identity
+    // implementation; Unix exposes the identity through `MetadataExt`.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if let Some((left, right)) = file.metadata().ok().zip(std::fs::metadata(path).ok()) {
             return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(file) = file.try_clone() {
+        if let (Ok(left), Ok(right)) = (
+            same_file::Handle::from_file(file),
+            same_file::Handle::from_path(path),
+        ) {
+            return left == right;
         }
     }
     let _ = (file, path);

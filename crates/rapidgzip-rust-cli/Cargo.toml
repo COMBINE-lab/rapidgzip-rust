@@ -19,5 +19,8 @@ path = "src/main.rs"
 clap.workspace = true
 rapidgzip-core.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+same-file.workspace = true
+
 [lints]
 workspace = true

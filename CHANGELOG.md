@@ -18,6 +18,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   write failures. Normal decode output treats an early closed pipe as a
   successful consumer exit through wrapped decoder errors as well as direct
   I/O errors.
+- Output collision checks now compare the already-open input file with the
+  destination by file identity on Unix and Windows, preventing hard-link and
+  symlink aliases from truncating a forced input.
 
 ### Changed
 

@@ -23,6 +23,7 @@ libz-rs-sys = "0.6.6"
 paraseq = { version = "0.4.14", default-features = false }
 proptest = "1.11.0"
 rapidgzip-core = { path = "crates/rapidgzip-core", version = "0.1.0" }
+same-file = "1.0.6"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
