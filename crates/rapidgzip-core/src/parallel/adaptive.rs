@@ -6,7 +6,10 @@
 //! budget-derived range. Measurements happen before ordered output handoff, so
 //! a slow `Read` consumer does not masquerade as a slow decoder.
 
-use std::time::Instant;
+use crate::runtime::RuntimeState;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const RATE_TOLERANCE: f64 = 0.03;
 const SAMPLES_PER_CANDIDATE: usize = 5;
@@ -261,6 +264,113 @@ impl AdaptiveConcurrency {
         self.interval_started = None;
         self.sample_rates = [0.0; SAMPLES_PER_CANDIDATE];
         self.sample_count = 0;
+    }
+}
+
+/// Admission control shared by parallel decode paths.
+///
+/// Worker ranks are created lazily as upward probes request them and retire
+/// after a persistent downward decision. Candidate measurements count native
+/// completions before ordered output handoff. Stable operation costs one
+/// atomic rank check per task without touching the controller mutex.
+pub(crate) struct AdaptiveWorkers {
+    controller: Mutex<AdaptiveConcurrency>,
+    generation: AtomicUsize,
+    calibrating: AtomicBool,
+    worker_pool_limit: usize,
+    observed_limit_epoch: AtomicUsize,
+    pub(crate) runtime: Arc<RuntimeState>,
+}
+
+impl AdaptiveWorkers {
+    pub(crate) fn new(
+        maximum: usize,
+        machine_parallelism: usize,
+        sample_bytes: usize,
+        work_items: usize,
+        runtime: Arc<RuntimeState>,
+    ) -> Self {
+        let controller =
+            AdaptiveConcurrency::new(maximum, machine_parallelism, sample_bytes, work_items);
+        let current_limit = controller.current_limit();
+        let generation = controller.generation();
+        let calibrating = !controller.is_stable();
+        let worker_pool_limit = controller.worker_pool_limit();
+        runtime.set_adaptive_target(current_limit);
+        runtime.set_best_workers(controller.best_limit());
+        Self {
+            controller: Mutex::new(controller),
+            generation: AtomicUsize::new(generation),
+            calibrating: AtomicBool::new(calibrating),
+            worker_pool_limit,
+            observed_limit_epoch: AtomicUsize::new(runtime.limit_epoch()),
+            runtime,
+        }
+    }
+
+    pub(crate) fn current_limit(&self) -> usize {
+        self.runtime.effective_worker_limit()
+    }
+
+    pub(crate) fn worker_enabled(&self, worker_index: usize) -> bool {
+        worker_index < self.current_limit()
+    }
+
+    pub(crate) const fn worker_pool_limit(&self) -> usize {
+        self.worker_pool_limit
+    }
+
+    pub(crate) fn wait_until_enabled_or_retire(
+        &self,
+        worker_index: usize,
+        stopped: &AtomicBool,
+    ) -> bool {
+        const RETIRE_AFTER: Duration = Duration::from_millis(250);
+        self.runtime.wait_for_limit_change(RETIRE_AFTER);
+        !stopped.load(Ordering::Relaxed) && self.worker_enabled(worker_index)
+    }
+
+    pub(crate) fn start_work(&self) -> Option<usize> {
+        if !self.calibrating.load(Ordering::Acquire) {
+            return None;
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        let limit_epoch = self.runtime.limit_epoch();
+        let mut controller = self
+            .controller
+            .lock()
+            .expect("adaptive worker mutex poisoned");
+        if self
+            .observed_limit_epoch
+            .swap(limit_epoch, Ordering::AcqRel)
+            != limit_epoch
+            || self.current_limit() != controller.current_limit()
+        {
+            controller.pause_observation();
+            return None;
+        }
+        controller.start_work(generation, Instant::now());
+        Some(generation)
+    }
+
+    pub(crate) fn observe_work(&self, generation: Option<usize>, decoded_bytes: usize) -> bool {
+        let Some(generation) = generation else {
+            return false;
+        };
+        let mut controller = self
+            .controller
+            .lock()
+            .expect("adaptive worker mutex poisoned");
+        let changed = controller.observe_work(generation, decoded_bytes, Instant::now());
+        if changed {
+            self.generation
+                .store(controller.generation(), Ordering::Release);
+            self.calibrating
+                .store(!controller.is_stable(), Ordering::Release);
+            self.runtime.set_adaptive_target(controller.current_limit());
+            self.runtime.set_best_workers(controller.best_limit());
+        }
+        changed
     }
 }
 

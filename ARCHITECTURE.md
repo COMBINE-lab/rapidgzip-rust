@@ -5,7 +5,7 @@
 `rapidgzip-core` accepts an immutable positional `ReadAt` source. A decode
 snapshots its length, resolves explicit or automatic container selection,
 parses gzip or zlib framing itself, and routes the raw DEFLATE payload through
-one of five bounded paths:
+one of six bounded paths:
 
 1. Standard zlib-rs raw inflate is the authoritative fallback and the
    single-thread path.
@@ -18,6 +18,8 @@ one of five bounded paths:
 5. Other sufficiently large gzip, zlib, and raw-DEFLATE streams use a
    bounded empirical admission screen, then either authoritative zlib-rs or a
    file-wide estimated grid and rapidgzip's marker/window path.
+6. A caller-supplied validated index partitions a full gzip, BGZF, zlib, or
+   raw-DEFLATE decode into exact independently resumable spans.
 
 Positional paths return ordered owned chunks to one coordinator. The
 coordinator updates member accounting and calls the user's `Write`, so a writer
@@ -28,7 +30,7 @@ sequential core as a resumable state machine, described below.
 ## Non-seekable input
 
 `rapidgzip-core` also accepts a plain `std::io::Read`. Such a source cannot be
-pre-indexed, probed, or revisited, so paths 2 through 5 are all unreachable:
+pre-indexed, probed, or revisited, so paths 2 through 6 are all unreachable:
 each one begins by reading headers or block boundaries scattered across the
 file before it decodes anything. Path 1 is reachable, because it only ever
 moves forward. An explicit indexing operation can nevertheless record member
@@ -102,6 +104,20 @@ CRC32/ISIZE or zlib Adler-32 when it resumes at a framing start; an interior
 index cannot authenticate the skipped prefix. Raw DEFLATE has no checksum.
 Index parsers have explicit count and aggregate-window limits, and source-size
 metadata is checked before indexed reads begin.
+
+An existing index can separately drive complete parallel decoding through
+`decode_from_index` or `reader_from_index`. Preflight validates source size,
+container provenance, origin, actual framing, and final-size metadata before
+workers exist. Every checkpoint, including equal-output empty-member points,
+becomes one ordered span. A worker installs its exact predecessor window and
+must reach the next compressed bit and decompressed byte offsets. It accumulates
+small internal `Z_BLOCK` results into ordinary decoded chunks; checkpoint
+spacing therefore controls task size without turning every DEFLATE block into
+an ordered handoff. One-slot span channels and the normal adaptive admission
+target bound reordering. The coordinator combines CRC32 or Adler-32 fragments
+across interior checkpoints, validates every trailer, and reports
+`DecoderPath::IndexedParallel`. The complete design is recorded in
+`docs/design/indexed-parallel-decode.md`.
 
 ## Marker/window algorithm
 

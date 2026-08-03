@@ -9,7 +9,7 @@ use crate::index::{
 };
 use crate::inflate::RawInflater;
 use crate::parallel::Window;
-use crate::parallel::adaptive::AdaptiveConcurrency;
+use crate::parallel::adaptive::AdaptiveWorkers;
 use crate::parallel::admission::{
     WorkSample, effective_parallelism, screen_admits_marker, should_probe,
 };
@@ -857,6 +857,23 @@ struct SequentialStream {
     inflater: RawInflater,
     checksum: StreamChecksum,
     output_size: u32,
+    index_history: Option<Vec<u8>>,
+}
+
+fn update_index_history(history: &mut Vec<u8>, decoded: &[u8]) {
+    if decoded.len() >= WINDOW_SIZE {
+        history.clear();
+        history.extend_from_slice(&decoded[decoded.len() - WINDOW_SIZE..]);
+        return;
+    }
+    let overflow = history
+        .len()
+        .saturating_add(decoded.len())
+        .saturating_sub(WINDOW_SIZE);
+    if overflow != 0 {
+        history.drain(..overflow);
+    }
+    history.extend_from_slice(decoded);
 }
 
 enum SequentialState {
@@ -1007,6 +1024,7 @@ impl<C: InputCursor> SequentialDecoder<C> {
                         inflater: RawInflater::new()?,
                         checksum: StreamChecksum::Crc32(Crc32::new()),
                         output_size: 0,
+                        index_history: self.collector.as_ref().map(|_| Vec::new()),
                     });
                 }
                 SequentialState::ZlibHeader => {
@@ -1029,6 +1047,7 @@ impl<C: InputCursor> SequentialDecoder<C> {
                         inflater: RawInflater::new_with_window_bits(window_bits)?,
                         checksum: StreamChecksum::Adler32(Adler32::new()),
                         output_size: 0,
+                        index_history: self.collector.as_ref().map(|_| Vec::new()),
                     });
                 }
                 SequentialState::RawDeflateStart => {
@@ -1049,6 +1068,7 @@ impl<C: InputCursor> SequentialDecoder<C> {
                         inflater: RawInflater::new()?,
                         checksum: StreamChecksum::None,
                         output_size: 0,
+                        index_history: self.collector.as_ref().map(|_| Vec::new()),
                     });
                 }
                 SequentialState::Inflating(mut stream) => {
@@ -1079,7 +1099,16 @@ impl<C: InputCursor> SequentialDecoder<C> {
                     // - `next_in/avail_in` describe the cursor's stable current window.
                     // - `next_out/avail_out` describe the uniquely owned spare
                     //   capacity of `decoded`; the returned count is checked below.
-                    let status = unsafe { z::inflate(&mut stream.inflater.stream, z::Z_NO_FLUSH) };
+                    let status = unsafe {
+                        z::inflate(
+                            &mut stream.inflater.stream,
+                            if self.collector.is_some() {
+                                z::Z_BLOCK
+                            } else {
+                                z::Z_NO_FLUSH
+                            },
+                        )
+                    };
 
                     let consumed = usize::try_from(input_before - stream.inflater.stream.avail_in)
                         .expect("zlib uInt fits usize");
@@ -1103,10 +1132,45 @@ impl<C: InputCursor> SequentialDecoder<C> {
                             .checked_output_total(self.total_output, decoded.len())?;
                         stream.output_size = stream.output_size.wrapping_add(decoded.len() as u32);
                         stream.checksum.update(&decoded);
+                        if let Some(history) = stream.index_history.as_mut() {
+                            update_index_history(history, &decoded);
+                        }
                     }
 
+                    if status != z::Z_STREAM_END
+                        && stream.inflater.stream.data_type & 0x80 != 0
+                        && stream.inflater.stream.data_type & 0x40 == 0
+                    {
+                        if let (Some(collector), Some(history)) =
+                            (&self.collector, stream.index_history.as_ref())
+                        {
+                            if history.len() == WINDOW_SIZE {
+                                let unused_bits =
+                                    u64::try_from(stream.inflater.stream.data_type & 0x3f)
+                                        .expect("the low six data_type bits are non-negative");
+                                let boundary = self
+                                    .cursor
+                                    .position()
+                                    .saturating_mul(8)
+                                    .saturating_sub(unused_bits);
+                                collector.offer(
+                                    Checkpoint {
+                                        compressed_offset_in_bits: boundary,
+                                        uncompressed_offset_in_bytes: self.total_output,
+                                        kind: CheckpointKind::DeflateBlock,
+                                        line_offset: None,
+                                    },
+                                    history,
+                                );
+                            }
+                        }
+                    }
+
+                    let reached_stream_end = status == z::Z_STREAM_END
+                        || (self.collector.is_some()
+                            && stream.inflater.stream.data_type & 0xc0 == 0xc0);
                     let transition = match status {
-                        z::Z_STREAM_END => Ok(SequentialState::FinishStream {
+                        _ if reached_stream_end => Ok(SequentialState::FinishStream {
                             checksum: stream.checksum,
                             output_size: stream.output_size,
                         }),
@@ -2671,109 +2735,6 @@ struct ResolveTask {
 struct ResolveResult {
     sequence: usize,
     result: Result<ResolvedParts, crate::parallel::MarkerError>,
-}
-
-/// Admission control shared by parallel decode paths.
-///
-/// Worker ranks are created lazily as upward probes request them and retire
-/// after a persistent downward decision. Candidate measurements count native
-/// completions before ordered output handoff. Stable operation costs one atomic
-/// rank check per task without touching the controller mutex.
-struct AdaptiveWorkers {
-    controller: Mutex<AdaptiveConcurrency>,
-    generation: AtomicUsize,
-    calibrating: AtomicBool,
-    worker_pool_limit: usize,
-    observed_limit_epoch: AtomicUsize,
-    runtime: Arc<RuntimeState>,
-}
-
-impl AdaptiveWorkers {
-    fn new(
-        maximum: usize,
-        machine_parallelism: usize,
-        sample_bytes: usize,
-        work_items: usize,
-        runtime: Arc<RuntimeState>,
-    ) -> Self {
-        let controller =
-            AdaptiveConcurrency::new(maximum, machine_parallelism, sample_bytes, work_items);
-        let current_limit = controller.current_limit();
-        let generation = controller.generation();
-        let calibrating = !controller.is_stable();
-        let worker_pool_limit = controller.worker_pool_limit();
-        runtime.set_adaptive_target(current_limit);
-        runtime.set_best_workers(controller.best_limit());
-        Self {
-            controller: Mutex::new(controller),
-            generation: AtomicUsize::new(generation),
-            calibrating: AtomicBool::new(calibrating),
-            worker_pool_limit,
-            observed_limit_epoch: AtomicUsize::new(runtime.limit_epoch()),
-            runtime,
-        }
-    }
-
-    fn current_limit(&self) -> usize {
-        self.runtime.effective_worker_limit()
-    }
-
-    fn worker_enabled(&self, worker_index: usize) -> bool {
-        worker_index < self.current_limit()
-    }
-
-    const fn worker_pool_limit(&self) -> usize {
-        self.worker_pool_limit
-    }
-
-    fn wait_until_enabled_or_retire(&self, worker_index: usize, stopped: &AtomicBool) -> bool {
-        const RETIRE_AFTER: Duration = Duration::from_millis(250);
-        self.runtime.wait_for_limit_change(RETIRE_AFTER);
-        !stopped.load(Ordering::Relaxed) && self.worker_enabled(worker_index)
-    }
-
-    fn start_work(&self) -> Option<usize> {
-        if !self.calibrating.load(Ordering::Acquire) {
-            return None;
-        }
-        let generation = self.generation.load(Ordering::Acquire);
-        let limit_epoch = self.runtime.limit_epoch();
-        let mut controller = self
-            .controller
-            .lock()
-            .expect("adaptive worker mutex poisoned");
-        if self
-            .observed_limit_epoch
-            .swap(limit_epoch, Ordering::AcqRel)
-            != limit_epoch
-            || self.current_limit() != controller.current_limit()
-        {
-            controller.pause_observation();
-            return None;
-        }
-        controller.start_work(generation, Instant::now());
-        Some(generation)
-    }
-
-    fn observe_work(&self, generation: Option<usize>, decoded_bytes: usize) -> bool {
-        let Some(generation) = generation else {
-            return false;
-        };
-        let mut controller = self
-            .controller
-            .lock()
-            .expect("adaptive worker mutex poisoned");
-        let changed = controller.observe_work(generation, decoded_bytes, Instant::now());
-        if changed {
-            self.generation
-                .store(controller.generation(), Ordering::Release);
-            self.calibrating
-                .store(!controller.is_stable(), Ordering::Release);
-            self.runtime.set_adaptive_target(controller.current_limit());
-            self.runtime.set_best_workers(controller.best_limit());
-        }
-        changed
-    }
 }
 
 fn send_native_result(

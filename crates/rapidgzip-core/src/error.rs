@@ -1,4 +1,4 @@
-use crate::{DeflateIndex, Format, IndexError};
+use crate::{DeflateIndex, Format, IndexError, IndexKind};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -200,6 +200,22 @@ pub enum DecodeError {
         /// Observed total, or the total that the next handoff would produce.
         actual: u64,
     },
+    /// Inflation did not reach an index checkpoint at its declared bit offset.
+    IndexBoundaryMismatch {
+        /// Compressed bit offset declared by the index.
+        expected_bit_offset: u64,
+        /// Compressed bit offset reached by the inflater.
+        actual_bit_offset: u64,
+    },
+    /// A checkpoint's decompressed offset disagreed with decoded output.
+    IndexOutputMismatch {
+        /// Compressed checkpoint whose output offset was checked.
+        checkpoint_bit_offset: u64,
+        /// Decompressed bytes declared between the surrounding checkpoints.
+        expected_bytes: u64,
+        /// Decompressed bytes actually produced for that span.
+        actual_bytes: u64,
+    },
     /// A decoder worker panicked.
     WorkerPanicked,
     /// Decoding was cancelled because the consumer stopped.
@@ -242,7 +258,9 @@ impl DecodeError {
             | Self::InvalidDeflate { .. }
             | Self::ChecksumMismatch { .. }
             | Self::SizeMismatch { .. }
-            | Self::UnexpectedOutputSize { .. } => io::ErrorKind::InvalidData,
+            | Self::UnexpectedOutputSize { .. }
+            | Self::IndexBoundaryMismatch { .. }
+            | Self::IndexOutputMismatch { .. } => io::ErrorKind::InvalidData,
             Self::OutputLimitExceeded { .. } => io::ErrorKind::FileTooLarge,
             Self::WorkerPanicked => io::ErrorKind::Other,
             Self::Cancelled => io::ErrorKind::Interrupted,
@@ -305,6 +323,21 @@ impl Display for DecodeError {
             Self::UnexpectedOutputSize { expected, actual } => write!(
                 formatter,
                 "decoded output size mismatch: expected {expected} bytes, got {actual}"
+            ),
+            Self::IndexBoundaryMismatch {
+                expected_bit_offset,
+                actual_bit_offset,
+            } => write!(
+                formatter,
+                "index checkpoint at bit {expected_bit_offset} did not match the inflater boundary at bit {actual_bit_offset}"
+            ),
+            Self::IndexOutputMismatch {
+                checkpoint_bit_offset,
+                expected_bytes,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "index span ending at bit {checkpoint_bit_offset} declared {expected_bytes} output bytes but produced {actual_bytes}"
             ),
             Self::WorkerPanicked => formatter.write_str("a decoder worker panicked"),
             Self::Cancelled => formatter.write_str("decoding was cancelled"),
@@ -388,6 +421,63 @@ pub enum IndexingError {
     Decode(DecodeError),
     /// The index could not be constructed or finalized.
     Index(IndexError),
+}
+
+/// Failure while decoding through a caller-supplied index.
+///
+/// Index-driven decoding is strict: an invalid, incomplete, or source-mismatched
+/// index is reported rather than silently falling back to an unindexed path.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum IndexDecodeError {
+    /// The compressed input could not be decoded and verified.
+    Decode(DecodeError),
+    /// The supplied index was invalid or did not describe the source.
+    Index(IndexError),
+    /// The decoder's selected container disagreed with the index provenance.
+    FormatMismatch {
+        /// Container selected on the decoder builder.
+        selected: Format,
+        /// Container provenance recorded by the index.
+        indexed: IndexKind,
+    },
+}
+
+impl From<DecodeError> for IndexDecodeError {
+    fn from(error: DecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+impl From<IndexError> for IndexDecodeError {
+    fn from(error: IndexError) -> Self {
+        Self::Index(error)
+    }
+}
+
+impl Display for IndexDecodeError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decode(error) => Display::fmt(error, formatter),
+            Self::Index(error) => {
+                write!(formatter, "index-driven decode rejected the index: {error}")
+            }
+            Self::FormatMismatch { selected, indexed } => write!(
+                formatter,
+                "decoder selected {selected}, but the index describes {indexed:?} data"
+            ),
+        }
+    }
+}
+
+impl Error for IndexDecodeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Decode(error) => Some(error),
+            Self::Index(error) => Some(error),
+            Self::FormatMismatch { .. } => None,
+        }
+    }
 }
 
 impl IndexingError {

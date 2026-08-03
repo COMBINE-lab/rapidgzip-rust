@@ -1,6 +1,7 @@
 # Random-access DEFLATE indexing and seeking
 
-Status: implemented by PR #8 and generalized by PR #9
+Status: implemented by PR #8, generalized by PR #9, and extended with
+parallel full-stream reuse by the clean successor to PR #14
 
 Scope: gzip, BGZF, zlib, and raw-DEFLATE decoding and seeking
 
@@ -25,8 +26,9 @@ Companion: `multi-format-decode.md`
 ## Non-goals
 
 - Encoding or modifying gzip data.
-- Parallel decoding *from* an existing index. `IndexedReader` is deliberately
-  single-threaded; parallel indexed range decoding is separate work.
+- Parallel indexed range reads. `IndexedReader` is deliberately single-threaded;
+  the separate `decode_from_index` and `reader_from_index` APIs use an existing
+  index to decode the complete stream in parallel.
 - Authenticating output resumed inside a member when the imported format does
   not contain the checksum state of the skipped prefix.
 - Treating line counters as present when they were not supplied by an imported
@@ -256,6 +258,17 @@ Integrity depends on the resume point:
 
 The native format reserves room for future prefix-checksum state, but that is
 not required for version 1 interoperability.
+
+## Parallel full-stream reuse
+
+`Decoder::decode_from_index` and `Decoder::reader_from_index` use every
+checkpoint as an exact parallel span boundary while still processing the
+complete stream from source origin. Each span must reach both the next recorded
+compressed bit offset and decompressed byte offset. Ordered checksum fragments
+therefore preserve full gzip/zlib authentication even when a span begins
+inside one framing unit. Multi-member spans, empty members, and BGZF `.gzi`
+indexes are supported. See `indexed-parallel-decode.md` for the execution,
+resource, telemetry, and error model.
 
 ## Native format version 1
 

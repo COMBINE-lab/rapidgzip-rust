@@ -20,6 +20,17 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Strict parallel full-stream reuse of caller-supplied `DeflateIndex` values
+  through `Decoder::decode_from_index` and `Decoder::reader_from_index`. Every
+  span must match its next compressed-bit and decompressed-byte checkpoint;
+  invalid indexes never fall back. The path supports gzip, concatenated and
+  empty gzip members, BGZF `.gzi` without a known final output size, zlib, and
+  raw DEFLATE while preserving complete trailer verification, bounded ordered
+  output, adaptive workers, runtime ceilings, `Read + Send`, and telemetry via
+  `DecoderPath::IndexedParallel`.
+- Deterministic interior block checkpoints from one-worker indexed decoding,
+  making an index built by the authoritative sequential zlib-rs path reusable
+  for later parallel decoding of single-stream gzip, zlib, and raw DEFLATE.
 - Explicit zlib and raw-DEFLATE decoding through every push and pull API, plus
   opt-in gzip/zlib auto-detection that never guesses raw input. Large positional
   streams share the adaptive rapidgzip marker/window path; non-seekable streams

@@ -47,6 +47,16 @@ exactly the initialized byte count reported by zlib-rs, verifies that the
 stream reached `Z_STREAM_END`, and authenticates CRC32 and ISIZE before the
 coordinator can emit the buffer.
 
+The existing-index parallel path reuses the same `RawInflater` and calls
+`inflate` directly only to request `Z_BLOCK` boundary reporting. Its positional
+cursor page cannot refill or move while the call is active. The output pointer
+covers the spare capacity between the vector's current length and the
+configured chunk bound, and `avail_out` advertises exactly that smaller count.
+After clearing all backend pointers, the path advances the vector length by
+only the reported produced count. Multiple internal blocks may append to one
+allocation, but the capacity proof is repeated before every call. The worker
+owns the inflater, cursor, and vector exclusively for its lifetime.
+
 ## Resumable decoder `Send`
 
 `SequentialDecoder<C>` has a private `unsafe impl<C: Send> Send`. Its zlib-rs

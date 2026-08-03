@@ -102,6 +102,14 @@
 //! supported container; GZIDX, htslib BGZF `.gzi`, and gztool are gzip-family
 //! formats and reject incompatible export.
 //!
+//! [`Decoder::decode_from_index`] and [`Decoder::reader_from_index`] reuse an
+//! existing index for strict parallel full-stream decoding. Every worker must
+//! reach the next checkpoint's exact compressed bit and decompressed byte
+//! offsets; invalid or source-mismatched indexes never trigger an ordinary
+//! fallback. The reader remains [`std::io::Read`] + [`Send`] and exposes the
+//! usual runtime worker controls. Concatenated and empty gzip members and BGZF
+//! `.gzi` indexes are supported without weakening whole-stream verification.
+//!
 //! [`IndexedReader`] implements [`std::io::Read`] + [`std::io::Seek`] over a
 //! stable [`ReadAt`] source. Framing-start checkpoints permit complete gzip or
 //! zlib verification; an interior checkpoint cannot authenticate bytes skipped
@@ -117,6 +125,7 @@ mod error;
 mod format;
 mod gzip;
 mod indexed;
+mod indexed_parallel;
 mod inflate;
 mod read_at;
 mod reader;
@@ -128,8 +137,8 @@ pub mod parallel;
 
 pub use config::{ConfigError, Decoder, DecoderBuilder};
 pub use error::{
-    DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, IndexedDecodeReport, IndexingError,
-    ZlibErrorKind,
+    DecodeError, DecodeReport, DeflateErrorKind, GzipErrorKind, IndexDecodeError,
+    IndexedDecodeReport, IndexingError, ZlibErrorKind,
 };
 pub use format::Format;
 pub use index::{
