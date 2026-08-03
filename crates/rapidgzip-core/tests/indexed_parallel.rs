@@ -460,10 +460,14 @@ fn full_flush_index(plain: &[u8], format: Format, pieces: usize) -> (Arc<[u8]>, 
         assert_eq!(status, if last { z::Z_STREAM_END } else { z::Z_OK });
         uncompressed += piece.len();
         if !last {
+            // `total_out` is `c_ulong`: 32 bits on Windows and 64 bits on the
+            // primary Unix targets. Normalize the test's public bit offset.
+            #[allow(clippy::unnecessary_cast)]
+            let compressed_offset_in_bytes = stream.total_out as u64;
             index
                 .push(
                     Checkpoint {
-                        compressed_offset_in_bits: stream.total_out.saturating_mul(8),
+                        compressed_offset_in_bits: compressed_offset_in_bytes.saturating_mul(8),
                         uncompressed_offset_in_bytes: uncompressed as u64,
                         kind: CheckpointKind::DeflateBlock,
                         line_offset: None,
