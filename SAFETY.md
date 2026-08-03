@@ -9,6 +9,20 @@ The crate denies unsafe operations inside unsafe functions:
 There is no unsafe public API. One private manual `Send` implementation, for the
 resumable sequential decoder, is justified below; there is no manual `Sync`.
 
+## Structural analysis
+
+Structural analysis adds no unsafe code. Its cursor fills a safe integer bit
+buffer through the existing bounded `InputCursor` interface, and its output
+history is a fixed 32 KiB array indexed only after validating every DEFLATE
+distance against both the declared zlib window and the bytes actually
+available. Result vectors use checked retention limits and fallible reserve.
+
+The analyzer shares generic Huffman construction and lookup with the native
+speculative decoder. Monomorphization preserves the latter's existing audited
+`word_at` implementation; analysis itself never invokes an unaligned pointer
+load. The unsafe argument for production native bit loads remains the one under
+“Native DEFLATE bit loads” below and is not broadened by the shared trait.
+
 ## zlib-rs ABI adapter
 
 `inflate.rs` contains a private RAII wrapper around `libz-rs-sys`.
