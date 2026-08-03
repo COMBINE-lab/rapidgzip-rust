@@ -323,7 +323,10 @@ Format parsers apply explicit checkpoint and window-allocation limits through
 `IndexReadOptions`. The native format represents every container. `.gzi`
 export requires an index proven to come from BGZF; GZIDX and gztool export
 require gzip-family provenance; gztool line-aware export requires real line
-counters and never invents them.
+counters and never invents them. The CLI detects formats from a bounded prefix,
+streams index parsing, rejects trailing bytes, and writes exports through a
+same-directory temporary file so failed conversions cannot truncate an
+existing index.
 
 Line metadata is collected only when requested. Enabling
 [`DecoderBuilder::count_lines`] adds `DecodeReport::line_count`; combining it
@@ -361,7 +364,10 @@ nearest checkpoint. Counting happens once on final ordered bytes, after marker
 resolution, and is disabled by default. `DecodeReport` remains `Copy` because
 the result is an optional scalar. A line-aware index is published only when
 every retained checkpoint received an exact count; partial metadata is never
-presented as complete.
+presented as complete. Strict full-stream decoding with line counting enabled
+also recomputes imported per-checkpoint and total line counts, rejecting
+structurally valid but incorrect navigation metadata. Without line counting,
+imported line offsets remain explicitly trusted navigation data.
 
 `IndexedReader` validates the index and any recorded source size before use.
 Resuming at a gzip member or zlib-header checkpoint verifies that complete
@@ -390,6 +396,9 @@ rapidgzip-rust -P 16 --test reads.fastq.gz
 rapidgzip-rust --count reads.fastq.gz
 rapidgzip-rust --count-lines reads.fastq.gz
 
+# Decode and count in one pass. Counts use stderr when payload uses stdout.
+rapidgzip-rust -c --count --count-lines reads.fastq.gz > reads.fastq
+
 # Build a native index, then use it for strict full-stream parallel decoding.
 rapidgzip-rust --test --export-index reads.rgzidx \
   --index-format native reads.fastq.gz
@@ -397,6 +406,10 @@ rapidgzip-rust --import-index reads.rgzidx -c reads.fastq.gz > reads.fastq
 
 # Extract byte and zero-based line ranges in the requested order.
 rapidgzip-rust --ranges '1KiB@4MiB,10L@1000L' -c reads.fastq.gz
+
+# Authenticate the complete source before an imported random-access read.
+rapidgzip-rust --import-index reads.rgzidx --verify \
+  --ranges '10L@1000L' -c reads.fastq.gz
 
 # Export gztool version 1 with real line counters.
 rapidgzip-rust --count-lines --export-index reads.gzi \
@@ -415,7 +428,10 @@ rapidgzip-rust <(some_producer) > reads.fastq
 The CLI auto-detects gzip or zlib by default; raw DEFLATE requires
 `--format raw-deflate`. `--chunk-size` controls the decoded handoff size in
 KiB. Output defaults to stdout when redirected; at a terminal, a regular input
-derives a safe output filename. Existing files require `--force`.
+derives a safe output filename using case-insensitive compression suffixes.
+Existing files require `--force`. Index export defaults to the native,
+format-neutral representation; gzip-specific interoperable formats must be
+selected explicitly.
 
 `-P`/`--decoder-parallelism` (`--threads` is an alias) is a maximum
 decoder-worker budget. Parallel paths bootstrap
@@ -428,12 +444,16 @@ Imported indexes are never advisory. Full-stream operations use
 `decode_from_index`, and malformed, incomplete, or source-mismatched indexes
 fail without falling back. Range extraction uses `IndexedReader`; a line range
 requires complete line metadata in an imported index or builds a line-aware
-index first. `--no-verify`, `--sparse-windows`, and the `sequential` and
+index first. A seek from an interior DEFLATE checkpoint cannot authenticate
+the skipped prefix. For that reason, `--verify` on an imported range performs
+a complete strict indexed decode before extraction. Decoder options that would
+otherwise be ignored by an unverified imported range are rejected and explain
+that `--verify` is required. `--no-verify`, `--sparse-windows`, and the `sequential` and
 `locked-read` I/O methods are rejected because the current implementation
-cannot honor their semantics. `--verify`, `--no-sparse-windows`, `-d`, and `-k`
-are accepted compatibility aliases for behavior already in effect. This is a
-deliberately compatible subset, not a claim that every rapidgzip CLI option is
-implemented.
+cannot honor their semantics. Outside imported ranges, complete decode paths
+already verify their selected framing. `--no-sparse-windows`, `-d`, and `-k`
+remain compatibility aliases. This is a deliberately compatible subset, not a
+claim that every rapidgzip CLI option is implemented.
 
 ## Correctness and resource behavior
 

@@ -96,7 +96,9 @@ are guarded by `offset + width <= bytes.len()`, and comparison masks are only
 counted, never used for memory access. On AArch64, Advanced SIMD is baseline and
 the NEON loop applies the same 16-byte bound before each unaligned load. Every
 implementation sends its shorter tail through safe scalar Rust and is
-differentially tested against that scalar implementation across vector edges.
+differentially tested against that scalar implementation across vector edges,
+randomized contents, and every starting-address displacement from zero through
+63 bytes.
 
 ## Native DEFLATE bit loads
 

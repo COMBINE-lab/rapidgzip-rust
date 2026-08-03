@@ -82,13 +82,15 @@ Index construction stays decode-local and separate from `RuntimeState`.
 `IndexCollector` receives an `annotate_lines` flag only for an operation that
 requested both indexing and line counting.
 
-The collector merges two monotonically ordered inputs:
+The collector merges two monotonically ordered inputs without auxiliary search
+trees:
 
 1. retained checkpoint decoded offsets; and
 2. final emitted byte ranges plus the line count preceding each range.
 
-For a checkpoint inside `[start, end)`, the collector scans from the preceding
-checkpoint within that same output slice and records the exact prefix count. A
+One cursor advances through the retained checkpoint vector. For a checkpoint
+inside `[start, end)`, the collector scans from the preceding checkpoint within
+that same output slice and records the exact prefix count in place. A
 checkpoint at decoded EOF is resolved during finalization. Multiple empty gzip
 members can have distinct compressed offsets but the same decoded offset; they
 correctly reuse the same resolved line count.
@@ -143,8 +145,9 @@ The binary is divided by responsibility:
 
 - `main.rs`: argument contract, validation, and operation dispatch;
 - `source.rs`: regular-file versus streaming classification and safe output
-  creation;
-- `index.rs`: format detection and import/export;
+creation;
+- `index.rs`: bounded streaming format detection, strict import, and
+  transactional export;
 - `ranges.rs`: `SIZE@OFFSET` parsing and ordered extraction;
 - `report.rs`: test, count, line-count, and verbose output; and
 - `attributions.rs`: linked dependency licenses.
@@ -158,8 +161,11 @@ rather than the internal compressed marker-grid spacing.
 
 Without `-c` or `-o`, redirected stdout receives decoded bytes. At an
 interactive terminal, a regular input derives an output filename by removing a
-known compression suffix or adding `.out`. Existing output is preserved unless
-`--force` is supplied. Validation and count actions use a sink.
+known compression suffix case-insensitively or adding `.out`. Existing output
+is preserved unless `--force` is supplied. Validation and count actions use a
+sink unless combined with explicit output. When decoded payload occupies
+stdout, byte and line count results are routed to stderr so the payload remains
+unmodified.
 
 ## Index operations
 
@@ -167,17 +173,26 @@ Without `--import-index`, `--export-index` selects an explicit indexing decode.
 The exported `DeflateIndex` is written after complete stream verification.
 Supported outputs are native version 1, indexed_gzip GZIDX, gztool versions 0
 and 1, and BGZF `.gzi`; format provenance checks remain in the core serializers.
+Native is the format-neutral CLI default. Serialization uses a completed
+same-directory temporary file and only then installs the destination, so a
+conversion or write failure never truncates the previous index.
 
 With `--import-index`, a full-stream operation calls `Decoder::decode_from_index`.
 Every checkpoint boundary and decoded span size must match, and errors never
 fall back to an ordinary decoder. An imported index may be re-exported only
 after this strict decode verifies the source. Line-aware re-export requires the
-imported index itself to contain complete line metadata.
+imported index itself to contain complete line metadata. Line counting during
+strict indexed decoding recomputes every imported checkpoint annotation and
+the total; a mismatch is an error.
 
 Range extraction requires a regular positional file. Without an imported
 index, the CLI performs one verified sink decode to build one. A line-addressed
 range enables checkpoint annotation automatically. With an imported index, a
-line range requires complete line metadata before extraction begins.
+line range requires complete line metadata before extraction begins. An
+interior checkpoint cannot authenticate the skipped prefix. `--verify` therefore
+runs a complete strict indexed validation pass before imported extraction;
+without it, decoder format, size, thread, and chunk options that cannot affect
+random access are rejected instead of ignored.
 
 ## Range grammar
 
@@ -198,7 +213,8 @@ The CLI accepts options that describe behavior already in force:
 
 - `-d` / `--decompress`;
 - `-k` / `--keep`, because inputs are never deleted;
-- `--verify`, because verification is unconditional;
+- `--verify`; it requests a complete pass for imported ranges and is already
+  satisfied by ordinary complete decode actions;
 - `--no-sparse-windows`, because complete windows are retained; and
 - `--io-read-method pread` for regular files.
 
@@ -213,17 +229,20 @@ It rejects options that would otherwise lie about behavior:
 
 Core tests cover disabled counting, trailing and unterminated lines, empty
 output, sequential and marker-parallel gzip, concatenated and empty members,
-BGZF, streaming push and pull, zlib, raw DEFLATE, strict indexed decoding,
-exact checkpoint annotations, line seeks, and missing-metadata rejection.
+BGZF, every positional and streaming pull-index surface, zlib, raw DEFLATE,
+strict indexed decoding, imported line-metadata authentication, exact
+checkpoint annotations, line seeks, and missing-metadata rejection.
 
 Format tests pin gztool's one-based field encoding and reject zero external
 line numbers. Optional interoperability tests let real gztool extract a line
 through an index written here and compare the result with `seek_to_line`.
 
-CLI integration tests execute the built binary and cover output safety,
-counting, quiet/verbose reporting, every index family, strict imported-index
-failure, full indexed decoding, byte/line/mixed/overlapping ranges, stdin,
-compatibility aliases, semantic rejections, corrupt input, and attributions.
+CLI integration tests execute the built binary and cover output and alias
+safety, combined output/count actions, broken pipes, quiet/verbose reporting,
+every index family, strict bounded imported-index parsing, transactional export
+failure, zlib/raw native indexes, full indexed decoding, verified and partial
+range semantics, byte/line/mixed/overlapping ranges, stdin, compatibility
+aliases, semantic rejections, corrupt input, and complete attributions.
 
 The newline scanner adds narrowly scoped SIMD intrinsics. Runtime AVX2
 detection, the x86-64 SSE2 baseline, the AArch64 NEON baseline, slice-bounded

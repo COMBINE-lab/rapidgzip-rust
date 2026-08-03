@@ -10,6 +10,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Parallel task queues now publish their availability counters before making
   work visible, preventing a worker from consuming a task before the matching
   counter increment.
+- CLI index import now streams through the core allocation limits, requires an
+  exact format length, and rejects trailing data instead of buffering an
+  untrusted file or treating arbitrary bytes as an empty GZI.
+- Index export now serializes transactionally through a same-directory
+  temporary file, preserving an existing destination after incompatibility or
+  write failures. Normal decode output treats an early closed pipe as a
+  successful consumer exit through wrapped decoder errors as well as direct
+  I/O errors.
 
 ### Changed
 
@@ -18,6 +26,15 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Imported indexes drive strict full-stream indexed decoding. Options whose
   semantics are not implemented, including disabled verification, sparse
   windows, and shared-cursor I/O strategies, are rejected instead of ignored.
+- The CLI's format-neutral index default is now native. Payload output can be
+  combined with byte and line counting in one pass; reports move to stderr when
+  stdout carries decoded bytes. Imported range extraction documents its
+  partial-verification boundary, while `--verify` performs a complete strict
+  pass and otherwise-ignored decoder options are rejected.
+- Line-aware index construction annotates the retained checkpoint vector in
+  place instead of duplicating every point in ordered tree structures. Strict
+  indexed decoding with line counting enabled now authenticates imported
+  checkpoint and total line counters.
 
 - Generic gzip, zlib, and raw-DEFLATE path selection now uses a bounded
   machine-, runtime-budget-, task-count-, and input-aware admission screen.
