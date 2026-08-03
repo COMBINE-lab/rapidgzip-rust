@@ -115,6 +115,16 @@
 //! zlib verification; an interior checkpoint cannot authenticate bytes skipped
 //! earlier because indexes do not store prefix checksum state. Raw DEFLATE has
 //! no checksum to authenticate.
+//!
+//! # Line counting and seeking
+//!
+//! [`DecoderBuilder::count_lines`] optionally counts newline bytes on final
+//! ordered output. The scalar result is returned in
+//! [`DecodeReport::line_count`], so [`DecodeReport`] remains [`Copy`]. When the
+//! same operation explicitly builds an index, each retained checkpoint and the
+//! index total receive exact line metadata. [`IndexedReader::seek_to_line`]
+//! then seeks to a zero-based line without scanning from the source origin.
+//! Counting is disabled by default.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
@@ -127,6 +137,7 @@ mod gzip;
 mod indexed;
 mod indexed_parallel;
 mod inflate;
+mod line;
 mod read_at;
 mod reader;
 mod runtime;

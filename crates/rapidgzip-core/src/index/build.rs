@@ -4,6 +4,8 @@ use super::{
     Checkpoint, CheckpointKind, DeflateIndex, IndexError, IndexKind, IndexOptions, StoredWindow,
     WindowStorage,
 };
+use crate::line::count_newlines;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 /// Mutable ordered state protected by [`IndexCollector`].
@@ -12,10 +14,13 @@ pub(crate) struct IndexBuilder {
     options: IndexOptions,
     last_kept: Option<Checkpoint>,
     error: Option<IndexError>,
+    annotate_lines: bool,
+    pending_line_offsets: BTreeSet<u64>,
+    resolved_line_offsets: BTreeMap<u64, u64>,
 }
 
 impl IndexBuilder {
-    pub(crate) fn new(options: IndexOptions) -> Self {
+    pub(crate) fn new(options: IndexOptions, annotate_lines: bool) -> Self {
         let mut index = DeflateIndex::new();
         index.set_checkpoint_spacing(Some(options.checkpoint_spacing.get()));
         Self {
@@ -23,6 +28,9 @@ impl IndexBuilder {
             options,
             last_kept: None,
             error: None,
+            annotate_lines,
+            pending_line_offsets: BTreeSet::new(),
+            resolved_line_offsets: BTreeMap::new(),
         }
     }
 
@@ -55,7 +63,13 @@ impl IndexBuilder {
             return;
         }
         match self.index.push(checkpoint, window) {
-            Ok(()) => self.last_kept = Some(checkpoint),
+            Ok(()) => {
+                if self.annotate_lines {
+                    self.pending_line_offsets
+                        .insert(checkpoint.uncompressed_offset_in_bytes);
+                }
+                self.last_kept = Some(checkpoint);
+            }
             Err(error) => self.error = Some(error),
         }
     }
@@ -66,11 +80,34 @@ impl IndexBuilder {
         }
     }
 
+    /// Resolves retained checkpoint line offsets covered by one output run.
+    fn note_output(&mut self, start: u64, lines_before: u64, bytes: &[u8]) -> Option<u64> {
+        if !self.annotate_lines || self.pending_line_offsets.is_empty() {
+            return None;
+        }
+        let end = start.saturating_add(bytes.len() as u64);
+        let mut scanned = 0_usize;
+        let mut lines = lines_before;
+        while let Some(offset) = self.pending_line_offsets.range(start..end).next().copied() {
+            let target = usize::try_from(offset - start).expect("offset falls inside this slice");
+            lines = lines.saturating_add(count_newlines(&bytes[scanned..target]));
+            scanned = target;
+            self.pending_line_offsets.remove(&offset);
+            self.resolved_line_offsets.insert(offset, lines);
+        }
+        Some(
+            lines
+                .saturating_sub(lines_before)
+                .saturating_add(count_newlines(&bytes[scanned..])),
+        )
+    }
+
     fn finish(
         mut self,
         kind: IndexKind,
         compressed_size: u64,
         uncompressed_size: u64,
+        line_count: Option<u64>,
     ) -> Result<DeflateIndex, IndexError> {
         if let Some(error) = self.error.take() {
             return Err(error);
@@ -78,6 +115,32 @@ impl IndexBuilder {
         self.index.set_kind(kind);
         self.index.set_compressed_size(Some(compressed_size));
         self.index.set_uncompressed_size(Some(uncompressed_size));
+        if let Some(lines) = line_count {
+            if self.pending_line_offsets.remove(&uncompressed_size) {
+                self.resolved_line_offsets.insert(uncompressed_size, lines);
+            }
+        }
+        let fully_annotated = self.annotate_lines
+            && line_count.is_some()
+            && self.pending_line_offsets.is_empty()
+            && self.index.checkpoints.iter().all(|checkpoint| {
+                self.resolved_line_offsets
+                    .contains_key(&checkpoint.uncompressed_offset_in_bytes)
+            });
+        if fully_annotated {
+            for checkpoint in &mut self.index.checkpoints {
+                checkpoint.line_offset = self
+                    .resolved_line_offsets
+                    .get(&checkpoint.uncompressed_offset_in_bytes)
+                    .copied();
+            }
+            self.index.set_total_line_count(line_count);
+        } else {
+            for checkpoint in &mut self.index.checkpoints {
+                checkpoint.line_offset = None;
+            }
+            self.index.set_total_line_count(None);
+        }
         self.index.validate()?;
         Ok(self.index)
     }
@@ -96,9 +159,9 @@ pub(crate) struct IndexCollector {
 }
 
 impl IndexCollector {
-    pub(crate) fn new(options: IndexOptions) -> Arc<Self> {
+    pub(crate) fn new(options: IndexOptions, annotate_lines: bool) -> Arc<Self> {
         Arc::new(Self {
-            builder: Mutex::new(Some(IndexBuilder::new(options))),
+            builder: Mutex::new(Some(IndexBuilder::new(options, annotate_lines))),
             kind: Mutex::new(IndexKind::Gzip),
         })
     }
@@ -140,11 +203,20 @@ impl IndexCollector {
         }
     }
 
+    /// Resolves line metadata as final ordered output passes checkpoints.
+    pub(crate) fn note_output(&self, start: u64, lines_before: u64, bytes: &[u8]) -> Option<u64> {
+        if let Some(builder) = self.builder.lock().expect("index builder mutex").as_mut() {
+            return builder.note_output(start, lines_before, bytes);
+        }
+        None
+    }
+
     /// Consumes the collector and validates final source sizes.
     pub(crate) fn finish(
         &self,
         compressed_size: u64,
         uncompressed_size: u64,
+        line_count: Option<u64>,
     ) -> Result<DeflateIndex, IndexError> {
         let builder = self
             .builder
@@ -155,7 +227,7 @@ impl IndexCollector {
                 "index collector was finalized more than once",
             ))?;
         let kind = *self.kind.lock().expect("index kind mutex");
-        builder.finish(kind, compressed_size, uncompressed_size)
+        builder.finish(kind, compressed_size, uncompressed_size, line_count)
     }
 }
 
@@ -175,7 +247,7 @@ mod tests {
 
     #[test]
     fn thins_interior_windows_before_storage() {
-        let collector = IndexCollector::new(IndexOptions::default());
+        let collector = IndexCollector::new(IndexOptions::default(), false);
         let window = vec![7; WINDOW_SIZE];
         collector.offer(point(0, 0, CheckpointKind::GzipMemberHeader), &[]);
         collector.offer(point(80, 1024, CheckpointKind::DeflateBlock), &window);
@@ -183,16 +255,18 @@ mod tests {
             point(160, 8 * 1024 * 1024, CheckpointKind::DeflateBlock),
             &window,
         );
-        let index = collector.finish(1024, 9 * 1024 * 1024).expect("index");
+        let index = collector
+            .finish(1024, 9 * 1024 * 1024, None)
+            .expect("index");
         assert_eq!(index.checkpoint_count(), 2);
     }
 
     #[test]
     fn keeps_equal_output_offsets_for_empty_members() {
-        let collector = IndexCollector::new(IndexOptions::default());
+        let collector = IndexCollector::new(IndexOptions::default(), false);
         collector.offer(point(0, 0, CheckpointKind::GzipMemberHeader), &[]);
         collector.offer(point(160, 0, CheckpointKind::GzipMemberHeader), &[]);
-        let index = collector.finish(40, 0).expect("index");
+        let index = collector.finish(40, 0, None).expect("index");
         assert_eq!(index.checkpoint_count(), 2);
         assert_eq!(
             index

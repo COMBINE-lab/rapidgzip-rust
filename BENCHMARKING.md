@@ -450,3 +450,23 @@ FASTQ contains many small internal DEFLATE blocks, so multi-worker throughput
 fell below 350 MiB/s despite synthetic success. Accumulating internal block
 results into configured output chunks restored scaling; a focused integration
 test now enforces a chunk-plus-span bound on writer handoffs.
+
+## 2026-08-03 line-counting FASTQ diagnostic
+
+The line-aware CLI successor was checked on the same public FASTQ file and
+dual-socket host described above. This was an unpinned implementation
+diagnostic, not a release parity matrix. The release CLI used a 16-worker
+budget, one warmup per mode, and five alternating `/usr/bin/time` runs. Both
+modes decoded and verified the full stream to a sink; the counted mode reported
+4,320,920 newline bytes.
+
+| mode | five wall times (s) | median (s) | decoded MiB/s |
+|---|---|---:|---:|
+| counting disabled (`--test`) | 0.25, 0.27, 0.25, 0.25, 0.24 | 0.25 | 1,380.2 |
+| counting enabled (`--count-lines`) | 0.28, 0.28, 0.28, 0.27, 0.27 | 0.28 | 1,232.3 |
+
+The first scalar implementation measured 0.52 seconds in the counted mode on
+the same warm cache, more than twice the 0.25-second control. Runtime-dispatched
+AVX2 with SSE2 and NEON baselines reduced the measured optional cost to roughly
+12%. The ordinary disabled path still performs no scan and only tests the
+decode-local enabled flag at each ordered output chunk.

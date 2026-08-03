@@ -119,6 +119,44 @@ across interior checkpoints, validates every trailer, and reports
 `DecoderPath::IndexedParallel`. The complete design is recorded in
 `docs/design/indexed-parallel-decode.md`.
 
+## Ordered line counting and line seeking
+
+Newline counting is decoder configuration, while index construction remains an
+explicit per-operation choice. `DecoderBuilder::count_lines(true)` adds one
+scalar scan over final ordered output and places the result in
+`DecodeReport::line_count`; the field is `Option<u64>`, so `DecodeReport`
+remains `Copy`. The disabled path keeps no counter and does not scan output.
+
+Counting occurs at the `Output` boundary after predecessor markers have been
+resolved. Worker-local or speculative buffers are not valid inputs because an
+unresolved symbol may later become a newline. Push decodes wrap their final
+output sink in a decode-local counter. Pull-driven streaming uses the same
+counter immediately before publishing each final chunk. Strict indexed
+parallel decoding counts its ordered span handoff.
+
+When indexing and counting are both requested, `IndexCollector` maintains two
+ordered streams: retained checkpoint output offsets and emitted byte ranges.
+As output passes an offset, the collector records the number of newlines before
+that byte. Checkpoints at decoded EOF are resolved during finalization. Empty
+gzip members may produce multiple checkpoints at the same output offset; they
+correctly share one line count. If any retained checkpoint was offered too late
+to resolve, finalization clears every checkpoint line field and the total
+rather than publishing partial metadata.
+
+`IndexedReader::seek_to_line` selects the latest complete annotated checkpoint
+proven to precede the requested zero-based line's start, resumes through its
+exact predecessor window, and scans forward to the terminating newline. It
+uses a strictly smaller line count for nonzero targets because an equal-count
+checkpoint can sit inside a long line. The scan is bounded by checkpoint
+spacing for an in-range target. A request beyond the final line lands at
+decoded EOF. The method rejects indexes without a total and per-point line
+counters. gztool version 1 is translated at the codec boundary because it
+stores one-based checkpoint line numbers, while the Rust API stores preceding
+newline counts.
+
+The complete design and CLI integration are recorded in
+`docs/design/line-aware-cli.md`.
+
 ## Marker/window algorithm
 
 Before the generic marker grid starts, path admission derives a useful worker

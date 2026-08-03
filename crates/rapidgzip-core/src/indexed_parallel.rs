@@ -6,7 +6,7 @@
 //! output offsets. Output travels through one-slot per-span channels, bounding
 //! decoded reordering without allocating an entire sparse span.
 
-use crate::backend::Output;
+use crate::backend::{LineCounter, Output};
 use crate::config::Config;
 use crate::crc32::Crc32;
 use crate::format::FormatSelection;
@@ -1168,6 +1168,7 @@ where
     let mut next_to_emit = 0_usize;
     let mut verifier = OrderedVerifier::new(plan.kind);
     let mut total_output = 0_u64;
+    let mut line_counter = LineCounter::new(config.count_lines);
 
     let result = thread::scope(|scope| -> Result<(), DecodeError> {
         let _stop = StopGuard {
@@ -1219,11 +1220,13 @@ where
                 active.insert(next_to_schedule, ActiveSpan { receiver });
                 {
                     let _guard = work_signal.0.lock().expect("indexed work mutex poisoned");
+                    // A worker decrements after a successful steal, so publish
+                    // the count before the task becomes queue-visible.
+                    let queued = available_tasks.fetch_add(1, Ordering::Release) + 1;
                     queue.push(Work {
                         span_index: next_to_schedule,
                         sender,
                     });
-                    let queued = available_tasks.fetch_add(1, Ordering::Release) + 1;
                     runtime.set_queued_tasks(queued);
                     work_signal.1.notify_one();
                 }
@@ -1247,6 +1250,7 @@ where
                     let next_total = config.checked_output_total(total_output, bytes.len())?;
                     verifier.accept_chunk(checksum, bytes.len())?;
                     total_output = next_total;
+                    line_counter.note_output(&bytes, None);
                     let reusable = output.emit_reusable(bytes)?;
                     if reusable.capacity() != 0 {
                         recycled.push(reusable);
@@ -1288,11 +1292,12 @@ where
     }
     let members = verifier.finish()?;
     config.verify_expected_output(total_output)?;
-    Ok(DecodeReport {
+    Ok(line_counter.finish_report(DecodeReport {
         compressed_bytes: plan.source_length,
         decompressed_bytes: total_output,
         member_count: members,
         decoder_threads: config.decoder_threads,
         format: plan.format,
-    })
+        line_count: None,
+    }))
 }

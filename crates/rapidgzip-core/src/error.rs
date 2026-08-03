@@ -370,6 +370,13 @@ pub struct DecodeReport {
     pub decoder_threads: usize,
     /// Concrete container framing that was decoded.
     pub format: Format,
+    /// Newline bytes in the decoded output when line counting was enabled.
+    ///
+    /// Enable this with
+    /// [`DecoderBuilder::count_lines`](crate::DecoderBuilder::count_lines).
+    /// The value counts `b'\n'` bytes; a final unterminated line does not add
+    /// one to the count.
+    pub line_count: Option<u64>,
 }
 
 impl AsRef<DecodeReport> for DecodeReport {

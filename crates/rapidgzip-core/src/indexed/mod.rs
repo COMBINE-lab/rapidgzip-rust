@@ -197,6 +197,59 @@ impl<R: ReadAt> IndexedReader<R> {
         (self.source, self.index)
     }
 
+    /// Seeks to the first byte of zero-based `line` and returns its byte offset.
+    ///
+    /// The reader resumes from the nearest preceding annotated checkpoint and
+    /// scans forward only far enough to find the requested newline. Seeking
+    /// beyond the recorded lines positions the reader at decoded EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::Unsupported`] unless the index carries a total
+    /// line count and a line offset for every checkpoint. Other errors have the
+    /// same meaning as [`Read`] and [`Seek`] errors from this reader.
+    pub fn seek_to_line(&mut self, line: u64) -> io::Result<u64> {
+        let Some(checkpoint) = self.index.checkpoint_at_or_before_line(line) else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the index does not carry complete line metadata",
+            ));
+        };
+        let checkpoint_line = checkpoint
+            .line_offset
+            .expect("line checkpoint lookup requires complete metadata");
+        let mut remaining = line - checkpoint_line;
+        let start = checkpoint.uncompressed_offset_in_bytes;
+        self.seek(SeekFrom::Start(start))?;
+        if remaining == 0 {
+            return Ok(start);
+        }
+
+        let mut scratch = [0_u8; 64 * 1024];
+        loop {
+            let read = self.read(&mut scratch)?;
+            if read == 0 {
+                return Ok(self.position);
+            }
+            let mut consumed = 0_usize;
+            for (index, &byte) in scratch[..read].iter().enumerate() {
+                if byte != b'\n' {
+                    continue;
+                }
+                remaining -= 1;
+                if remaining == 0 {
+                    consumed = index + 1;
+                    break;
+                }
+            }
+            if remaining == 0 {
+                let position = self.position - (read - consumed) as u64;
+                self.seek(SeekFrom::Start(position))?;
+                return Ok(position);
+            }
+        }
+    }
+
     fn buffered(&self) -> usize {
         self.decoded.len() - self.decoded_position
     }
