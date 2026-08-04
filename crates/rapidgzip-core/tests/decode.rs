@@ -635,8 +635,13 @@ fn final_reader_handoff_reports_consumer_backpressure() {
             DecoderPressure::ConsumerBound { .. }
         )
     }));
+
+    // Backpressure must reduce observed decode activity. A worker that already
+    // owns a completed result can remain parked on a bounded internal handoff
+    // while the coordinator waits for the reader, so `spawned_workers` is not
+    // required to fall until output advances or cancellation releases it.
     assert!(wait_until(Duration::from_secs(5), || {
-        handle.stats().spawned_workers <= 1
+        handle.stats().busy_workers <= 1
     }));
     drop(reader);
 }

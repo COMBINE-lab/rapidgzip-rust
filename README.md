@@ -129,10 +129,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The configured worker count is an immutable maximum, not an eager allocation.
 Workers are created lazily as the empirical controller finds useful parallel
 work. Lowering the runtime ceiling is nonblocking: in-flight tasks finish,
-excess workers stop accepting tasks, and persistently excess OS threads retire.
-They can be recreated if the ceiling and measured demand later increase.
-Sustained backpressure at the final reader handoff automatically reduces task
-admission to one worker and retires the rest.
+excess workers stop accepting new tasks, and retire after publishing completed
+results they already own. They can be recreated if the ceiling and measured
+demand later increase. Sustained backpressure at the final reader handoff
+automatically reduces the active target and actual decode activity to one. A
+worker already holding a completed result can remain live, normally parked
+between bounded handoff retries, until the consumer advances or the decode is
+cancelled. It remains visible in `spawned_workers` but not `busy_workers`.
 
 `DecoderStats` distinguishes the configured maximum, current application
 ceiling, adaptive active target, workers executing decode tasks, and live OS
