@@ -38,7 +38,7 @@ Matrix:
   --delay-micros N    sleep after each successful Read (default: 0)
   --stop-after N      call finish after consuming N bytes (default: all)
   --iterations N      archives decoded per timed process (default: 1)
-  --reader-mode MODE  ordinary or indexed (default: ordinary)
+  --reader-mode MODE  ordinary, indexed, or paraseq (default: ordinary)
   --cpus LIST         taskset CPU list applied to both implementations
   --results-dir DIR   explicit new output directory
 EOF
@@ -78,8 +78,8 @@ done
 [[ $warmups =~ ^[0-9]+$ ]] || { echo "--warmups must be an integer" >&2; exit 2; }
 [[ $delay_micros =~ ^[0-9]+$ ]] || { echo "--delay-micros must be an integer" >&2; exit 2; }
 [[ $iterations =~ ^[1-9][0-9]*$ ]] || { echo "--iterations must be nonzero" >&2; exit 2; }
-[[ $reader_mode == ordinary || $reader_mode == indexed ]] || {
-    echo "--reader-mode must be ordinary or indexed" >&2
+[[ $reader_mode == ordinary || $reader_mode == indexed || $reader_mode == paraseq ]] || {
+    echo "--reader-mode must be ordinary, indexed, or paraseq" >&2
     exit 2
 }
 [[ $stop_after == all || $stop_after =~ ^[0-9]+$ ]] || {

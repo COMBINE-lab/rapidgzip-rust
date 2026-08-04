@@ -11,11 +11,11 @@ publish = false
 
 [dependencies]
 libz-rs-sys.workspace = true
+paraseq.workspace = true
 rapidgzip-core.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-paraseq.workspace = true
 
 [[bench]]
 name = "decode"
