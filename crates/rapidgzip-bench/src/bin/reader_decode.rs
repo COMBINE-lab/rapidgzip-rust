@@ -3,8 +3,9 @@
 //! This deliberately measures the public `Decoder::open` -> `Read` ->
 //! `DecoderReader::finish` path without telemetry sampling or output I/O.
 
-use rapidgzip_core::Decoder;
+use rapidgzip_core::{Decoder, IndexOptions};
 use std::env;
+use std::fs::File;
 use std::hint::black_box;
 use std::io::Read;
 use std::path::PathBuf;
@@ -20,11 +21,12 @@ struct Arguments {
     delay: Duration,
     stop_after_bytes: Option<u64>,
     iterations: usize,
+    indexed: bool,
 }
 
 fn usage() -> &'static str {
     "usage: reader_decode INPUT.gz THREADS READ_BUFFER_BYTES EXPECTED_DECODED_BYTES \
-     [DELAY_MICROS [STOP_AFTER_BYTES|all [ITERATIONS]]]"
+     [DELAY_MICROS [STOP_AFTER_BYTES|all [ITERATIONS [ordinary|indexed]]]]"
 }
 
 fn parse_usize(value: Option<String>, name: &str) -> Result<usize, String> {
@@ -86,6 +88,11 @@ fn parse_arguments() -> Result<Arguments, String> {
         })
         .transpose()?
         .unwrap_or(1);
+    let indexed = match arguments.next().as_deref() {
+        None | Some("ordinary") => false,
+        Some("indexed") => true,
+        Some(mode) => return Err(format!("invalid reader mode {mode:?}")),
+    };
     if arguments.next().is_some() {
         return Err(format!("too many arguments\n{}", usage()));
     }
@@ -97,7 +104,63 @@ fn parse_arguments() -> Result<Arguments, String> {
         delay: Duration::from_micros(delay_micros),
         stop_after_bytes,
         iterations,
+        indexed,
     })
+}
+
+fn consume<R: Read>(
+    reader: &mut R,
+    output: &mut [u8],
+    arguments: &Arguments,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut consumed = 0_u64;
+    while arguments
+        .stop_after_bytes
+        .is_none_or(|limit| consumed < limit)
+    {
+        let remaining = arguments.stop_after_bytes.map_or(output.len(), |limit| {
+            usize::try_from(limit.saturating_sub(consumed))
+                .unwrap_or(usize::MAX)
+                .min(output.len())
+        });
+        if remaining == 0 {
+            break;
+        }
+        let count = reader.read(&mut output[..remaining])?;
+        if count == 0 {
+            break;
+        }
+        // Make the writes observably consumed without adding a checksum pass.
+        black_box(&output[..count]);
+        consumed = consumed
+            .checked_add(count as u64)
+            .ok_or("consumed-byte count overflow")?;
+        if !arguments.delay.is_zero() {
+            thread::sleep(arguments.delay);
+        }
+    }
+    Ok(consumed)
+}
+
+fn validate_report(
+    report: rapidgzip_core::DecodeReport,
+    arguments: &Arguments,
+    member_count: &mut Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if report.decompressed_bytes != arguments.expected_decoded_bytes {
+        return Err(format!(
+            "decoded {} bytes; expected {}",
+            report.decompressed_bytes, arguments.expected_decoded_bytes
+        )
+        .into());
+    }
+    if member_count
+        .replace(report.member_count)
+        .is_some_and(|previous| previous != report.member_count)
+    {
+        return Err("member count changed between iterations".into());
+    }
+    Ok(())
 }
 
 fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
@@ -108,47 +171,18 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let mut total_consumed = 0_u64;
     let mut member_count = None;
     for _ in 0..arguments.iterations {
-        let mut reader = decoder.open(&arguments.input)?;
-        let mut consumed = 0_u64;
-        while arguments
-            .stop_after_bytes
-            .is_none_or(|limit| consumed < limit)
-        {
-            let remaining = arguments.stop_after_bytes.map_or(output.len(), |limit| {
-                usize::try_from(limit.saturating_sub(consumed))
-                    .unwrap_or(usize::MAX)
-                    .min(output.len())
-            });
-            if remaining == 0 {
-                break;
-            }
-            let count = reader.read(&mut output[..remaining])?;
-            if count == 0 {
-                break;
-            }
-            // Make the writes observably consumed without adding a checksum pass.
-            black_box(&output[..count]);
-            consumed = consumed
-                .checked_add(count as u64)
-                .ok_or("consumed-byte count overflow")?;
-            if !arguments.delay.is_zero() {
-                thread::sleep(arguments.delay);
-            }
-        }
-        let report = reader.finish()?;
-        if report.decompressed_bytes != arguments.expected_decoded_bytes {
-            return Err(format!(
-                "decoded {} bytes; expected {}",
-                report.decompressed_bytes, arguments.expected_decoded_bytes
-            )
-            .into());
-        }
-        if member_count
-            .replace(report.member_count)
-            .is_some_and(|previous| previous != report.member_count)
-        {
-            return Err("member count changed between iterations".into());
-        }
+        let consumed = if arguments.indexed {
+            let source = File::open(&arguments.input)?;
+            let mut reader = decoder.reader_with_index(source, IndexOptions::default())?;
+            let consumed = consume(&mut reader, &mut output, &arguments)?;
+            validate_report(reader.finish()?.decode, &arguments, &mut member_count)?;
+            consumed
+        } else {
+            let mut reader = decoder.open(&arguments.input)?;
+            let consumed = consume(&mut reader, &mut output, &arguments)?;
+            validate_report(reader.finish()?, &arguments, &mut member_count)?;
+            consumed
+        };
         total_consumed = total_consumed
             .checked_add(consumed)
             .ok_or("total consumed-byte count overflow")?;
@@ -160,6 +194,14 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("member_count\t{}", member_count.unwrap_or(0));
     println!("iterations\t{}", arguments.iterations);
+    println!(
+        "reader_mode\t{}",
+        if arguments.indexed {
+            "indexed"
+        } else {
+            "ordinary"
+        }
+    );
     Ok(())
 }
 
