@@ -201,6 +201,9 @@ guess its backend. Configured tools must be executable, report a version, and
 pass correctness preflight. The initial C++ command template deliberately
 supports rapidgzip 0.16.x. Missing optional tools are recorded in
 `environment.tsv`; a configured but broken tool fails before timing.
+`RAPIDGZIP_RUST`, `GENERATE_CORPORA`, and `SUMMARIZE_RESULTS` may point to
+prebuilt Rust binaries, which keeps release artifacts and generated data in a
+maintainer-selected scratch directory.
 
 `--generate` creates deterministic single-member, sparse/dense ordinary
 multi-member, true BGZF, stored, low-compression, zlib, and raw-DEFLATE inputs
@@ -263,6 +266,69 @@ some speculative chunks.
 FASTQ integration benchmarks should use paraseq with a fixed total physical-core
 budget. Sweep decompressor/parser thread splits rather than assigning all cores
 to both pools.
+
+## 2026-08-04 v0.2.0 release qualification
+
+The v0.2.0 candidate was qualified from decoder source commit `e8b2531` on the
+dual-socket Xeon E5-2699 v4 host described below. Every process was pinned to
+physical CPUs 0--43, excluding SMT siblings. Each cell decoded 256 MiB of the
+same deterministic valid FASTQ payload after two warmups and reported the
+median of nine runs. The four representations were one ordinary member, four
+ordinary members, 1,024 ordinary members, and 4,371-member BGZF including its
+canonical EOF member.
+
+The Rust build used rustc 1.91.1, zlib-rs/libz-rs-sys 0.6.6, thin LTO, and one
+codegen unit. Both C++ binaries were rapidgzip 0.16.0 at commit `d2350e9`, one
+with ISA-L and zlib-ng and one with zlib-ng only. gzippy was 0.8.0 at commit
+`fa2862a` using its default `parallel-sm+pure` decoder. All four tools produced
+the same 268,435,456-byte output and SHA-256 for every representation. All 576
+timed attempts succeeded.
+
+Median decoded throughput in MiB/s was:
+
+| corpus and decoder | 1 | 4 | 16 | 44 |
+|---|---:|---:|---:|---:|
+| single: rapidgzip-rust | 4,458.5 | 4,691.6 | 3,183.4 | 3,109.2 |
+| single: C++ ISA-L | 1,426.0 | 1,069.5 | 1,495.1 | 1,517.3 |
+| single: C++ zlib-ng | 836.4 | 1,016.0 | 1,368.1 | 1,317.6 |
+| single: gzippy | 4,878.3 | 4,464.3 | 3,278.5 | 2,045.0 |
+| four members: rapidgzip-rust | 4,516.3 | 2,289.6 | 2,251.0 | 2,248.5 |
+| four members: C++ ISA-L | 1,486.0 | 1,089.6 | 1,532.8 | 1,493.3 |
+| four members: C++ zlib-ng | 828.1 | 860.7 | 1,402.3 | 1,318.9 |
+| four members: gzippy | 1,294.1 | 2,865.7 | 2,780.9 | 2,758.8 |
+| 1,024 members: rapidgzip-rust | 4,344.7 | 5,730.9 | 7,758.5 | 4,563.0 |
+| 1,024 members: C++ ISA-L | 1,305.0 | 816.5 | 710.4 | 709.4 |
+| 1,024 members: C++ zlib-ng | 877.0 | 531.2 | 525.2 | 525.5 |
+| 1,024 members: gzippy | 700.2 | 2,304.9 | 2,602.9 | 2,294.7 |
+| BGZF: rapidgzip-rust | 2,209.2 | 5,912.4 | 7,934.5 | 4,386.0 |
+| BGZF: C++ ISA-L | 1,102.6 | 2,352.6 | 3,573.1 | 3,249.6 |
+| BGZF: C++ zlib-ng | 798.2 | 1,775.2 | 3,046.2 | 2,977.4 |
+| BGZF: gzippy | 635.2 | 1,875.5 | 1,702.3 | 814.1 |
+
+Rust exceeded zlib-ng C++ in every cell by 1.47x--14.77x, with a 3.71x
+geometric mean. It exceeded ISA-L-enabled C++ in every cell by 1.35x--10.92x,
+with a 2.87x geometric mean. Its worst per-cell maximum-RSS ratio was 45.1% of
+zlib-ng C++ and 42.7% of ISA-L-enabled C++. This clears all throughput and
+memory release gates; the deliberately short, highly compressible generated
+payload should be read as a regression matrix rather than a universal speed
+claim.
+
+The public `DecoderReader` and actual paraseq consumer were separately drained
+through 8 KiB and 1 MiB read buffers at 1, 4, and 16 configured workers. Each
+of the 24 cells per mode completed all nine runs with correct byte and member
+counts; paraseq additionally parsed every FASTQ record. Across the eight
+shape/buffer combinations per worker count, median throughput ranges were:
+
+| consumer | 1 | 4 | 16 |
+|---|---:|---:|---:|
+| ordinary `Read` | 1,760.6--3,055.0 | 2,300.2--5,758.6 | 2,033.6--5,804.9 |
+| paraseq FASTQ parse | 1,259.4--2,066.3 | 1,355.1--1,985.9 | 1,168.1--1,849.9 |
+
+Those reader runs used the same `e8b2531` runtime binary for both arms of the
+alternating harness because the release-preparation changes affected only
+documentation and release/benchmark scripts. The paired differences therefore
+measure host noise, not a code delta; the absolute medians and full validation
+are the release evidence.
 
 ## 2026-08-03 adaptive-admission diagnostic
 

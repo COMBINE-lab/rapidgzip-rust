@@ -619,13 +619,15 @@ Maintainers can validate a prospective release without retaining version-file
 changes:
 
 ```console
-scripts/bump_and_publish.sh --dry-run 0.1.0
+scripts/bump_and_publish.sh --dry-run 0.2.0
 ```
 
-Omitting `--dry-run` updates the workspace version, repeats formatting, lint,
+The dry run accepts any clean branch, which lets a release-preparation pull
+request exercise the exact package contents before merge. Omitting `--dry-run`
+requires `main`, updates the workspace version, repeats formatting, lint,
 test, documentation, and package checks, creates and pushes a release commit
 and annotated tag, publishes the crates to crates.io, and creates a GitHub
-release from that version's changelog section. The script requires a clean
+release from that version's changelog section. A real release requires a clean
 `main` branch plus Cargo and GitHub authentication, and asks for confirmation
 before external changes; `--yes` is available for an intentional unattended
 release.
