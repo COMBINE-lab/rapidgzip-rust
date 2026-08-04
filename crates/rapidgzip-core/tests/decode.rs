@@ -635,8 +635,16 @@ fn final_reader_handoff_reports_consumer_backpressure() {
             DecoderPressure::ConsumerBound { .. }
         )
     }));
+
+    // Sustained backpressure caps admission, which is what the runtime
+    // actually promises. It cannot also promise that the operating-system
+    // threads disappear: a worker parked inside the bounded handoff still owns
+    // a verified chunk nobody has read, and retiring it would discard output
+    // this decoder has already validated. How many workers reached that state
+    // before backpressure was observed is a race, so asserting on
+    // `spawned_workers` here made this test fail roughly one run in ten.
     assert!(wait_until(Duration::from_secs(5), || {
-        handle.stats().spawned_workers <= 1
+        handle.stats().active_workers <= 1
     }));
     drop(reader);
 }
