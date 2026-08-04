@@ -25,12 +25,15 @@ Positional paths return ordered owned chunks to one coordinator. The
 coordinator updates member accounting and calls the user's `Write`, so a writer
 need not be `Send`. A positional `DecoderReader` substitutes a bounded
 synchronous channel at this final edge. Output paths that can accept a reusable
-allocation wrap the channel payload in a private RAII owner. Once the consumer
-finishes or drops that payload, its cleared `Vec<u8>` capacity returns to a
-decode-local, size-classed pool for the coordinator's next chunk. The pool is
-bounded by actual retained bytes and entry count; non-reusable marker and
-specialized results do not enter it. The non-seekable path uses the same
-sequential core as a resumable state machine, described below.
+allocation keep the ordinary `Message::Data(Vec<u8>)` payload. On an eligible
+one-worker stream, consuming a registered single-member chunk returns its
+cleared capacity through a lazy, two-entry, decode-local channel for the
+coordinator's next chunk. Recycling retires at the first completed member
+boundary and is constructed only after requests below 64 KiB (or one quarter
+of a smaller decoded chunk), so bulk reads, dense multi-member data, and BGZF
+retain their original allocation and cache behavior. Non-reusable marker and specialized results do
+not enter it. The non-seekable path uses the same sequential core as a
+resumable state machine, described below.
 
 ## Non-seekable input
 
@@ -406,10 +409,13 @@ committed. No speculative worker calls the user's output object.
 Input is paged with positional reads. Speculative output is capped per task;
 oversized regions continue through zlib-rs instead. `DecoderReader` adds at most
 the configured in-flight chunk count plus its currently partially consumed
-chunk. Its reusable-allocation pool can retain at most two additional decoded
-chunk capacities and `min(in_flight_chunks + 1, 4)` entries; actual capacity is
-charged before publication. Dropping the reader closes the consumer edge, sets
-cancellation, drains or drops queued RAII payloads, and joins the coordinator.
+chunk. Its lazy reusable-allocation return channel can retain at most two decoded
+vectors, each accepted only between one and two configured decoded chunks.
+The recycler is initialized lazily only for a one-worker reusable handoff and
+is retired before output from a second gzip member or after a bulk consumer
+request. Dropping the reader closes
+the consumer edge, sets cancellation, drops ordinary owned vector payloads,
+and joins the coordinator.
 
 A non-seekable source holds one input window instead of a positional page and
 spools nothing, so its memory is independent of the input length. There is no

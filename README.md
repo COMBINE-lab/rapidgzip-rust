@@ -534,8 +534,13 @@ claim that every rapidgzip CLI option is implemented.
 - Work queues and reader handoff are bounded. Memory still scales with active
   workers and configured chunk sizes; the defaults are intended for throughput
   on general-purpose machines rather than minimum memory use. Reusable
-  positional-reader allocations are recycled only after consumption through a
-  decode-local pool capped at two decoded chunks and four entries.
+  one-worker positional-reader allocations make a non-blocking, decode-local
+  round trip only after consumption. The lazy return channel has two entries,
+  accepts capacities from one through two decoded chunks, and retires before
+  output from a second gzip member. It is only constructed after a full chunk
+  of reads smaller than 64 KiB (or one quarter of a smaller decoded chunk).
+  Bulk reads, multi-member data, and BGZF therefore
+  keep their existing allocation behavior.
 - Structural analysis retains one output-history window plus explicitly
   bounded stream, block, optional-header, alphabet, and detailed-reference
   results. Checked counter or allocation failure is reported as a typed

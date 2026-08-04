@@ -24,12 +24,13 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Positional `DecoderReader` handoffs that support reusable output now return
-  consumed allocations through a private decode-local, size-classed pool.
-  Retention is bounded by two decoded chunks and at most four entries; normal
-  reads, `finish`, cancellation, terminal errors, and dropped queued messages
-  share the same RAII ownership path. Marker and specialized non-reusable
-  output remain unchanged.
+- Eligible one-worker positional `DecoderReader` handoffs now return consumed
+  single-member output allocations through a lazy, two-entry, decode-local
+  channel while retaining the ordinary `Message::Data(Vec<u8>)` payload.
+  Recycling is non-blocking and capacity-bounded. It is constructed only after
+  one full chunk of small consumer requests and retires before output from a
+  second gzip member, preserving the 1 MiB `Read`, dense multi-member, and BGZF
+  FASTQ hot paths. Multi-worker, marker, and specialized output remain unchanged.
 - Structural analysis now uses an inlined bit-buffer fast path and one bounded
   linear history/checksum buffer. The default no-output-limit path is
   monomorphized separately, avoiding configured-limit and redundant structural

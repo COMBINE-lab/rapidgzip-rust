@@ -386,6 +386,11 @@ impl RuntimeState {
         self.member_count.store(count, Ordering::Relaxed);
     }
 
+    /// Returns the latest completed-member count for internal path policy.
+    pub(crate) fn member_count(&self) -> u64 {
+        self.member_count.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn set_consumer_blocked(&self, blocked: bool) {
         let previous = self.consumer_blocked.swap(blocked, Ordering::Relaxed);
         if previous != blocked {

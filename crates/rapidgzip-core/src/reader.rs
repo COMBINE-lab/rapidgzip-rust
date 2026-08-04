@@ -2,7 +2,6 @@ use crate::backend::{
     LineCounter, Output, SequentialDecoder, SequentialItem, decode_source,
     decode_source_with_index, validate_initial_stream,
 };
-use crate::buffer_pool::ByteBufferPool;
 use crate::config::Config;
 use crate::gzip::StreamCursor;
 use crate::index::{DeflateIndex, IndexCollector, IndexOptions};
@@ -13,85 +12,100 @@ use crate::{
     ReadAt, WorkerLimitError,
 };
 use std::io::{self, IoSliceMut, Read};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 enum Message {
-    Data(ReaderChunk),
+    Data(Vec<u8>),
     Finished(Completion),
     Failed(Failure),
 }
 
-enum ReaderChunk {
-    Unpooled(Vec<u8>),
-    Pooled(PooledChunk),
+const CONSUMER_SHAPE_UNKNOWN: u8 = 0;
+const CONSUMER_SHAPE_SMALL_READS: u8 = 1;
+const CONSUMER_SHAPE_BULK_READS: u8 = 2;
+
+struct RecyclingControl {
+    state: OnceLock<Arc<RecyclingState>>,
+    consumer_shape: std::sync::atomic::AtomicU8,
+    decoded_chunk_size: usize,
 }
 
-impl ReaderChunk {
-    const fn unpooled(bytes: Vec<u8>) -> Self {
-        Self::Unpooled(bytes)
-    }
-
-    fn pooled(bytes: Vec<u8>, pool: Arc<ByteBufferPool>) -> Self {
-        Self::Pooled(PooledChunk {
-            bytes: Some(bytes),
-            pool,
-        })
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Unpooled(bytes) => bytes,
-            Self::Pooled(chunk) => chunk
-                .bytes
-                .as_deref()
-                .expect("a live pooled chunk always owns its bytes"),
+impl RecyclingControl {
+    fn note_consumer_read(&self, read_size: usize) -> bool {
+        let bulk_threshold = self.decoded_chunk_size.div_ceil(4).min(64 * 1024);
+        if read_size < bulk_threshold {
+            return false;
         }
+        self.consumer_shape
+            .store(CONSUMER_SHAPE_BULK_READS, Ordering::Relaxed);
+        true
     }
 
-    fn len(&self) -> usize {
-        self.as_slice().len()
-    }
-
-    fn clear(&mut self) {
-        match self {
-            Self::Unpooled(bytes) => bytes.clear(),
-            Self::Pooled(chunk) => chunk
-                .bytes
-                .as_mut()
-                .expect("a live pooled chunk always owns its bytes")
-                .clear(),
-        }
-    }
-
-    fn take_unpooled(&mut self) -> Vec<u8> {
-        match self {
-            Self::Unpooled(bytes) => std::mem::take(bytes),
-            Self::Pooled(_) => unreachable!("streaming readers never receive pooled chunks"),
-        }
+    fn finish_small_read_probe(&self) {
+        let _ = self.consumer_shape.compare_exchange(
+            CONSUMER_SHAPE_UNKNOWN,
+            CONSUMER_SHAPE_SMALL_READS,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 }
 
-impl Default for ReaderChunk {
-    fn default() -> Self {
-        Self::Unpooled(Vec::new())
+struct RecyclingState {
+    sender: SyncSender<Vec<u8>>,
+    decoded_chunk_size: usize,
+    active: AtomicBool,
+    reusable_allocations: Mutex<Vec<usize>>,
+}
+
+impl RecyclingState {
+    /// Tags one live allocation without changing the ordinary message shape.
+    ///
+    /// The address is never dereferenced. The vector remains owned by the
+    /// in-flight message or reader until `try_recycle` removes this tag, so no
+    /// other live allocation can acquire the same address in the meantime.
+    fn register(&self, buffer: &[u8]) {
+        self.reusable_allocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(buffer.as_ptr() as usize);
     }
-}
 
-struct PooledChunk {
-    bytes: Option<Vec<u8>>,
-    pool: Arc<ByteBufferPool>,
-}
-
-impl Drop for PooledChunk {
-    fn drop(&mut self) {
-        if let Some(bytes) = self.bytes.take() {
-            self.pool.recycle(bytes);
+    /// Returns whether `buffer` was registered and therefore consumed here.
+    fn try_recycle(&self, buffer: &mut Vec<u8>) -> bool {
+        if !self.active.load(Ordering::Relaxed) {
+            return false;
         }
+        let pointer = buffer.as_ptr() as usize;
+        let mut registered = self
+            .reusable_allocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(index) = registered.iter().position(|&value| value == pointer) else {
+            return false;
+        };
+        registered.swap_remove(index);
+        drop(registered);
+
+        let mut returned = std::mem::take(buffer);
+        returned.clear();
+        let capacity = returned.capacity();
+        let eligible = capacity >= self.decoded_chunk_size
+            && capacity <= self.decoded_chunk_size.saturating_mul(2);
+        if eligible {
+            let _ = self.sender.try_send(returned);
+        }
+        true
     }
+}
+
+struct CoordinatorRecycling {
+    state: Arc<RecyclingState>,
+    recycled: Receiver<Vec<u8>>,
 }
 
 enum Completion {
@@ -108,7 +122,8 @@ struct ChannelOutput {
     sender: SyncSender<Message>,
     cancelled: Arc<AtomicBool>,
     runtime: Arc<RuntimeState>,
-    pool: Arc<ByteBufferPool>,
+    recycling_control: Option<Arc<RecyclingControl>>,
+    recycling: Option<CoordinatorRecycling>,
     decoded_chunk_size: usize,
 }
 
@@ -141,19 +156,119 @@ impl ChannelOutput {
 impl Output for ChannelOutput {
     fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError> {
         let byte_count = chunk.len();
-        self.send(Message::Data(ReaderChunk::unpooled(chunk)))?;
+        self.send(Message::Data(chunk))?;
         self.runtime.add_decompressed_bytes(byte_count);
         Ok(())
     }
 
     fn emit_reusable(&mut self, chunk: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
-        let byte_count = chunk.len();
-        self.send(Message::Data(ReaderChunk::pooled(
-            chunk,
-            Arc::clone(&self.pool),
-        )))?;
-        self.runtime.add_decompressed_bytes(byte_count);
-        Ok(self.pool.take(self.decoded_chunk_size))
+        if self.recycling_control.is_none() {
+            self.emit(chunk)?;
+            return Ok(Vec::new());
+        }
+        self.emit_reusable_controlled(chunk)
+    }
+}
+
+impl ChannelOutput {
+    #[inline(never)]
+    fn emit_reusable_controlled(&mut self, chunk: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
+        let Some(consumer_shape) = self
+            .recycling_control
+            .as_ref()
+            .map(|control| control.consumer_shape.load(Ordering::Relaxed))
+        else {
+            self.emit(chunk)?;
+            return Ok(Vec::new());
+        };
+        match consumer_shape {
+            CONSUMER_SHAPE_UNKNOWN => {
+                self.emit(chunk)?;
+                return Ok(Vec::new());
+            }
+            CONSUMER_SHAPE_BULK_READS => {
+                self.recycling = None;
+                self.recycling_control = None;
+                self.emit(chunk)?;
+                return Ok(Vec::new());
+            }
+            CONSUMER_SHAPE_SMALL_READS => {}
+            _ => unreachable!("consumer shape has a valid encoding"),
+        }
+        // Reusing a buffer across the producer/consumer boundary saves
+        // allocations for large sequential members, but transfers ownership
+        // of the same pages between threads. Dense multi-member streams have
+        // enough independent handoffs that this cache traffic is slower than
+        // fresh worker-local allocations. A zero count means no member footer
+        // has completed yet, so this keeps the full single-member fast path
+        // and automatically retires recycling when a second member begins.
+        if self.runtime.member_count() != 0 {
+            // Drop the receiver as part of retirement so returned first-member
+            // capacity is released immediately instead of remaining live
+            // until the coordinator itself exits.
+            if let Some(recycling) = &self.recycling {
+                recycling.state.active.store(false, Ordering::Relaxed);
+            }
+            self.recycling = None;
+            self.recycling_control = None;
+            self.emit(chunk)?;
+            return Ok(Vec::new());
+        }
+        let recycling_inactive = self
+            .recycling_control
+            .as_ref()
+            .and_then(|control| control.state.get())
+            .is_some_and(|state| !state.active.load(Ordering::Relaxed));
+        if recycling_inactive {
+            self.recycling = None;
+            self.recycling_control = None;
+            self.emit(chunk)?;
+            return Ok(Vec::new());
+        }
+        let capacity = chunk.capacity();
+        if chunk.len() < self.decoded_chunk_size
+            || capacity < self.decoded_chunk_size
+            || capacity > self.decoded_chunk_size.saturating_mul(2)
+        {
+            self.emit(chunk)?;
+            return Ok(Vec::new());
+        }
+        if self.recycling.is_none() {
+            let (recycler, recycled) = mpsc::sync_channel(2);
+            let state = Arc::new(RecyclingState {
+                sender: recycler,
+                decoded_chunk_size: self.decoded_chunk_size,
+                active: AtomicBool::new(true),
+                reusable_allocations: Mutex::new(Vec::new()),
+            });
+            self.recycling_control
+                .as_ref()
+                .expect("small-read recycling retains its control")
+                .state
+                .set(Arc::clone(&state))
+                .unwrap_or_else(|_| unreachable!("one coordinator initializes recycling"));
+            self.recycling = Some(CoordinatorRecycling { state, recycled });
+        }
+        let recycling = self
+            .recycling
+            .as_ref()
+            .expect("recycling is initialized before use");
+        recycling.state.register(&chunk);
+        self.emit(chunk)?;
+        match self
+            .recycling
+            .as_ref()
+            .expect("recycling is initialized before polling")
+            .recycled
+            .try_recv()
+        {
+            Ok(buffer) => {
+                debug_assert!(buffer.is_empty());
+                debug_assert!(buffer.capacity() >= self.decoded_chunk_size);
+                Ok(buffer)
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => Ok(Vec::new()),
+        }
     }
 }
 
@@ -180,16 +295,21 @@ enum Terminal {
 /// leaves a blocked coordinator thread behind.
 ///
 /// Reusable positional output allocations make a bounded ownership round trip
-/// through the reader handoff. Capacity is returned only after the reader has
-/// finished observing that chunk; cancellation and queued-message destruction
-/// release it by the same path. The private pool retains at most two configured
-/// decoded chunks and never changes output or verification semantics.
+/// through the reader handoff. Capacity is returned at the next receive after
+/// the reader has finished observing that chunk. The lazy, non-blocking channel is
+/// enabled only after a one-worker reader consumes one full chunk with small
+/// requests. It retires before output from a second gzip member. Bulk readers
+/// never construct it, preserving ordinary bulk-read, dense multi-member, and
+/// BGZF hot-path behavior. It never changes output, verification, cancellation,
+/// or error semantics.
 #[must_use]
 pub struct DecoderReader {
     mode: ReaderMode,
     cancelled: Arc<AtomicBool>,
     handle: DecoderHandle,
-    current: ReaderChunk,
+    current: Vec<u8>,
+    recycling: Option<Arc<RecyclingControl>>,
+    consumer_shape_observed: bool,
     current_offset: usize,
     terminal: Terminal,
 }
@@ -225,12 +345,17 @@ where
         + 'static,
 {
     let (sender, receiver) = mpsc::sync_channel(in_flight_chunks);
+    let recycling = (configured_workers == 1).then(|| {
+        Arc::new(RecyclingControl {
+            state: OnceLock::new(),
+            consumer_shape: std::sync::atomic::AtomicU8::new(CONSUMER_SHAPE_UNKNOWN),
+            decoded_chunk_size,
+        })
+    });
+    let consumer_shape_observed = recycling.is_none();
+    let coordinator_recycling = recycling.clone();
     let cancelled = Arc::new(AtomicBool::new(false));
     let runtime = RuntimeState::new(configured_workers);
-    let pool = Arc::new(ByteBufferPool::for_reader(
-        decoded_chunk_size,
-        in_flight_chunks,
-    ));
     let handle = DecoderHandle::new(Arc::clone(&runtime));
     let worker_cancelled = Arc::clone(&cancelled);
     let worker_runtime = Arc::clone(&runtime);
@@ -242,7 +367,8 @@ where
                 sender,
                 cancelled: Arc::clone(&worker_cancelled),
                 runtime: Arc::clone(&worker_runtime),
-                pool,
+                recycling_control: coordinator_recycling,
+                recycling: None,
                 decoded_chunk_size,
             };
             let terminal = match decode(&worker_cancelled, &mut output, &worker_runtime) {
@@ -272,7 +398,9 @@ where
         },
         cancelled,
         handle,
-        current: ReaderChunk::default(),
+        current: Vec::new(),
+        recycling,
+        consumer_shape_observed,
         current_offset: 0,
         terminal: Terminal::Open,
     })
@@ -377,7 +505,9 @@ where
         },
         cancelled: Arc::new(AtomicBool::new(false)),
         handle,
-        current: ReaderChunk::default(),
+        current: Vec::new(),
+        recycling: None,
+        consumer_shape_observed: true,
         current_offset: 0,
         terminal: Terminal::Open,
     })
@@ -415,7 +545,9 @@ where
             },
             cancelled: Arc::new(AtomicBool::new(false)),
             handle,
-            current: ReaderChunk::default(),
+            current: Vec::new(),
+            recycling: None,
+            consumer_shape_observed: true,
             current_offset: 0,
             terminal: Terminal::Open,
         },
@@ -474,15 +606,38 @@ impl DecoderReader {
         Ok(())
     }
 
+    fn release_current(&mut self) -> bool {
+        let Some(recycling) = self
+            .recycling
+            .as_deref()
+            .and_then(|control| control.state.get())
+        else {
+            return false;
+        };
+        if !recycling.try_recycle(&mut self.current) {
+            return false;
+        }
+        self.current_offset = 0;
+        true
+    }
+
     fn receive(&mut self) {
         let coordinator = matches!(self.mode, ReaderMode::Coordinator { .. });
         let mut reusable = if coordinator {
-            // Dropping an exhausted pooled chunk returns its allocation before
-            // the coordinator produces the next handoff.
-            self.current = ReaderChunk::default();
+            if self.recycling.is_none() {
+                self.current = Vec::new();
+                self.current_offset = 0;
+            } else if self.release_current() {
+                // Return eligible capacity before the coordinator produces
+                // its next reusable handoff.
+            } else {
+                self.current = Vec::new();
+                self.current_offset = 0;
+            }
             Vec::new()
         } else {
-            self.current.take_unpooled()
+            debug_assert!(self.recycling.is_none());
+            std::mem::take(&mut self.current)
         };
         reusable.clear();
         let message = match &mut self.mode {
@@ -505,7 +660,7 @@ impl DecoderReader {
                     Ok(SequentialItem::Chunk(data)) => {
                         line_counter.note_output(&data, collector.as_deref());
                         runtime.add_decompressed_bytes(data.len());
-                        Some(Message::Data(ReaderChunk::unpooled(data)))
+                        Some(Message::Data(data))
                     }
                     Ok(SequentialItem::Finished(report)) => {
                         let report = line_counter.finish_report(report);
@@ -537,6 +692,17 @@ impl DecoderReader {
             Some(Message::Data(data)) => {
                 self.current = data;
                 self.current_offset = 0;
+                if !self.consumer_shape_observed && self.handle.state.member_count() != 0 {
+                    if let Some(recycling) = self
+                        .recycling
+                        .as_deref()
+                        .and_then(|control| control.state.get())
+                    {
+                        recycling.active.store(false, Ordering::Relaxed);
+                    }
+                    self.recycling = None;
+                    self.consumer_shape_observed = true;
+                }
             }
             Some(Message::Finished(completion)) => {
                 self.handle.state.mark_terminal();
@@ -679,19 +845,16 @@ impl Read for IndexingDecoderReader {
     }
 }
 
-impl Read for DecoderReader {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-
+impl DecoderReader {
+    #[inline]
+    fn read_plain(&mut self, output: &mut [u8]) -> io::Result<usize> {
         loop {
             if self.current_offset < self.current.len() {
                 let count = output
                     .len()
                     .min(self.current.len().saturating_sub(self.current_offset));
                 output[..count].copy_from_slice(
-                    &self.current.as_slice()[self.current_offset..self.current_offset + count],
+                    &self.current[self.current_offset..self.current_offset + count],
                 );
                 self.current_offset += count;
                 if self.current_offset == self.current.len() {
@@ -708,6 +871,81 @@ impl Read for DecoderReader {
                 Terminal::Failed(Failure::Indexing(error)) => return Err(error.to_io_error()),
                 Terminal::Open => self.receive(),
             }
+        }
+    }
+
+    #[inline(never)]
+    fn read_recycling(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let current_length = self.current.len();
+            if self.current_offset < current_length {
+                let observed_bulk = !self.consumer_shape_observed
+                    && self
+                        .recycling
+                        .as_deref()
+                        .is_some_and(|control| control.note_consumer_read(output.len()));
+                if observed_bulk {
+                    self.recycling = None;
+                    self.consumer_shape_observed = true;
+                    // The probe has not copied any bytes yet. Tail-dispatch
+                    // immediately so even this first bulk request uses the
+                    // compact, original reader loop.
+                    return self.read_plain(output);
+                }
+                let count = output
+                    .len()
+                    .min(current_length.saturating_sub(self.current_offset));
+                output[..count].copy_from_slice(
+                    &self.current[self.current_offset..self.current_offset + count],
+                );
+                self.current_offset += count;
+                let exhausted = self.current_offset == current_length;
+                let retain_for_recycling = self
+                    .recycling
+                    .as_deref()
+                    .and_then(|control| control.state.get())
+                    .is_some();
+                if exhausted && !retain_for_recycling {
+                    // Preserve the original reader path unless a published
+                    // recycler may own this allocation tag. Streaming decode
+                    // also reuses this cleared vector synchronously.
+                    self.current_offset = 0;
+                    self.current.clear();
+                }
+                if exhausted
+                    && !self.consumer_shape_observed
+                    && let Some(control) = self.recycling.as_deref()
+                    && current_length >= control.decoded_chunk_size
+                {
+                    // Observe every request used for the first recyclable
+                    // chunk so a one-byte format probe cannot hide a later
+                    // bulk-read shape. Later chunks pay no sampling cost.
+                    control.finish_small_read_probe();
+                    self.consumer_shape_observed = true;
+                }
+                self.handle.state.add_consumed_bytes(count);
+                return Ok(count);
+            }
+
+            match &self.terminal {
+                Terminal::Finished(_) => return Ok(0),
+                Terminal::Failed(Failure::Decode(error)) => return Err(error.to_io_error()),
+                Terminal::Failed(Failure::Indexing(error)) => return Err(error.to_io_error()),
+                Terminal::Open => self.receive(),
+            }
+        }
+    }
+}
+
+impl Read for DecoderReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.recycling.is_none() {
+            self.read_plain(output)
+        } else {
+            self.read_recycling(output)
         }
     }
 
@@ -735,6 +973,7 @@ impl Read for DecoderReader {
 
 impl Drop for DecoderReader {
     fn drop(&mut self) {
+        self.release_current();
         self.cancelled.store(true, Ordering::Relaxed);
         self.handle.state.mark_terminal();
         if let ReaderMode::Coordinator { receiver, .. } = &mut self.mode {
@@ -746,13 +985,15 @@ impl Drop for DecoderReader {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelOutput, DecoderReader, IndexingDecoderReader, Message};
+    use super::{
+        ChannelOutput, DecoderReader, IndexingDecoderReader, Message, ReaderMode, Terminal,
+    };
+    use crate::DecoderHandle;
     use crate::backend::Output;
-    use crate::buffer_pool::ByteBufferPool;
     use crate::runtime::RuntimeState;
     use std::io::Read;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
     fn assert_traits<T: Read + Send + Unpin>() {}
@@ -765,51 +1006,251 @@ mod tests {
 
     fn channel_output(
         sender: mpsc::SyncSender<Message>,
-        pool: Arc<ByteBufferPool>,
-    ) -> ChannelOutput {
-        ChannelOutput {
-            sender,
-            cancelled: Arc::new(AtomicBool::new(false)),
-            runtime: RuntimeState::new(1),
-            pool,
-            decoded_chunk_size: 1024,
-        }
+        recycling_enabled: bool,
+    ) -> (ChannelOutput, Option<Arc<super::RecyclingControl>>) {
+        let control = recycling_enabled.then(|| {
+            Arc::new(super::RecyclingControl {
+                state: std::sync::OnceLock::new(),
+                consumer_shape: std::sync::atomic::AtomicU8::new(super::CONSUMER_SHAPE_SMALL_READS),
+                decoded_chunk_size: 1024,
+            })
+        });
+        (
+            ChannelOutput {
+                sender,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                runtime: RuntimeState::new(1),
+                recycling_control: control.clone(),
+                recycling: None,
+                decoded_chunk_size: 1024,
+            },
+            control,
+        )
     }
 
     #[test]
     fn reusable_handoff_recycles_only_after_the_reader_releases_it() {
-        let pool = Arc::new(ByteBufferPool::for_reader(1024, 1));
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let mut output = channel_output(sender, Arc::clone(&pool));
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let (mut output, slot) = channel_output(sender, true);
         let mut bytes = Vec::with_capacity(1024);
         bytes.resize(1024, 7);
 
         let immediate = output.emit_reusable(bytes).unwrap();
         assert_eq!(immediate.capacity(), 0);
-        let Message::Data(chunk) = receiver.recv().unwrap() else {
+        let Message::Data(mut chunk) = receiver.recv().unwrap() else {
             panic!("expected data handoff");
         };
-        assert_eq!(chunk.as_slice(), &[7; 1024]);
-        assert_eq!(pool.take(1024).capacity(), 0);
+        assert_eq!(chunk, vec![7; 1024]);
+        assert!(
+            slot.unwrap()
+                .state
+                .get()
+                .expect("emission initializes recycling")
+                .try_recycle(&mut chunk)
+        );
 
-        drop(chunk);
-        assert_eq!(pool.take(1024).capacity(), 1024);
+        let replacement = output.emit_reusable(vec![8; 1024]).unwrap();
+        assert_eq!(replacement.capacity(), 1024);
     }
 
     #[test]
-    fn disconnected_and_dropped_queues_release_reusable_handoffs() {
-        let pool = Arc::new(ByteBufferPool::for_reader(1024, 1));
+    fn disabled_recycling_preserves_the_plain_data_handoff() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        drop(receiver);
-        let mut output = channel_output(sender, Arc::clone(&pool));
-        assert!(output.emit_reusable(Vec::with_capacity(1024)).is_err());
-        assert_eq!(pool.take(1024).capacity(), 1024);
+        let (mut output, slot) = channel_output(sender, false);
+        let mut bytes = Vec::with_capacity(1024);
+        bytes.resize(1024, 3);
 
+        assert_eq!(output.emit_reusable(bytes).unwrap().capacity(), 0);
+        let Message::Data(bytes) = receiver.recv().unwrap() else {
+            panic!("expected plain data handoff");
+        };
+        assert_eq!(bytes, vec![3; 1024]);
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn short_reusable_handoff_does_not_initialize_recycling() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        let mut output = channel_output(sender, Arc::clone(&pool));
-        let replacement = output.emit_reusable(Vec::with_capacity(1024)).unwrap();
-        drop(replacement);
-        drop(receiver);
-        assert_eq!(pool.take(1024).capacity(), 1024);
+        let (mut output, slot) = channel_output(sender, true);
+
+        assert_eq!(output.emit_reusable(vec![3; 1023]).unwrap().capacity(), 0);
+        assert!(matches!(receiver.recv().unwrap(), Message::Data(_)));
+        assert!(slot.unwrap().state.get().is_none());
+    }
+
+    #[test]
+    fn completed_member_retires_recycling_before_the_next_handoff() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (mut output, slot) = channel_output(sender, true);
+        output.runtime.set_member_count(1);
+        let mut bytes = Vec::with_capacity(1024);
+        bytes.resize(1024, 4);
+
+        assert_eq!(output.emit_reusable(bytes).unwrap().capacity(), 0);
+        assert!(matches!(receiver.recv().unwrap(), Message::Data(_)));
+        assert!(slot.unwrap().state.get().is_none());
+    }
+
+    #[test]
+    fn retirement_disables_reader_side_registry_checks() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (mut output, slot) = channel_output(sender, true);
+        assert_eq!(output.emit_reusable(vec![1; 1024]).unwrap().capacity(), 0);
+        let Message::Data(mut first) = receiver.recv().unwrap() else {
+            panic!("expected first data handoff");
+        };
+        let state = Arc::clone(slot.unwrap().state.get().expect("initialized recycler"));
+
+        output.runtime.set_member_count(1);
+        assert_eq!(output.emit_reusable(vec![2; 1024]).unwrap().capacity(), 0);
+        assert!(!state.try_recycle(&mut first));
+    }
+
+    #[test]
+    fn bulk_consumer_shape_never_initializes_recycling() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (mut output, control) = channel_output(sender, true);
+        let control = control.unwrap();
+        control
+            .consumer_shape
+            .store(super::CONSUMER_SHAPE_UNKNOWN, Ordering::Relaxed);
+
+        assert!(control.note_consumer_read(256));
+        assert_eq!(output.emit_reusable(vec![1; 1024]).unwrap().capacity(), 0);
+        assert!(matches!(receiver.recv().unwrap(), Message::Data(_)));
+        assert!(control.state.get().is_none());
+    }
+
+    #[test]
+    fn parser_sized_probe_enables_recycling_only_after_a_full_chunk() {
+        let (_state, _recycled, control) = recycling_state();
+        control
+            .consumer_shape
+            .store(super::CONSUMER_SHAPE_UNKNOWN, Ordering::Relaxed);
+
+        assert!(!control.note_consumer_read(255));
+        assert_eq!(
+            control.consumer_shape.load(Ordering::Relaxed),
+            super::CONSUMER_SHAPE_UNKNOWN
+        );
+        control.finish_small_read_probe();
+        assert_eq!(
+            control.consumer_shape.load(Ordering::Relaxed),
+            super::CONSUMER_SHAPE_SMALL_READS
+        );
+    }
+
+    fn positional_reader(
+        bytes: Vec<u8>,
+        recycling: Option<Arc<super::RecyclingControl>>,
+        register: bool,
+    ) -> DecoderReader {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(sender);
+        let runtime = RuntimeState::new(1);
+        if register {
+            recycling
+                .as_deref()
+                .and_then(|control| control.state.get())
+                .expect("test recycling state")
+                .register(&bytes);
+        }
+        DecoderReader {
+            mode: ReaderMode::Coordinator {
+                receiver: Some(receiver),
+                worker: None,
+            },
+            cancelled: Arc::new(AtomicBool::new(false)),
+            handle: DecoderHandle::new(Arc::clone(&runtime)),
+            current: bytes,
+            recycling,
+            consumer_shape_observed: false,
+            current_offset: 0,
+            terminal: Terminal::Open,
+        }
+    }
+
+    fn recycling_state() -> (
+        Arc<super::RecyclingState>,
+        mpsc::Receiver<Vec<u8>>,
+        Arc<super::RecyclingControl>,
+    ) {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let state = Arc::new(super::RecyclingState {
+            sender,
+            decoded_chunk_size: 1024,
+            active: AtomicBool::new(true),
+            reusable_allocations: std::sync::Mutex::new(Vec::new()),
+        });
+        let control = Arc::new(super::RecyclingControl {
+            state: std::sync::OnceLock::new(),
+            consumer_shape: std::sync::atomic::AtomicU8::new(super::CONSUMER_SHAPE_SMALL_READS),
+            decoded_chunk_size: 1024,
+        });
+        control
+            .state
+            .set(Arc::clone(&state))
+            .unwrap_or_else(|_| unreachable!("new test slot is empty"));
+        (state, receiver, control)
+    }
+
+    #[test]
+    fn next_receive_recycles_an_exhausted_positional_chunk() {
+        let mut bytes = Vec::with_capacity(1024);
+        bytes.resize(1024, 9);
+        let (_state, recycled, recycling) = recycling_state();
+        let mut reader = positional_reader(bytes, Some(recycling), true);
+
+        let mut output = [0_u8; 255];
+        let mut decoded = Vec::new();
+        while decoded.len() < 1024 {
+            let count = reader.read(&mut output).unwrap();
+            decoded.extend_from_slice(&output[..count]);
+        }
+        assert_eq!(decoded, vec![9; 1024]);
+        assert!(recycled.try_recv().is_err());
+
+        reader.receive();
+        assert_eq!(recycled.recv().unwrap().capacity(), 1024);
+    }
+
+    #[test]
+    fn returned_capacity_is_size_and_entry_bounded() {
+        let (_state, recycled, recycling) = recycling_state();
+        let mut reader = positional_reader(Vec::new(), Some(recycling), false);
+        for capacity in [1023, 2049, 1024, 1024, 1024] {
+            reader.current = Vec::with_capacity(capacity);
+            reader
+                .recycling
+                .as_deref()
+                .and_then(|control| control.state.get())
+                .expect("test recycling state")
+                .register(&reader.current);
+            reader.release_current();
+        }
+
+        assert_eq!(recycled.try_iter().count(), 2);
+    }
+
+    #[test]
+    fn exhausting_unpooled_positional_output_does_not_replay_it() {
+        let bytes = vec![5_u8; 1024];
+        let mut reader = positional_reader(bytes, None, false);
+
+        let mut output = [0_u8; 1024];
+        assert_eq!(reader.read(&mut output).unwrap(), output.len());
+        assert_eq!(output, [5; 1024]);
+        assert_eq!(reader.current_offset, reader.current.len());
+    }
+
+    #[test]
+    fn plain_output_is_not_returned_on_a_recycling_reader() {
+        let (_state, recycled, recycling) = recycling_state();
+        let mut reader = positional_reader(vec![6_u8; 1024], Some(recycling), false);
+
+        let mut output = [0_u8; 1024];
+        assert_eq!(reader.read(&mut output).unwrap(), output.len());
+        assert_eq!(reader.current_offset, reader.current.len());
+        assert!(recycled.try_recv().is_err());
     }
 }

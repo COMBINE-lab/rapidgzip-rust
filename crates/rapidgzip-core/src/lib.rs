@@ -140,7 +140,6 @@
 
 mod analyze;
 mod backend;
-mod buffer_pool;
 mod config;
 mod crc32;
 mod error;
