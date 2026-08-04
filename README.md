@@ -18,6 +18,8 @@ The project provides:
   decoded-output `Read + Seek` adapter;
 - opt-in newline counting, line-annotated indexes, and indexed seeking by
   zero-based line number;
+- bounded structural analysis of container framing, every DEFLATE block,
+  dynamic Huffman alphabets, symbol composition, and predecessor-window use;
 - decoding of non-seekable compressed input such as standard input, a FIFO, a
   process substitution, or a socket.
 
@@ -232,6 +234,51 @@ resumable inflater only inside the consumer's `Read::read` call, so a slow
 consumer naturally stops reading the producer. Dropping it immediately drops
 the source; there is no streaming coordinator thread to block or detach.
 
+### Structural analysis
+
+[`Decoder::analyze`] verifies the complete input while returning structured
+container, block, alphabet, symbol, and predecessor-window facts. Analysis is
+an explicit operation, so ordinary decoding and its small `Copy`
+`DecodeReport` are unchanged:
+
+```rust,no_run
+use rapidgzip_core::{AnalyzeOptions, Decoder};
+use std::fs::File;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let source = File::open("reads.fastq.gz")?;
+let options = AnalyzeOptions::default()
+    .maximum_blocks(250_000)
+    .maximum_retained_backreferences(10_000);
+let analysis = Decoder::default().analyze_with_options(&source, options)?;
+
+println!("{} members", analysis.streams.len());
+for (kind, count) in analysis.block_type_counts() {
+    println!("{kind:?}: {count}");
+}
+assert_eq!(analysis.compressed_size_in_bytes, source.metadata()?.len());
+# Ok(())
+# }
+```
+
+The default result retains up to 100,000 streams, 100,000 blocks, and 1 MiB of
+optional gzip-header metadata across the input. Individual predecessor-window
+references are omitted by default. Their counts, length histogram, farthest
+reach, deterministic interval-union count, and window coverage remain exact;
+each block says how many details were omitted. [`AnalyzeOptions`] makes every
+retention limit explicit, and exceeding a structural limit returns a typed
+[`AnalysisErrorKind`] through `DecodeError::Analysis` rather than allocating
+without bound.
+
+The walk is intentionally single-threaded and causal. It keeps one 32 KiB
+history ring and verifies gzip CRC32/ISIZE or zlib Adler-32 without retaining
+decoded output. Concatenated and empty gzip members, BGZF (including its EOF
+member), zlib, raw DEFLATE, format detection, output limits, exact-size
+contracts, trailing-data rules, positional [`ReadAt`] sources, and streaming
+`Read` sources are supported. [`Decoder::analyze_stream`] is the forward-only
+counterpart. Timings and rapidgzip-specific text formatting remain CLI
+presentation data and are not part of the deterministic [`Analysis`] value.
+
 ### Random-access indexes and seeking
 
 Index construction is explicit per decode operation. This keeps the existing
@@ -421,6 +468,16 @@ rapidgzip-rust -P 16 --output reads.fastq reads.fastq.gz
 # Read standard input, decoded sequentially and verified the same way.
 cat reads.fastq.gz | rapidgzip-rust - > reads.fastq
 
+# Print rapidgzip-compatible framing and DEFLATE block analysis.
+rapidgzip-rust --analyze reads.fastq.gz
+
+# Retain bounded per-reference detail; aggregate summaries are always exact.
+rapidgzip-rust --analyze --verbose \
+  --analysis-reference-limit 10000 reads.fastq.gz
+
+# Streaming analysis uses the same bounded forward walk.
+cat reads.fastq.gz | rapidgzip-rust --analyze -
+
 # A FIFO or process substitution given as a path is routed the same way.
 rapidgzip-rust <(some_producer) > reads.fastq
 ```
@@ -477,6 +534,10 @@ claim that every rapidgzip CLI option is implemented.
 - Work queues and reader handoff are bounded. Memory still scales with active
   workers and configured chunk sizes; the defaults are intended for throughput
   on general-purpose machines rather than minimum memory use.
+- Structural analysis retains one output-history window plus explicitly
+  bounded stream, block, optional-header, alphabet, and detailed-reference
+  results. Checked counter or allocation failure is reported as a typed
+  analysis error; exact summaries do not require detailed references.
 - All of the above hold identically for non-seekable input, because it runs the
   same sequential decoder that the parallel paths already use as their
   authoritative fallback. It is not decoded in parallel, and the telemetry says
@@ -563,6 +624,8 @@ MIT. See [LICENSE-BSD-3-CLAUSE] and [LICENSE-MIT].
 [`Decoder::decode_from_index`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode_from_index
 [`Decoder::decode_with_index`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode_with_index
 [`Decoder::decode_stream`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.decode_stream
+[`Decoder::analyze`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.analyze
+[`Decoder::analyze_stream`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.analyze_stream
 [`Decoder::open`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.open
 [`Decoder::reader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.reader
 [`Decoder::reader_from_index`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.reader_from_index
@@ -581,6 +644,9 @@ MIT. See [LICENSE-BSD-3-CLAUSE] and [LICENSE-MIT].
 [`DecoderStats::configured_workers`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderStats.html#structfield.configured_workers
 [`DecoderStats::active_workers`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderStats.html#structfield.active_workers
 [`ReadAt`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/trait.ReadAt.html
+[`Analysis`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Analysis.html
+[`AnalysisErrorKind`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/enum.AnalysisErrorKind.html
+[`AnalyzeOptions`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.AnalyzeOptions.html
 [ARCHITECTURE.md]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/ARCHITECTURE.md
 [BENCHMARKING.md]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/BENCHMARKING.md
 [CHANGELOG.md]: https://github.com/COMBINE-lab/rapidgzip-rust/blob/main/CHANGELOG.md

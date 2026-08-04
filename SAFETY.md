@@ -9,6 +9,23 @@ The crate denies unsafe operations inside unsafe functions:
 There is no unsafe public API. One private manual `Send` implementation, for the
 resumable sequential decoder, is justified below; there is no manual `Sync`.
 
+## Structural analysis
+
+Structural analysis uses one private unaligned input load in its refill slow
+path. It executes only after `available.len() >= 8` proves that a complete
+initialized `u64` lies at the slice pointer. `read_unaligned` removes the
+alignment requirement, and `to_le` normalizes the loaded word before the
+cursor masks off only the bytes it consumes. A shorter page uses a local array
+and safe slice copying instead.
+
+Decoded output stays in a fixed 40 KiB linear allocation: 32 KiB of reachable
+history and at most 8 KiB awaiting a checksum update. Every DEFLATE distance is
+validated against both the declared zlib window and available history before
+it selects a safe `copy_within` range. Result vectors use checked retention
+limits and fallible reserve. Symbol and reference counters cannot exceed the
+checked total output count, which is established before their direct
+increments.
+
 ## zlib-rs ABI adapter
 
 `inflate.rs` contains a private RAII wrapper around `libz-rs-sys`.
@@ -102,8 +119,9 @@ randomized contents, and every starting-address displacement from zero through
 
 ## Native DEFLATE bit loads
 
-The hot bit reader and Huffman peek perform an unaligned `u64` load only after
-proving that eight bytes remain beginning at the requested offset.
+The production bit reader and analyzer refill path perform an unaligned `u64`
+load only after proving that eight bytes remain beginning at the requested
+offset.
 `read_unaligned` removes the alignment requirement; conversion with `to_le`
 gives the RFC 1951 stream bit order on every target. A read requests at most 24
 bits and a peek at most 15, so either fits in the loaded word even at the

@@ -4,7 +4,9 @@
 //! their semantics. Options that would select an unimplemented I/O or sparse-
 //! window strategy are rejected explicitly rather than accepted as no-ops.
 
+mod analyze_report;
 mod attributions;
+mod cxx_format;
 mod index;
 mod ranges;
 mod report;
@@ -13,8 +15,8 @@ mod source;
 use clap::{ArgAction, Parser, ValueEnum};
 use index::IndexFormat;
 use rapidgzip_core::{
-    DecodeError, DecodeReport, Decoder, DecoderBuilder, DeflateIndex, Format, IndexOptions,
-    IndexedDecodeReport, IndexedReader,
+    AnalyzeOptions, DecodeError, DecodeReport, Decoder, DecoderBuilder, DeflateIndex, Format,
+    IndexOptions, IndexedDecodeReport, IndexedReader,
 };
 use report::Volume;
 use source::{Destination, Source, open_destination, open_source, paths_refer_to_same_file};
@@ -94,6 +96,56 @@ struct Arguments {
     /// Verify the complete input without retaining decoded bytes.
     #[arg(short = 't', long = "test", action = ArgAction::SetTrue, conflicts_with = "ranges")]
     test: bool,
+
+    /// Print container and DEFLATE block structure instead of decoding output.
+    #[arg(
+        long = "analyze",
+        action = ArgAction::SetTrue,
+        conflicts_with_all = [
+            "test",
+            "count",
+            "count_lines",
+            "ranges",
+            "export_index",
+            "import_index",
+            "stdout",
+            "output",
+            "quiet"
+        ]
+    )]
+    analyze: bool,
+
+    /// Maximum streams retained by --analyze (default: 100000).
+    #[arg(
+        long = "analysis-max-streams",
+        value_name = "COUNT",
+        requires = "analyze"
+    )]
+    analysis_max_streams: Option<usize>,
+
+    /// Maximum DEFLATE blocks retained by --analyze (default: 100000).
+    #[arg(
+        long = "analysis-max-blocks",
+        value_name = "COUNT",
+        requires = "analyze"
+    )]
+    analysis_max_blocks: Option<usize>,
+
+    /// Maximum optional gzip-header bytes retained across the input (default: 1 MiB).
+    #[arg(
+        long = "analysis-max-header-bytes",
+        value_name = "BYTES",
+        requires = "analyze"
+    )]
+    analysis_max_header_bytes: Option<usize>,
+
+    /// Detailed predecessor-window references retained by --analyze --verbose.
+    #[arg(
+        long = "analysis-reference-limit",
+        value_name = "COUNT",
+        requires_all = ["analyze", "verbose"]
+    )]
+    analysis_reference_limit: Option<usize>,
 
     /// Print the complete decompressed size in bytes.
     #[arg(long = "count", action = ArgAction::SetTrue, conflicts_with = "ranges")]
@@ -264,6 +316,14 @@ fn validate_options(arguments: &Arguments) -> Result<(), Box<dyn std::error::Err
                 .into(),
         );
     }
+    if arguments.analyze && arguments.threads.is_some() {
+        return Err(
+            "--decoder-parallelism does not affect the causally ordered --analyze walk".into(),
+        );
+    }
+    if arguments.analyze && arguments.chunk_size.is_some() {
+        return Err("--chunk-size controls decoded handoff and does not apply to --analyze".into());
+    }
     if arguments.builds_index()
         && arguments.index_format.needs_line_counts()
         && !arguments.count_lines
@@ -308,6 +368,48 @@ fn validate_options(arguments: &Arguments) -> Result<(), Box<dyn std::error::Err
         arguments.decompress,
         arguments.no_sparse_windows,
     );
+    Ok(())
+}
+
+fn run_analyze(
+    arguments: &Arguments,
+    source: &mut Source,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let decoder = build_decoder(arguments, false)?;
+    let mut options = AnalyzeOptions::default();
+    if let Some(limit) = arguments.analysis_max_streams {
+        options = options.maximum_streams(limit);
+    }
+    if let Some(limit) = arguments.analysis_max_blocks {
+        options = options.maximum_blocks(limit);
+    }
+    if let Some(limit) = arguments.analysis_max_header_bytes {
+        options = options.maximum_header_bytes(limit);
+    }
+    if arguments.verbose {
+        options = options.maximum_retained_backreferences(
+            arguments.analysis_reference_limit.unwrap_or(1_000_000),
+        );
+    }
+
+    let started = Instant::now();
+    let analysis = match source {
+        Source::Positional(file, _) => decoder.analyze_with_options(file, options)?,
+        Source::Stream(reader) => decoder.analyze_stream_with_options(reader.as_mut(), options)?,
+    };
+    let elapsed = started.elapsed();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    analyze_report::write_report(
+        &mut output,
+        &analysis,
+        analyze_report::Timings {
+            read_dynamic_header: std::time::Duration::ZERO,
+            read_data: elapsed,
+        },
+        arguments.verbose,
+    )?;
+    output.flush()?;
     Ok(())
 }
 
@@ -427,6 +529,10 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     }
     let name = source.display_name();
     let volume = Volume::from_flags(arguments.quiet, arguments.verbose);
+
+    if arguments.analyze {
+        return run_analyze(&arguments, &mut source);
+    }
 
     if let Some(export_path) = &arguments.export_index {
         if source.refers_to_path(export_path) {

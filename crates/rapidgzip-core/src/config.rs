@@ -6,8 +6,9 @@ use crate::gzip::StreamCursor;
 use crate::reader;
 use crate::runtime::RuntimeState;
 use crate::{
-    DecodeError, DecodeReport, DecoderReader, DeflateIndex, Format, IndexDecodeError, IndexOptions,
-    IndexedDecodeReport, IndexingDecoderReader, IndexingError, ReadAt,
+    Analysis, AnalyzeOptions, DecodeError, DecodeReport, DecoderReader, DeflateIndex, Format,
+    IndexDecodeError, IndexOptions, IndexedDecodeReport, IndexingDecoderReader, IndexingError,
+    ReadAt,
 };
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -303,6 +304,80 @@ impl Decoder {
         let mut sink = DirectOutput::new(output);
         let runtime = RuntimeState::new(self.config.decoder_threads);
         decode_source(source, &self.config, &cancelled, &mut sink, &runtime)
+    }
+
+    /// Analyzes every DEFLATE block using bounded default retention limits.
+    ///
+    /// The walk is sequential because each block depends on its predecessor
+    /// history. It validates the same container headers, checksums, sizes, and
+    /// trailing-data rules as decoding while retaining only one 32 KiB output
+    /// window. Use [`Self::analyze_with_options`] to change result limits or
+    /// retain individual predecessor-window references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] for input, framing, DEFLATE, integrity, output
+    /// expectation, or typed analysis-budget failures.
+    pub fn analyze<R>(&self, source: &R) -> Result<Analysis, DecodeError>
+    where
+        R: ReadAt + ?Sized,
+    {
+        self.analyze_with_options(source, AnalyzeOptions::default())
+    }
+
+    /// Analyzes every DEFLATE block with explicit retention limits.
+    ///
+    /// Detailed back-reference retention is input-wide. Exact summaries remain
+    /// available when that budget is exhausted, and each block records its
+    /// omitted detail count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] for input, framing, DEFLATE, integrity, output
+    /// expectation, or typed analysis-budget failures.
+    pub fn analyze_with_options<R>(
+        &self,
+        source: &R,
+        options: AnalyzeOptions,
+    ) -> Result<Analysis, DecodeError>
+    where
+        R: ReadAt + ?Sized,
+    {
+        crate::analyze::analyze_source(source, &self.config, options)
+    }
+
+    /// Analyzes a non-seekable compressed stream with default limits.
+    ///
+    /// Input and decompressed history remain bounded; unlike positional
+    /// analysis, a stream cannot be re-read if the caller later requests more
+    /// retained detail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] for input, framing, DEFLATE, integrity, output
+    /// expectation, or typed analysis-budget failures.
+    pub fn analyze_stream<R>(&self, source: R) -> Result<Analysis, DecodeError>
+    where
+        R: Read,
+    {
+        self.analyze_stream_with_options(source, AnalyzeOptions::default())
+    }
+
+    /// Analyzes a non-seekable compressed stream with explicit limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] for input, framing, DEFLATE, integrity, output
+    /// expectation, or typed analysis-budget failures.
+    pub fn analyze_stream_with_options<R>(
+        &self,
+        source: R,
+        options: AnalyzeOptions,
+    ) -> Result<Analysis, DecodeError>
+    where
+        R: Read,
+    {
+        crate::analyze::analyze_stream(source, &self.config, options)
     }
 
     /// Decodes the selected container while collecting a random-access index.

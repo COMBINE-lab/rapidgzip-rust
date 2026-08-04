@@ -24,6 +24,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Structural analysis now uses an inlined bit-buffer fast path and one bounded
+  linear history/checksum buffer. The default no-output-limit path is
+  monomorphized separately, avoiding configured-limit and redundant structural
+  counter checks for each symbol while preserving checked total output.
 - The `rapidgzip-rust` CLI now exposes rapidgzip-compatible decoding, counting,
   index import/export, range extraction, output, format, and reporting options.
   Imported indexes drive strict full-stream indexed decoding. Options whose
@@ -52,6 +56,20 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Bounded structural analysis through `Decoder::analyze`,
+  `Decoder::analyze_with_options`, and streaming counterparts. The structured,
+  deterministic result covers gzip/zlib/raw framing, every DEFLATE block,
+  dynamic Huffman alphabets, symbol composition, and exact predecessor-window
+  summaries while retaining only one 32 KiB output history. Concatenated and
+  empty gzip members and BGZF remain distinct and fully checksum-verified.
+- `AnalyzeOptions` and typed analysis errors for stream, block, aggregate
+  optional-header, and detailed-reference budgets, allocation failures, and
+  checked-counter overflow. Individual references are optional; exact counts,
+  length histograms, reach, coverage, and deterministic interval unions remain
+  available when detail is omitted.
+- `rapidgzip-rust --analyze`, including non-seekable input, bounded verbose
+  reference detail, rapidgzip 0.16.0-compatible presentation, pinned
+  differential CI, and a generated FASTQ-like analysis benchmark.
 - Opt-in newline counting through `DecoderBuilder::count_lines` and the new
   `DecodeReport::line_count` scalar, preserving `DecodeReport: Copy`. Combining
   counting with explicit index construction annotates every retained

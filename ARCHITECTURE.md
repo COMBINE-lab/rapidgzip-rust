@@ -78,6 +78,49 @@ is insufficient: block and character devices can implement seek while lacking
 the stable, known-length, concurrently readable snapshot required by `ReadAt`.
 Every non-regular path accepted by `File::open` uses the streaming engine.
 
+## Structural analysis
+
+Structural analysis is an explicit operation over the same positional and
+streaming input cursors. `AnalysisCursor` layers exact bit positions and a
+small look-ahead buffer over `InputCursor`; it does not materialize compressed
+input. The gzip analyzer calls the same header parser as ordinary decode in a
+detailed-retention mode, and format detection, reserved flags, FHCRC, BGZF
+metadata, zlib CMF/FLG, and trailing-data rules therefore have one source of
+truth.
+
+The block walker is deliberately sequential. It decodes literal and
+length/distance symbols in causal order into one linear 32 KiB history plus
+8 KiB pending-output buffer. Each output byte is written once; when the tail
+fills, it is checksummed and the newest history is compacted to the prefix.
+Output is discarded after it can no longer be referenced.
+gzip CRC32/ISIZE and zlib Adler-32 are checked before a stream result is
+published. Each gzip member resets its history and becomes one `StreamAnalysis`;
+empty members and BGZF's EOF member remain visible instead of being collapsed.
+
+The speculative native decoder and analyzer share monomorphized bit/Huffman
+primitives. The production `BitReader` keeps its slice-specialized unaligned
+word loads, while the analyzer supplies a bounded cursor implementation. There
+is no trait object or added branch in the ordinary hot loop. Dynamic code
+lengths are copied into the result only for analysis; ordinary marker decoding
+does not retain them.
+
+Result memory is explicit. `AnalyzeOptions` limits total streams, total blocks,
+input-wide optional gzip metadata, and input-wide detailed predecessor-window
+references. Collection growth uses fallible reservation. Output totals use
+checked arithmetic; symbol and reference counters are mathematically bounded
+by that checked total and avoid redundant overflow branches in the hot loop.
+Once the detailed-reference allowance is exhausted, the walker continues to
+compute exact counts, reference-length
+histograms, farthest reach, predecessor-window coverage, and deterministic
+interval-union counts. It records omitted detail per block.
+
+The core `Analysis` model contains deterministic facts and derives equality;
+it contains no wall-clock measurements or formatted text. The CLI measures its
+own invocation and renders a rapidgzip 0.16.0-compatible report in a separate
+module. Compatibility formatting does not constrain the library API, and the
+CLI intentionally fixes rapidgzip's unstable equal-distance interval merge.
+The complete design is recorded in `docs/design/deflate-analysis.md`.
+
 ## Random-access index construction
 
 Indexing is selected by operation (`decode_with_index` or

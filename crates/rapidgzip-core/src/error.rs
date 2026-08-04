@@ -4,6 +4,104 @@ use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::sync::Arc;
 
+/// An analysis-owned collection or byte budget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AnalysisResource {
+    /// Parsed container streams (gzip members, or one zlib/raw stream).
+    Streams,
+    /// Parsed DEFLATE blocks.
+    Blocks,
+    /// Retained optional gzip-header bytes.
+    HeaderBytes,
+    /// Retained Huffman code lengths.
+    AlphabetCodeLengths,
+    /// Retained individual back-reference records.
+    Backreferences,
+}
+
+impl Display for AnalysisResource {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Streams => "streams",
+            Self::Blocks => "DEFLATE blocks",
+            Self::HeaderBytes => "gzip header bytes",
+            Self::AlphabetCodeLengths => "Huffman code lengths",
+            Self::Backreferences => "back-reference records",
+        })
+    }
+}
+
+/// A checked counter maintained by structural analysis.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AnalysisCounter {
+    /// Absolute compressed bit positions and sizes.
+    CompressedBits,
+    /// Absolute decompressed byte positions and sizes.
+    DecompressedBytes,
+    /// Literal, copy, block, stream, or reference counts.
+    StructuralItems,
+}
+
+impl Display for AnalysisCounter {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::CompressedBits => "compressed-bit",
+            Self::DecompressedBytes => "decompressed-byte",
+            Self::StructuralItems => "structural-item",
+        })
+    }
+}
+
+/// The reason structural analysis stopped without accepting the input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AnalysisErrorKind {
+    /// A caller-configurable collection or metadata limit was reached.
+    ResourceLimit {
+        /// Limited resource.
+        resource: AnalysisResource,
+        /// Configured maximum number of items or bytes.
+        limit: usize,
+    },
+    /// A bounded collection could not reserve memory.
+    AllocationFailed {
+        /// Collection whose allocation failed.
+        resource: AnalysisResource,
+        /// Additional items or bytes requested from the allocator.
+        additional: usize,
+    },
+    /// An exact `u64` structural counter overflowed.
+    CounterOverflow {
+        /// Counter that could no longer represent the input.
+        counter: AnalysisCounter,
+    },
+}
+
+impl Display for AnalysisErrorKind {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResourceLimit { resource, limit } => {
+                write!(
+                    formatter,
+                    "{resource} exceeded the configured limit of {limit}"
+                )
+            }
+            Self::AllocationFailed {
+                resource,
+                additional,
+            } => write!(
+                formatter,
+                "could not reserve space for {additional} additional {resource}"
+            ),
+            Self::CounterOverflow { counter } => {
+                write!(formatter, "the {counter} analysis counter overflowed")
+            }
+        }
+    }
+}
+
 /// The reason a gzip container was rejected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -170,6 +268,11 @@ pub enum DecodeError {
         /// Detailed reason.
         reason: DeflateErrorKind,
     },
+    /// Structural analysis exhausted a configured budget or exact counter.
+    Analysis {
+        /// Typed resource or counter failure.
+        reason: AnalysisErrorKind,
+    },
     /// A member's CRC32 did not match its footer.
     ChecksumMismatch {
         /// Zero-based member number.
@@ -279,7 +382,14 @@ impl DecodeError {
             | Self::IndexOutputMismatch { .. }
             | Self::IndexLineMismatch { .. }
             | Self::IndexTotalLineMismatch { .. } => io::ErrorKind::InvalidData,
-            Self::OutputLimitExceeded { .. } => io::ErrorKind::FileTooLarge,
+            Self::OutputLimitExceeded { .. }
+            | Self::Analysis {
+                reason:
+                    AnalysisErrorKind::ResourceLimit { .. } | AnalysisErrorKind::AllocationFailed { .. },
+            } => io::ErrorKind::FileTooLarge,
+            Self::Analysis {
+                reason: AnalysisErrorKind::CounterOverflow { .. },
+            } => io::ErrorKind::InvalidData,
             Self::WorkerPanicked => io::ErrorKind::Other,
             Self::Cancelled => io::ErrorKind::Interrupted,
         }
@@ -319,6 +429,7 @@ impl Display for DecodeError {
                     "invalid DEFLATE data at bit {bit_offset}: {reason}"
                 )
             }
+            Self::Analysis { reason } => write!(formatter, "analysis failed: {reason}"),
             Self::ChecksumMismatch {
                 member,
                 expected,

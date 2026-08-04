@@ -162,6 +162,19 @@ fn decode_reader(criterion: &mut Criterion) {
     }
     group.finish();
 
+    let decoded = fastq_like_bytes(16 * 1024 * 1024);
+    let compressed: Arc<[u8]> = deflate_with_level(&decoded, 31, 6).into();
+    let decoder = Decoder::builder().decoder_threads(1).build().unwrap();
+    let mut group = criterion.benchmark_group("structural_analysis_fastq");
+    group.throughput(Throughput::Bytes(decoded.len() as u64));
+    group.bench_function("verified_decode", |bencher| {
+        bencher.iter(|| decoder.decode(&compressed, &mut io::sink()).unwrap());
+    });
+    group.bench_function("analyze", |bencher| {
+        bencher.iter(|| decoder.analyze(&compressed).unwrap());
+    });
+    group.finish();
+
     let decoded = fastq_like_bytes(32 * 1024 * 1024);
     let compressed: Arc<[u8]> = stored_bgzf(&decoded, 4 * 1024).into();
     for (name, build_index) in [("count", false), ("count_with_index", true)] {

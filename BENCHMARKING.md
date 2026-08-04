@@ -15,6 +15,52 @@ ratio between the two groups isolates indexing overhead on identical data.
 Record checkpoint count, serialized native-index size, and peak RSS alongside
 throughput when evaluating a release candidate.
 
+The `structural_analysis_fastq` group compares one-worker verified zlib-rs
+decode with the sequential structural walker on the same generated 16 MiB
+FASTQ-like gzip member. Both paths validate the complete container and discard
+decoded output; analysis additionally visits every symbol and retains its
+bounded structured block result. Record the `analyze / verified_decode` time
+ratio and peak RSS. This is an analyzer regression gate, not a parallel decode
+parity cell, because the dependency chain between DEFLATE blocks makes the
+structural walk intentionally sequential.
+
+### 2026-08-03 structural-analysis diagnostic
+
+The clean PR #12 replacement was checked on the dual-socket Xeon E5-2699 v4
+host and public `SRR22403185_2.fastq.gz` described below. The file contains
+96,754,995 compressed bytes and 361,815,302 decoded bytes. These were unpinned
+implementation diagnostics, not parallel decode parity results.
+
+The initial implementation used three release runs. The optimized build and
+both C++ controls used five interleaved release runs of the complete CLI
+report, with report output discarded. The medians were:
+
+| analyzer | elapsed | decoded throughput | peak RSS |
+|---|---:|---:|---:|
+| rapidgzip-rust, initial clean implementation | 2.68 s | 128.7 MiB/s | 7,256 KiB |
+| rapidgzip-rust, optimized | 1.70 s | 203.0 MiB/s | 7,292 KiB |
+| rapidgzip 0.16.0 | 1.71 s | 201.8 MiB/s | 17,724 KiB |
+| rapidgzip 0.16.0, ISA-L disabled | 1.74 s | 198.3 MiB/s | 8,812 KiB |
+
+The optimized Rust analyzer matches the reference on this input while using
+41% of the packaged ISA-L build's resident memory. Relative to the clean
+implementation, an inlined bit-buffer fast path, one linear history/checksum
+buffer, and output-limit specialization reduced elapsed time by 36.6% and the
+retired instruction count from approximately 24.3 billion to 12.6 billion.
+An analyzer-specific 11-bit Huffman/extra-bit cache was also tested and removed
+because its 1.85-second median regressed this workload. Bounded bulk LZ77
+overlap copies had previously reduced the Rust median from 3.20 s without
+retaining decoded output. The optimized generated 16 MiB FASTQ-like quick
+Criterion cell measured 8.54 ms, or 1.83 GiB/s, for analysis and 2.57 ms, or
+6.08 GiB/s, for verified zlib-rs decode; its highly repetitive
+sequence content makes bulk-copy gains larger than on the public file.
+
+The shared generic Huffman layer was separately checked against an untouched
+`main` build by alternating five complete 16-worker verified decodes of the
+public FASTQ input. Both medians were 0.24 s. Median user CPU was 2.00 s for the
+analysis branch and 2.05 s for `main`; wall time and noisy unpinned RSS show no
+ordinary decoder regression from the monomorphized abstraction.
+
 The paired `bgzf_line_count` and `bgzf_line_count_with_index` groups use a
 32 MiB FASTQ-like stream split into 4 KiB BGZF blocks (more than eight thousand
 retained checkpoints). Their ratio isolates checkpoint annotation from SIMD
