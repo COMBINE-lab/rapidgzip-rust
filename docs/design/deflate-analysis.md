@@ -202,11 +202,12 @@ the compatibility target.
 
 ## Safety
 
-The analyzer is safe Rust. History indices are used only after distance checks,
-fixed arrays carry the DEFLATE window and checksum staging, and cursor bit
-positions are checked. Sharing the generic Huffman layer does not move unsafe
-code into analysis or alter the production reader's existing unaligned-load
-safety proof. No caller must uphold a new unsafe contract.
+The analyzer uses one private unaligned `u64` load in the cursor's cold refill
+path. An eight-byte slice-length check precedes it, `read_unaligned` removes the
+alignment requirement, and `to_le` restores DEFLATE byte order. Short input
+tails use safe copying. History indices are used only after distance checks,
+and the fixed linear buffer carries both the 32 KiB reachable window and 8 KiB
+of pending checksum input. No caller must uphold an unsafe contract.
 
 ## Validation and performance gates
 

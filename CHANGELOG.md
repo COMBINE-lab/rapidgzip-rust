@@ -24,6 +24,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Structural analysis now uses an inlined bit-buffer fast path and one bounded
+  linear history/checksum buffer. The default no-output-limit path is
+  monomorphized separately, avoiding configured-limit and redundant structural
+  counter checks for each symbol while preserving checked total output.
 - The `rapidgzip-rust` CLI now exposes rapidgzip-compatible decoding, counting,
   index import/export, range extraction, output, format, and reporting options.
   Imported indexes drive strict full-stream indexed decoding. Options whose

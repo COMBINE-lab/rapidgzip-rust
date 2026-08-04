@@ -89,8 +89,10 @@ metadata, zlib CMF/FLG, and trailing-data rules therefore have one source of
 truth.
 
 The block walker is deliberately sequential. It decodes literal and
-length/distance symbols in causal order into a 32 KiB ring, feeds an 8 KiB
-checksum buffer, and discards output after it can no longer be referenced.
+length/distance symbols in causal order into one linear 32 KiB history plus
+8 KiB pending-output buffer. Each output byte is written once; when the tail
+fills, it is checksummed and the newest history is compacted to the prefix.
+Output is discarded after it can no longer be referenced.
 gzip CRC32/ISIZE and zlib Adler-32 are checked before a stream result is
 published. Each gzip member resets its history and becomes one `StreamAnalysis`;
 empty members and BGZF's EOF member remain visible instead of being collapsed.
@@ -104,9 +106,11 @@ does not retain them.
 
 Result memory is explicit. `AnalyzeOptions` limits total streams, total blocks,
 input-wide optional gzip metadata, and input-wide detailed predecessor-window
-references. Collection growth uses fallible reservation and structural
-counters use checked arithmetic. Once the detailed-reference allowance is
-exhausted, the walker continues to compute exact counts, reference-length
+references. Collection growth uses fallible reservation. Output totals use
+checked arithmetic; symbol and reference counters are mathematically bounded
+by that checked total and avoid redundant overflow branches in the hot loop.
+Once the detailed-reference allowance is exhausted, the walker continues to
+compute exact counts, reference-length
 histograms, farthest reach, predecessor-window coverage, and deterministic
 interval-union counts. It records omitted detail per block.
 

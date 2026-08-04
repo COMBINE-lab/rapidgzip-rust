@@ -11,17 +11,20 @@ resumable sequential decoder, is justified below; there is no manual `Sync`.
 
 ## Structural analysis
 
-Structural analysis adds no unsafe code. Its cursor fills a safe integer bit
-buffer through the existing bounded `InputCursor` interface, and its output
-history is a fixed 32 KiB array indexed only after validating every DEFLATE
-distance against both the declared zlib window and the bytes actually
-available. Result vectors use checked retention limits and fallible reserve.
+Structural analysis uses one private unaligned input load in its refill slow
+path. It executes only after `available.len() >= 8` proves that a complete
+initialized `u64` lies at the slice pointer. `read_unaligned` removes the
+alignment requirement, and `to_le` normalizes the loaded word before the
+cursor masks off only the bytes it consumes. A shorter page uses a local array
+and safe slice copying instead.
 
-The analyzer shares generic Huffman construction and lookup with the native
-speculative decoder. Monomorphization preserves the latter's existing audited
-`word_at` implementation; analysis itself never invokes an unaligned pointer
-load. The unsafe argument for production native bit loads remains the one under
-“Native DEFLATE bit loads” below and is not broadened by the shared trait.
+Decoded output stays in a fixed 40 KiB linear allocation: 32 KiB of reachable
+history and at most 8 KiB awaiting a checksum update. Every DEFLATE distance is
+validated against both the declared zlib window and available history before
+it selects a safe `copy_within` range. Result vectors use checked retention
+limits and fallible reserve. Symbol and reference counters cannot exceed the
+checked total output count, which is established before their direct
+increments.
 
 ## zlib-rs ABI adapter
 
@@ -116,8 +119,9 @@ randomized contents, and every starting-address displacement from zero through
 
 ## Native DEFLATE bit loads
 
-The hot bit reader and Huffman peek perform an unaligned `u64` load only after
-proving that eight bytes remain beginning at the requested offset.
+The production bit reader and analyzer refill path perform an unaligned `u64`
+load only after proving that eight bytes remain beginning at the requested
+offset.
 `read_unaligned` removes the alignment requirement; conversion with `to_le`
 gives the RFC 1951 stream bit order on every target. A read requests at most 24
 bits and a peek at most 15, so either fits in the loaded word even at the

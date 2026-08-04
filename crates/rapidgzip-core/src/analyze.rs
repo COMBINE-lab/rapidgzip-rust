@@ -6,9 +6,9 @@
 //! single-threaded: a block's history depends on every preceding block in its
 //! stream.
 //!
-//! Memory does not scale with decompressed size. The walker keeps one 32 KiB
-//! history window, a small checksum buffer, the bounded result collections,
-//! and the caller-configured number of detailed back-reference records.
+//! Memory does not scale with decompressed size. The walker keeps one bounded
+//! linear history/output buffer, the bounded result collections, and the
+//! caller-configured number of detailed back-reference records.
 
 use crate::backend::resolve_cursor_format;
 use crate::crc32::Crc32;
@@ -423,7 +423,9 @@ impl<C: InputCursor> AnalysisCursor<C> {
         self.bit_position
     }
 
-    fn fill_to(&mut self, wanted: u8) -> Result<(), DecodeError> {
+    #[cold]
+    #[inline(never)]
+    fn refill_bits(&mut self, wanted: u8) -> Result<(), DecodeError> {
         self.check_position()?;
         while self.buffered_bits < wanted {
             let available = self.inner.available()?;
@@ -432,13 +434,34 @@ impl<C: InputCursor> AnalysisCursor<C> {
             if count == 0 {
                 break;
             }
-            for (index, &byte) in available[..count].iter().enumerate() {
-                self.bits |= u64::from(byte) << (self.buffered_bits as usize + index * 8);
-            }
+            let word = if available.len() >= std::mem::size_of::<u64>() {
+                // SAFETY: `available.len() >= 8` proves that the unaligned
+                // eight-byte load is wholly inside the initialized slice.
+                // `read_unaligned` has no alignment requirement, and `to_le`
+                // normalizes the word before DEFLATE's least-significant-bit
+                // extraction.
+                unsafe { available.as_ptr().cast::<u64>().read_unaligned() }.to_le()
+            } else {
+                let mut tail = [0_u8; 8];
+                tail[..count].copy_from_slice(&available[..count]);
+                u64::from_le_bytes(tail)
+            };
+            let refill_bits = count * 8;
+            let mask = (1_u64 << refill_bits) - 1;
+            self.bits |= (word & mask) << self.buffered_bits;
             self.buffered_bits += u8::try_from(count * 8).expect("at most seven bytes fit");
             self.inner.advance(count);
         }
         Ok(())
+    }
+
+    #[inline(always)]
+    fn fill_to(&mut self, wanted: u8) -> Result<(), DecodeError> {
+        if self.buffered_bits >= wanted && !self.position_overflowed {
+            Ok(())
+        } else {
+            self.refill_bits(wanted)
+        }
     }
 
     fn check_position(&self) -> Result<(), DecodeError> {
@@ -453,6 +476,7 @@ impl<C: InputCursor> AnalysisCursor<C> {
         }
     }
 
+    #[inline(always)]
     fn consume_buffered(&mut self, count: u8) -> Result<(), DecodeError> {
         if count > self.buffered_bits {
             return Err(self.deflate_error(deflate::Error::UnexpectedEof));
@@ -493,8 +517,8 @@ impl<C: InputCursor> AnalysisCursor<C> {
 impl<C: InputCursor> DeflateBits for AnalysisCursor<C> {
     type Error = DecodeError;
 
+    #[inline(always)]
     fn read_bits(&mut self, count: u8) -> Result<u32, Self::Error> {
-        self.check_position()?;
         debug_assert!(count <= 24);
         self.fill_to(count)?;
         if self.buffered_bits < count {
@@ -506,6 +530,7 @@ impl<C: InputCursor> DeflateBits for AnalysisCursor<C> {
         Ok(value)
     }
 
+    #[inline(always)]
     fn peek_bits_padded(&mut self, count: u8) -> Result<(u32, u8), Self::Error> {
         self.fill_to(count)?;
         let available = self.buffered_bits.min(count);
@@ -513,11 +538,12 @@ impl<C: InputCursor> DeflateBits for AnalysisCursor<C> {
         Ok(((self.bits & mask) as u32, available))
     }
 
+    #[inline(always)]
     fn advance_bits(&mut self, count: u8) -> Result<(), Self::Error> {
-        self.check_position()?;
         self.consume_buffered(count)
     }
 
+    #[inline(always)]
     fn error(&self, error: deflate::Error) -> Self::Error {
         self.deflate_error(error)
     }
@@ -591,119 +617,131 @@ enum StreamChecksum {
 }
 
 struct OutputState {
-    history: [u8; WINDOW_SIZE],
+    // The prefix is predecessor history and the tail is new output awaiting a
+    // checksum update. Keeping both in one linear allocation lets literals and
+    // matches be written exactly once. When the tail fills, the checksum is
+    // advanced and the newest 32 KiB is compacted back to the prefix.
+    bytes: [u8; WINDOW_SIZE + CHECKSUM_BUFFER_SIZE],
     history_length: usize,
-    next_history: usize,
+    write_position: usize,
+    checksum_start: usize,
     maximum_distance: usize,
     checksum: StreamChecksum,
-    checksum_buffer: [u8; CHECKSUM_BUFFER_SIZE],
-    checksum_length: usize,
     stream_size: u64,
 }
 
 impl OutputState {
     fn new(maximum_distance: usize, checksum: StreamChecksum) -> Self {
         Self {
-            history: [0; WINDOW_SIZE],
+            bytes: [0; WINDOW_SIZE + CHECKSUM_BUFFER_SIZE],
             history_length: 0,
-            next_history: 0,
+            write_position: 0,
+            checksum_start: 0,
             maximum_distance,
             checksum,
-            checksum_buffer: [0; CHECKSUM_BUFFER_SIZE],
-            checksum_length: 0,
             stream_size: 0,
         }
     }
 
-    fn prepare_output(
+    #[inline(always)]
+    fn prepare_output<const CHECK_CONFIGURED_LIMITS: bool>(
         &mut self,
         total_output: &mut u64,
         additional: usize,
         config: &crate::config::Config,
     ) -> Result<(), DecodeError> {
-        *total_output = config.checked_output_total(*total_output, additional)?;
-        self.stream_size =
-            self.stream_size
+        let actual = if CHECK_CONFIGURED_LIMITS {
+            config.checked_output_total(*total_output, additional)?
+        } else {
+            total_output
                 .checked_add(additional as u64)
-                .ok_or(DecodeError::Analysis {
-                    reason: AnalysisErrorKind::CounterOverflow {
-                        counter: AnalysisCounter::DecompressedBytes,
-                    },
-                })?;
+                .ok_or(DecodeError::OutputLimitExceeded { limit: u64::MAX })?
+        };
+        *total_output = actual;
+        // A stream's output is a subset of total output. The checked total
+        // addition above therefore proves that this addition cannot overflow.
+        self.stream_size += additional as u64;
         Ok(())
     }
 
     #[inline(always)]
-    fn emit(&mut self, byte: u8) {
-        self.history[self.next_history] = byte;
-        self.next_history = (self.next_history + 1) & (WINDOW_SIZE - 1);
-        self.history_length = (self.history_length + 1).min(WINDOW_SIZE);
-        self.checksum_buffer[self.checksum_length] = byte;
-        self.checksum_length += 1;
-        if self.checksum_length == self.checksum_buffer.len() {
-            self.flush_checksum();
+    fn ensure_space(&mut self, additional: usize) {
+        debug_assert!(additional <= 258);
+        if self.write_position + additional > self.bytes.len() {
+            self.roll_buffer();
         }
+        debug_assert!(self.write_position + additional <= self.bytes.len());
+    }
+
+    #[inline(always)]
+    fn emit(&mut self, byte: u8) {
+        self.ensure_space(1);
+        self.bytes[self.write_position] = byte;
+        self.write_position += 1;
+        self.history_length = (self.history_length + 1).min(WINDOW_SIZE);
     }
 
     fn append_bytes(&mut self, bytes: &[u8]) {
         let mut offset = 0;
         while offset < bytes.len() {
-            let count = (bytes.len() - offset).min(WINDOW_SIZE - self.next_history);
-            self.history[self.next_history..self.next_history + count]
+            if self.write_position == self.bytes.len() {
+                self.roll_buffer();
+            }
+            let count = (bytes.len() - offset).min(self.bytes.len() - self.write_position);
+            self.bytes[self.write_position..self.write_position + count]
                 .copy_from_slice(&bytes[offset..offset + count]);
-            self.next_history = (self.next_history + count) & (WINDOW_SIZE - 1);
+            self.write_position += count;
             self.history_length = (self.history_length + count).min(WINDOW_SIZE);
             offset += count;
         }
-
-        let mut offset = 0;
-        while offset < bytes.len() {
-            let count =
-                (bytes.len() - offset).min(self.checksum_buffer.len() - self.checksum_length);
-            self.checksum_buffer[self.checksum_length..self.checksum_length + count]
-                .copy_from_slice(&bytes[offset..offset + count]);
-            self.checksum_length += count;
-            offset += count;
-            if self.checksum_length == self.checksum_buffer.len() {
-                self.flush_checksum();
-            }
-        }
     }
 
-    fn copy(&mut self, distance: usize, length: usize) -> Result<(), DecodeError> {
-        if distance == 0 || distance > self.maximum_distance || distance > self.history_length {
-            return Err(DecodeError::InvalidDeflate {
-                bit_offset: 0,
-                reason: DeflateErrorKind::InvalidData,
-            });
+    #[inline]
+    fn copy_match(&mut self, distance: usize, length: usize) {
+        debug_assert!(distance != 0);
+        debug_assert!(distance <= self.maximum_distance);
+        debug_assert!(distance <= self.history_length);
+        self.ensure_space(length);
+        let destination = self.write_position;
+        let source = destination - distance;
+        if distance == 1 {
+            let byte = self.bytes[source];
+            self.bytes[destination..destination + length].fill(byte);
+        } else if length <= distance {
+            self.bytes.copy_within(source..source + length, destination);
+        } else {
+            self.bytes
+                .copy_within(source..source + distance, destination);
+            let mut produced = distance;
+            while produced < length {
+                let count = produced.min(length - produced);
+                self.bytes
+                    .copy_within(destination..destination + count, destination + produced);
+                produced += count;
+            }
         }
-
-        let mut copied = [0_u8; 258];
-        let first_period = distance.min(length);
-        let source = self.next_history.wrapping_sub(distance) & (WINDOW_SIZE - 1);
-        let first = first_period.min(WINDOW_SIZE - source);
-        copied[..first].copy_from_slice(&self.history[source..source + first]);
-        if first < first_period {
-            copied[first..first_period].copy_from_slice(&self.history[..first_period - first]);
-        }
-        let mut produced = first_period;
-        while produced < length {
-            let count = produced.min(length - produced);
-            copied.copy_within(..count, produced);
-            produced += count;
-        }
-        self.append_bytes(&copied[..length]);
-        Ok(())
+        self.write_position += length;
+        self.history_length = (self.history_length + length).min(WINDOW_SIZE);
     }
 
     fn flush_checksum(&mut self) {
-        let bytes = &self.checksum_buffer[..self.checksum_length];
+        let bytes = &self.bytes[self.checksum_start..self.write_position];
         match &mut self.checksum {
             StreamChecksum::Gzip(checksum) => checksum.update(bytes),
             StreamChecksum::Zlib(checksum) => checksum.update(bytes),
             StreamChecksum::None => {}
         }
-        self.checksum_length = 0;
+        self.checksum_start = self.write_position;
+    }
+
+    #[cold]
+    fn roll_buffer(&mut self) {
+        self.flush_checksum();
+        let history_start = self.write_position - self.history_length;
+        self.bytes
+            .copy_within(history_start..self.write_position, 0);
+        self.write_position = self.history_length;
+        self.checksum_start = self.write_position;
     }
 
     fn finish_checksum(mut self) -> (StreamChecksum, u64) {
@@ -757,15 +795,6 @@ fn reserve_item<T>(
     })
 }
 
-fn checked_increment(value: &mut u64) -> Result<(), DecodeError> {
-    *value = value.checked_add(1).ok_or(DecodeError::Analysis {
-        reason: AnalysisErrorKind::CounterOverflow {
-            counter: AnalysisCounter::StructuralItems,
-        },
-    })?;
-    Ok(())
-}
-
 fn alphabet_shape(bytes: &[u8], declared_count: usize) -> Result<AlphabetShape, DecodeError> {
     let mut code_lengths = Vec::new();
     code_lengths
@@ -795,19 +824,21 @@ fn record_window_reference(
         distance: u16::try_from(distance).expect("DEFLATE distances fit u16"),
         length: u16::try_from(length).expect("DEFLATE lengths fit u16"),
     };
-    checked_increment(&mut block.window_backreference_count)?;
+    // Every count below is bounded by the number of decoded output symbols.
+    // `prepare_output` has already proved that total output fits in `u64`.
+    block.window_backreference_count += 1;
     block.farthest_backreference = block.farthest_backreference.max(distance as u64);
     let length_count = global_lengths
         .get_mut(length)
         .expect("DEFLATE reference lengths do not exceed 258");
-    checked_increment(length_count)?;
+    *length_count += 1;
 
     let begin = WINDOW_SIZE - distance;
     let end = begin.saturating_add(length).min(WINDOW_SIZE);
     coverage[begin..end].fill(true);
 
     if *remaining == 0 {
-        checked_increment(&mut block.omitted_backreference_count)?;
+        block.omitted_backreference_count += 1;
         return Ok(());
     }
     block
@@ -834,7 +865,7 @@ fn coverage_groups(coverage: &[bool; WINDOW_SIZE]) -> u64 {
         .1
 }
 
-fn analyze_compressed_symbols<C: InputCursor>(
+fn analyze_compressed_symbols<C: InputCursor, const CHECK_CONFIGURED_LIMITS: bool>(
     cursor: &mut AnalysisCursor<C>,
     trees: (&Huffman, &Huffman),
     output: &mut OutputState,
@@ -847,8 +878,13 @@ fn analyze_compressed_symbols<C: InputCursor>(
     loop {
         match literal_tree.decode(cursor)? {
             symbol @ 0..=255 => {
-                output.prepare_output(&mut state.total_output, 1, state.config)?;
-                checked_increment(&mut block.literal_symbols)?;
+                output.prepare_output::<CHECK_CONFIGURED_LIMITS>(
+                    &mut state.total_output,
+                    1,
+                    state.config,
+                )?;
+                // This is bounded by total output, whose increment was checked.
+                block.literal_symbols += 1;
                 output.emit(symbol as u8);
             }
             END_OF_BLOCK => return Ok(()),
@@ -868,18 +904,15 @@ fn analyze_compressed_symbols<C: InputCursor>(
                 {
                     return Err(cursor.deflate_error(deflate::Error::InvalidDistance));
                 }
-                checked_increment(&mut block.backreference_symbols)?;
-                block.copied_bytes =
-                    block
-                        .copied_bytes
-                        .checked_add(length as u64)
-                        .ok_or(DecodeError::Analysis {
-                            reason: AnalysisErrorKind::CounterOverflow {
-                                counter: AnalysisCounter::StructuralItems,
-                            },
-                        })?;
-
                 let position_in_block = state.total_output - block_output_start;
+                output.prepare_output::<CHECK_CONFIGURED_LIMITS>(
+                    &mut state.total_output,
+                    length,
+                    state.config,
+                )?;
+                // Both counters are bounded by checked total output.
+                block.backreference_symbols += 1;
+                block.copied_bytes += length as u64;
                 if distance as u64 > position_in_block {
                     let preceding_distance = distance as u64 - position_in_block;
                     let reported_length = length.min(distance);
@@ -893,17 +926,14 @@ fn analyze_compressed_symbols<C: InputCursor>(
                     )?;
                 }
 
-                output.prepare_output(&mut state.total_output, length, state.config)?;
-                output
-                    .copy(distance, length)
-                    .map_err(|_| cursor.deflate_error(deflate::Error::InvalidDistance))?;
+                output.copy_match(distance, length);
             }
             _ => return Err(cursor.deflate_error(deflate::Error::InvalidSymbol)),
         }
     }
 }
 
-fn analyze_block<C: InputCursor>(
+fn analyze_block<C: InputCursor, const CHECK_CONFIGURED_LIMITS: bool>(
     cursor: &mut AnalysisCursor<C>,
     output: &mut OutputState,
     state: &mut AnalyzeState<'_>,
@@ -934,7 +964,11 @@ fn analyze_block<C: InputCursor>(
                 return Err(cursor.deflate_error(deflate::Error::InvalidStoredLength));
             }
             block.compressed_data_offset_in_bits = cursor.bit_position();
-            output.prepare_output(&mut state.total_output, usize::from(length), state.config)?;
+            output.prepare_output::<CHECK_CONFIGURED_LIMITS>(
+                &mut state.total_output,
+                usize::from(length),
+                state.config,
+            )?;
             let mut remaining = usize::from(length);
             while remaining != 0 {
                 let available = cursor.available()?;
@@ -951,7 +985,7 @@ fn analyze_block<C: InputCursor>(
             block.block_type = BlockType::FixedHuffman;
             block.compressed_data_offset_in_bits = cursor.bit_position();
             let (literal, distance) = fixed_trees();
-            analyze_compressed_symbols(
+            analyze_compressed_symbols::<_, CHECK_CONFIGURED_LIMITS>(
                 cursor,
                 (literal, distance),
                 output,
@@ -976,7 +1010,7 @@ fn analyze_block<C: InputCursor>(
                 &declared.lengths[literal_end..distance_end],
                 declared.distance_count,
             )?);
-            analyze_compressed_symbols(
+            analyze_compressed_symbols::<_, CHECK_CONFIGURED_LIMITS>(
                 cursor,
                 (&literal_tree, &distance_tree),
                 output,
@@ -1073,7 +1107,7 @@ fn read_zlib_footer<C: InputCursor>(
     Ok(bytes)
 }
 
-fn analyze_one_stream<C: InputCursor>(
+fn analyze_one_stream<C: InputCursor, const CHECK_CONFIGURED_LIMITS: bool>(
     cursor: &mut AnalysisCursor<C>,
     state: &mut AnalyzeState<'_>,
     format: Format,
@@ -1114,7 +1148,13 @@ fn analyze_one_stream<C: InputCursor>(
     let mut block_index = 0_u64;
     loop {
         state.reserve_block()?;
-        let block = analyze_block(cursor, &mut output, state, stream_index, block_index)?;
+        let block = analyze_block::<_, CHECK_CONFIGURED_LIMITS>(
+            cursor,
+            &mut output,
+            state,
+            stream_index,
+            block_index,
+        )?;
         let final_block = block.is_final;
         state.analysis.blocks.push(block);
         block_index = block_index.checked_add(1).ok_or(DecodeError::Analysis {
@@ -1195,7 +1235,7 @@ fn analyze_one_stream<C: InputCursor>(
     Ok(())
 }
 
-fn analyze_cursor<C: InputCursor>(
+fn analyze_cursor_mode<C: InputCursor, const CHECK_CONFIGURED_LIMITS: bool>(
     cursor: C,
     config: &crate::config::Config,
     options: AnalyzeOptions,
@@ -1227,11 +1267,11 @@ fn analyze_cursor<C: InputCursor>(
                 });
             }
             while !cursor.is_at_end()? {
-                analyze_one_stream(&mut cursor, &mut state, format)?;
+                analyze_one_stream::<_, CHECK_CONFIGURED_LIMITS>(&mut cursor, &mut state, format)?;
             }
         }
         Format::Zlib | Format::RawDeflate => {
-            analyze_one_stream(&mut cursor, &mut state, format)?;
+            analyze_one_stream::<_, CHECK_CONFIGURED_LIMITS>(&mut cursor, &mut state, format)?;
             if !cursor.is_at_end()? {
                 return Err(match format {
                     Format::Zlib => DecodeError::InvalidZlib {
@@ -1253,6 +1293,21 @@ fn analyze_cursor<C: InputCursor>(
     state.analysis.uncompressed_size_in_bytes = state.total_output;
     state.analysis.compressed_size_in_bytes = cursor.position();
     Ok(state.analysis)
+}
+
+fn analyze_cursor<C: InputCursor>(
+    cursor: C,
+    config: &crate::config::Config,
+    options: AnalyzeOptions,
+) -> Result<Analysis, DecodeError> {
+    // Specializing once per operation keeps the common unconstrained walk
+    // free of two Option checks for every decoded symbol. The constrained
+    // version retains the exact configured-limit error precedence.
+    if config.output_limit.is_some() || config.expected_uncompressed_size.is_some() {
+        analyze_cursor_mode::<_, true>(cursor, config, options)
+    } else {
+        analyze_cursor_mode::<_, false>(cursor, config, options)
+    }
 }
 
 pub(crate) fn analyze_source<R: ReadAt + ?Sized>(
@@ -1288,18 +1343,12 @@ mod tests {
     use super::{OutputState, StreamChecksum, WINDOW_SIZE};
 
     fn ordered_history(output: &OutputState) -> Vec<u8> {
-        let start = if output.history_length == WINDOW_SIZE {
-            output.next_history
-        } else {
-            0
-        };
-        (0..output.history_length)
-            .map(|offset| output.history[(start + offset) & (WINDOW_SIZE - 1)])
-            .collect()
+        let start = output.write_position - output.history_length;
+        output.bytes[start..output.write_position].to_vec()
     }
 
     #[test]
-    fn bulk_match_copy_matches_naive_overlap_across_ring_wraps() {
+    fn bulk_match_copy_matches_naive_overlap_across_buffer_rolls() {
         let mut expected: Vec<u8> = (0..WINDOW_SIZE + 173)
             .map(|index| (index.wrapping_mul(37) >> 3) as u8)
             .collect();
@@ -1318,7 +1367,7 @@ mod tests {
                 let byte = expected[expected.len() - distance];
                 expected.push(byte);
             }
-            output.copy(distance, length).expect("valid match");
+            output.copy_match(distance, length);
             let suffix = &expected[expected.len() - WINDOW_SIZE..];
             assert_eq!(ordered_history(&output), suffix);
         }

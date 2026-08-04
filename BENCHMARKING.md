@@ -31,19 +31,28 @@ host and public `SRR22403185_2.fastq.gz` described below. The file contains
 96,754,995 compressed bytes and 361,815,302 decoded bytes. These were unpinned
 implementation diagnostics, not parallel decode parity results.
 
-Three release runs of the complete CLI report, with report output discarded,
-produced these medians:
+The initial implementation used three release runs. The optimized build and
+both C++ controls used five interleaved release runs of the complete CLI
+report, with report output discarded. The medians were:
 
 | analyzer | elapsed | decoded throughput | peak RSS |
 |---|---:|---:|---:|
-| rapidgzip-rust | 2.68 s | 128.7 MiB/s | 7,256 KiB |
-| rapidgzip 0.16.0 | 1.71 s | 201.8 MiB/s | 17,640 KiB |
+| rapidgzip-rust, initial clean implementation | 2.68 s | 128.7 MiB/s | 7,256 KiB |
+| rapidgzip-rust, optimized | 1.70 s | 203.0 MiB/s | 7,292 KiB |
+| rapidgzip 0.16.0 | 1.71 s | 201.8 MiB/s | 17,724 KiB |
+| rapidgzip 0.16.0, ISA-L disabled | 1.74 s | 198.3 MiB/s | 8,812 KiB |
 
-The Rust analyzer is 1.57 times slower on this input but uses 41% of the
-reference's resident memory. Bounded bulk LZ77 overlap copies reduced the Rust
-median from 3.20 s without retaining decoded output. The generated 16 MiB
-FASTQ-like quick Criterion cell measured 11.26 ms, or 1.39 GiB/s, for analysis
-and 2.57 ms, or 6.09 GiB/s, for verified zlib-rs decode; its highly repetitive
+The optimized Rust analyzer matches the reference on this input while using
+41% of the packaged ISA-L build's resident memory. Relative to the clean
+implementation, an inlined bit-buffer fast path, one linear history/checksum
+buffer, and output-limit specialization reduced elapsed time by 36.6% and the
+retired instruction count from approximately 24.3 billion to 12.6 billion.
+An analyzer-specific 11-bit Huffman/extra-bit cache was also tested and removed
+because its 1.85-second median regressed this workload. Bounded bulk LZ77
+overlap copies had previously reduced the Rust median from 3.20 s without
+retaining decoded output. The optimized generated 16 MiB FASTQ-like quick
+Criterion cell measured 8.54 ms, or 1.83 GiB/s, for analysis and 2.57 ms, or
+6.08 GiB/s, for verified zlib-rs decode; its highly repetitive
 sequence content makes bulk-copy gains larger than on the public file.
 
 The shared generic Huffman layer was separately checked against an untouched
