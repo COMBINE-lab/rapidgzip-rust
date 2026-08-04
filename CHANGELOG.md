@@ -73,10 +73,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unfavorable workloads on zlib-rs, and preserves specialized BGZF, stored,
   and dense-member routing. `DecoderPath::MarkerAdmission` exposes the
   transient decision through existing telemetry.
-- The unreleased random-access API now uses the format-neutral `DeflateIndex`
-  name instead of `GzipIndex`. This, the new mandatory `DecodeReport::format`
-  field, and multi-format index provenance are planned for the next minor
-  release rather than a patch release.
+- The random-access API uses the format-neutral `DeflateIndex` name instead of
+  `GzipIndex`. This, the new mandatory `DecodeReport::format` field, and
+  multi-format index provenance ship in 0.2.0 rather than a 0.1.x patch.
 
 ### Added
 
