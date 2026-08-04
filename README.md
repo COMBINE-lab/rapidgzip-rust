@@ -50,16 +50,15 @@ DEFLATE explicitly, or opt into detection between gzip and zlib:
 ```rust
 use rapidgzip_core::{Decoder, Format};
 
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-let zlib = Decoder::builder().format(Format::Zlib).build()?;
-let raw = Decoder::builder()
-    .format(Format::RawDeflate)
-    .expected_uncompressed_size(Some(1_000_000))
-    .build()?;
-let detected = Decoder::builder().auto_detect_format().build()?;
-# let _ = (zlib, raw, detected);
-# Ok(())
-# }
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _zlib = Decoder::builder().format(Format::Zlib).build()?;
+    let _raw = Decoder::builder()
+        .format(Format::RawDeflate)
+        .expected_uncompressed_size(Some(1_000_000))
+        .build()?;
+    let _detected = Decoder::builder().auto_detect_format().build()?;
+    Ok(())
+}
 ```
 
 Auto-detection performs an exact, non-consuming two-byte check and never
@@ -248,20 +247,20 @@ an explicit operation, so ordinary decoding and its small `Copy`
 use rapidgzip_core::{AnalyzeOptions, Decoder};
 use std::fs::File;
 
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-let source = File::open("reads.fastq.gz")?;
-let options = AnalyzeOptions::default()
-    .maximum_blocks(250_000)
-    .maximum_retained_backreferences(10_000);
-let analysis = Decoder::default().analyze_with_options(&source, options)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let source = File::open("reads.fastq.gz")?;
+    let options = AnalyzeOptions::default()
+        .maximum_blocks(250_000)
+        .maximum_retained_backreferences(10_000);
+    let analysis = Decoder::default().analyze_with_options(&source, options)?;
 
-println!("{} members", analysis.streams.len());
-for (kind, count) in analysis.block_type_counts() {
-    println!("{kind:?}: {count}");
+    println!("{} members", analysis.streams.len());
+    for (kind, count) in analysis.block_type_counts() {
+        println!("{kind:?}: {count}");
+    }
+    assert_eq!(analysis.compressed_size_in_bytes, source.metadata()?.len());
+    Ok(())
 }
-assert_eq!(analysis.compressed_size_in_bytes, source.metadata()?.len());
-# Ok(())
-# }
 ```
 
 The default result retains up to 100,000 streams, 100,000 blocks, and 1 MiB of
