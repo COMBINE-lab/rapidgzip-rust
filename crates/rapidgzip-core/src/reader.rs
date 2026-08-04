@@ -2,6 +2,7 @@ use crate::backend::{
     LineCounter, Output, SequentialDecoder, SequentialItem, decode_source,
     decode_source_with_index, validate_initial_stream,
 };
+use crate::buffer_pool::ByteBufferPool;
 use crate::config::Config;
 use crate::gzip::StreamCursor;
 use crate::index::{DeflateIndex, IndexCollector, IndexOptions};
@@ -19,9 +20,78 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 enum Message {
-    Data(Vec<u8>),
+    Data(ReaderChunk),
     Finished(Completion),
     Failed(Failure),
+}
+
+enum ReaderChunk {
+    Unpooled(Vec<u8>),
+    Pooled(PooledChunk),
+}
+
+impl ReaderChunk {
+    const fn unpooled(bytes: Vec<u8>) -> Self {
+        Self::Unpooled(bytes)
+    }
+
+    fn pooled(bytes: Vec<u8>, pool: Arc<ByteBufferPool>) -> Self {
+        Self::Pooled(PooledChunk {
+            bytes: Some(bytes),
+            pool,
+        })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Unpooled(bytes) => bytes,
+            Self::Pooled(chunk) => chunk
+                .bytes
+                .as_deref()
+                .expect("a live pooled chunk always owns its bytes"),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Unpooled(bytes) => bytes.clear(),
+            Self::Pooled(chunk) => chunk
+                .bytes
+                .as_mut()
+                .expect("a live pooled chunk always owns its bytes")
+                .clear(),
+        }
+    }
+
+    fn take_unpooled(&mut self) -> Vec<u8> {
+        match self {
+            Self::Unpooled(bytes) => std::mem::take(bytes),
+            Self::Pooled(_) => unreachable!("streaming readers never receive pooled chunks"),
+        }
+    }
+}
+
+impl Default for ReaderChunk {
+    fn default() -> Self {
+        Self::Unpooled(Vec::new())
+    }
+}
+
+struct PooledChunk {
+    bytes: Option<Vec<u8>>,
+    pool: Arc<ByteBufferPool>,
+}
+
+impl Drop for PooledChunk {
+    fn drop(&mut self) {
+        if let Some(bytes) = self.bytes.take() {
+            self.pool.recycle(bytes);
+        }
+    }
 }
 
 enum Completion {
@@ -38,6 +108,8 @@ struct ChannelOutput {
     sender: SyncSender<Message>,
     cancelled: Arc<AtomicBool>,
     runtime: Arc<RuntimeState>,
+    pool: Arc<ByteBufferPool>,
+    decoded_chunk_size: usize,
 }
 
 impl ChannelOutput {
@@ -69,9 +141,19 @@ impl ChannelOutput {
 impl Output for ChannelOutput {
     fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError> {
         let byte_count = chunk.len();
-        self.send(Message::Data(chunk))?;
+        self.send(Message::Data(ReaderChunk::unpooled(chunk)))?;
         self.runtime.add_decompressed_bytes(byte_count);
         Ok(())
+    }
+
+    fn emit_reusable(&mut self, chunk: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
+        let byte_count = chunk.len();
+        self.send(Message::Data(ReaderChunk::pooled(
+            chunk,
+            Arc::clone(&self.pool),
+        )))?;
+        self.runtime.add_decompressed_bytes(byte_count);
+        Ok(self.pool.take(self.decoded_chunk_size))
     }
 }
 
@@ -96,12 +178,18 @@ enum Terminal {
 /// and joined on drop. A non-seekable source is decoded synchronously as this
 /// reader is pulled, so dropping it immediately drops the source and never
 /// leaves a blocked coordinator thread behind.
+///
+/// Reusable positional output allocations make a bounded ownership round trip
+/// through the reader handoff. Capacity is returned only after the reader has
+/// finished observing that chunk; cancellation and queued-message destruction
+/// release it by the same path. The private pool retains at most two configured
+/// decoded chunks and never changes output or verification semantics.
 #[must_use]
 pub struct DecoderReader {
     mode: ReaderMode,
     cancelled: Arc<AtomicBool>,
     handle: DecoderHandle,
-    current: Vec<u8>,
+    current: ReaderChunk,
     current_offset: usize,
     terminal: Terminal,
 }
@@ -125,6 +213,7 @@ fn spawn_coordinator<F>(
     decode: F,
     in_flight_chunks: usize,
     configured_workers: usize,
+    decoded_chunk_size: usize,
 ) -> Result<DecoderReader, DecodeError>
 where
     F: FnOnce(
@@ -138,6 +227,10 @@ where
     let (sender, receiver) = mpsc::sync_channel(in_flight_chunks);
     let cancelled = Arc::new(AtomicBool::new(false));
     let runtime = RuntimeState::new(configured_workers);
+    let pool = Arc::new(ByteBufferPool::for_reader(
+        decoded_chunk_size,
+        in_flight_chunks,
+    ));
     let handle = DecoderHandle::new(Arc::clone(&runtime));
     let worker_cancelled = Arc::clone(&cancelled);
     let worker_runtime = Arc::clone(&runtime);
@@ -149,6 +242,8 @@ where
                 sender,
                 cancelled: Arc::clone(&worker_cancelled),
                 runtime: Arc::clone(&worker_runtime),
+                pool,
+                decoded_chunk_size,
             };
             let terminal = match decode(&worker_cancelled, &mut output, &worker_runtime) {
                 Ok(completion) => {
@@ -177,7 +272,7 @@ where
         },
         cancelled,
         handle,
-        current: Vec::new(),
+        current: ReaderChunk::default(),
         current_offset: 0,
         terminal: Terminal::Open,
     })
@@ -189,6 +284,7 @@ where
 {
     let in_flight_chunks = config.in_flight_chunks;
     let configured_workers = config.decoder_threads;
+    let decoded_chunk_size = config.decoded_chunk_size;
     spawn_coordinator(
         move |cancelled, output, runtime| {
             decode_source(&source, &config, cancelled, output, runtime)
@@ -197,6 +293,7 @@ where
         },
         in_flight_chunks,
         configured_workers,
+        decoded_chunk_size,
     )
 }
 
@@ -210,6 +307,7 @@ where
 {
     let in_flight_chunks = config.in_flight_chunks;
     let configured_workers = config.decoder_threads;
+    let decoded_chunk_size = config.decoded_chunk_size;
     spawn_coordinator(
         move |cancelled, output, runtime| {
             decode_source_with_index(&source, &config, cancelled, output, runtime, options)
@@ -217,6 +315,7 @@ where
         },
         in_flight_chunks,
         configured_workers,
+        decoded_chunk_size,
     )
     .map(|inner| IndexingDecoderReader { inner })
 }
@@ -232,6 +331,7 @@ where
 {
     let in_flight_chunks = config.in_flight_chunks;
     let configured_workers = config.decoder_threads;
+    let decoded_chunk_size = config.decoded_chunk_size;
     spawn_coordinator(
         move |cancelled, output, runtime| {
             crate::indexed_parallel::decode(
@@ -242,6 +342,7 @@ where
         },
         in_flight_chunks,
         configured_workers,
+        decoded_chunk_size,
     )
 }
 
@@ -276,7 +377,7 @@ where
         },
         cancelled: Arc::new(AtomicBool::new(false)),
         handle,
-        current: Vec::new(),
+        current: ReaderChunk::default(),
         current_offset: 0,
         terminal: Terminal::Open,
     })
@@ -314,7 +415,7 @@ where
             },
             cancelled: Arc::new(AtomicBool::new(false)),
             handle,
-            current: Vec::new(),
+            current: ReaderChunk::default(),
             current_offset: 0,
             terminal: Terminal::Open,
         },
@@ -374,7 +475,15 @@ impl DecoderReader {
     }
 
     fn receive(&mut self) {
-        let mut reusable = std::mem::take(&mut self.current);
+        let coordinator = matches!(self.mode, ReaderMode::Coordinator { .. });
+        let mut reusable = if coordinator {
+            // Dropping an exhausted pooled chunk returns its allocation before
+            // the coordinator produces the next handoff.
+            self.current = ReaderChunk::default();
+            Vec::new()
+        } else {
+            self.current.take_unpooled()
+        };
         reusable.clear();
         let message = match &mut self.mode {
             ReaderMode::Coordinator { receiver, .. } => receiver
@@ -396,7 +505,7 @@ impl DecoderReader {
                     Ok(SequentialItem::Chunk(data)) => {
                         line_counter.note_output(&data, collector.as_deref());
                         runtime.add_decompressed_bytes(data.len());
-                        Some(Message::Data(data))
+                        Some(Message::Data(ReaderChunk::unpooled(data)))
                     }
                     Ok(SequentialItem::Finished(report)) => {
                         let report = line_counter.finish_report(report);
@@ -582,7 +691,7 @@ impl Read for DecoderReader {
                     .len()
                     .min(self.current.len().saturating_sub(self.current_offset));
                 output[..count].copy_from_slice(
-                    &self.current[self.current_offset..self.current_offset + count],
+                    &self.current.as_slice()[self.current_offset..self.current_offset + count],
                 );
                 self.current_offset += count;
                 if self.current_offset == self.current.len() {
@@ -637,8 +746,14 @@ impl Drop for DecoderReader {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecoderReader, IndexingDecoderReader};
+    use super::{ChannelOutput, DecoderReader, IndexingDecoderReader, Message};
+    use crate::backend::Output;
+    use crate::buffer_pool::ByteBufferPool;
+    use crate::runtime::RuntimeState;
     use std::io::Read;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
 
     fn assert_traits<T: Read + Send + Unpin>() {}
 
@@ -646,5 +761,55 @@ mod tests {
     fn decoder_reader_is_read_send_and_unpin() {
         assert_traits::<DecoderReader>();
         assert_traits::<IndexingDecoderReader>();
+    }
+
+    fn channel_output(
+        sender: mpsc::SyncSender<Message>,
+        pool: Arc<ByteBufferPool>,
+    ) -> ChannelOutput {
+        ChannelOutput {
+            sender,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            runtime: RuntimeState::new(1),
+            pool,
+            decoded_chunk_size: 1024,
+        }
+    }
+
+    #[test]
+    fn reusable_handoff_recycles_only_after_the_reader_releases_it() {
+        let pool = Arc::new(ByteBufferPool::for_reader(1024, 1));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut output = channel_output(sender, Arc::clone(&pool));
+        let mut bytes = Vec::with_capacity(1024);
+        bytes.resize(1024, 7);
+
+        let immediate = output.emit_reusable(bytes).unwrap();
+        assert_eq!(immediate.capacity(), 0);
+        let Message::Data(chunk) = receiver.recv().unwrap() else {
+            panic!("expected data handoff");
+        };
+        assert_eq!(chunk.as_slice(), &[7; 1024]);
+        assert_eq!(pool.take(1024).capacity(), 0);
+
+        drop(chunk);
+        assert_eq!(pool.take(1024).capacity(), 1024);
+    }
+
+    #[test]
+    fn disconnected_and_dropped_queues_release_reusable_handoffs() {
+        let pool = Arc::new(ByteBufferPool::for_reader(1024, 1));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let mut output = channel_output(sender, Arc::clone(&pool));
+        assert!(output.emit_reusable(Vec::with_capacity(1024)).is_err());
+        assert_eq!(pool.take(1024).capacity(), 1024);
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut output = channel_output(sender, Arc::clone(&pool));
+        let replacement = output.emit_reusable(Vec::with_capacity(1024)).unwrap();
+        drop(replacement);
+        drop(receiver);
+        assert_eq!(pool.take(1024).capacity(), 1024);
     }
 }

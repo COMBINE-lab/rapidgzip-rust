@@ -24,7 +24,12 @@ one of six bounded paths:
 Positional paths return ordered owned chunks to one coordinator. The
 coordinator updates member accounting and calls the user's `Write`, so a writer
 need not be `Send`. A positional `DecoderReader` substitutes a bounded
-synchronous channel at this final edge. The non-seekable path uses the same
+synchronous channel at this final edge. Output paths that can accept a reusable
+allocation wrap the channel payload in a private RAII owner. Once the consumer
+finishes or drops that payload, its cleared `Vec<u8>` capacity returns to a
+decode-local, size-classed pool for the coordinator's next chunk. The pool is
+bounded by actual retained bytes and entry count; non-reusable marker and
+specialized results do not enter it. The non-seekable path uses the same
 sequential core as a resumable state machine, described below.
 
 ## Non-seekable input
@@ -401,8 +406,10 @@ committed. No speculative worker calls the user's output object.
 Input is paged with positional reads. Speculative output is capped per task;
 oversized regions continue through zlib-rs instead. `DecoderReader` adds at most
 the configured in-flight chunk count plus its currently partially consumed
-chunk. Dropping it closes the consumer edge, sets cancellation, and joins the
-coordinator.
+chunk. Its reusable-allocation pool can retain at most two additional decoded
+chunk capacities and `min(in_flight_chunks + 1, 4)` entries; actual capacity is
+charged before publication. Dropping the reader closes the consumer edge, sets
+cancellation, drains or drops queued RAII payloads, and joins the coordinator.
 
 A non-seekable source holds one input window instead of a positional page and
 spools nothing, so its memory is independent of the input length. There is no

@@ -1,7 +1,7 @@
 # Bounded decoded-buffer recycling
 
-Status: proposed; reader handoff is warranted, additional decode paths are
-separately benchmark-gated
+Status: phase one implemented; additional decode paths remain separately
+benchmark-gated
 
 Origin: the decode-local byte-buffer free lists in PR #5
 
@@ -293,3 +293,33 @@ FASTQ workload, does not regress median throughput beyond normal run variance,
 does not increase peak RSS beyond the documented retained bound, and preserves
 the dynamic worker/backpressure behavior. Phase two must independently improve
 the marker-reader path; a phase-one win is not evidence for merging it.
+
+## Phase-one outcome
+
+The implementation is intentionally narrower than a general allocator. A
+private `ByteBufferPool` owns three capacity classes around the configured
+decoded chunk size and charges actual capacity and entry count atomically before
+publishing an empty vector. A private RAII reader chunk returns capacity after
+normal consumption and also covers disconnected sends, dropped queued output,
+early reader cancellation, `finish`, and terminal failures. Safe Rust expresses
+the complete ownership protocol; this work adds no unsafe block or dependency.
+
+The efficacy probe used a deterministic 128 MiB FASTQ-like single-member gzip,
+a one-worker positional `DecoderReader`, and the default 4 MiB decoded chunk.
+Valgrind DHAT measured:
+
+| revision | allocated bytes | allocation blocks | bytes at global heap peak |
+|---|---:|---:|---:|
+| exact pre-change `main` | 145,808,062 | 86 | 23,120,080 |
+| phase one | 70,317,510 | 74 | 23,127,000 |
+
+That is 51.8% fewer allocated bytes and 14.0% fewer allocations, while the
+6,920-byte sampled heap-peak difference is negligible relative to the explicit
+two-chunk retention bound. A paired 20-sample Criterion run of the reusable
+one-worker gzip reader was statistically unchanged: 218.06 MiB/s after versus
+217.35 MiB/s before. Five runs of the intentionally unchanged 44-budget stored
+reader had medians of 2,646.9 and 2,649.2 MiB/s, a 0.1% difference.
+
+Phase one therefore passes its allocation, throughput, and memory gates.
+Marker resolution is not evidence-backed by this result and remains deferred;
+it must pass its own profile and paired benchmark before it may use the pool.

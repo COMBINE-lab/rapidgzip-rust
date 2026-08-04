@@ -24,6 +24,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Positional `DecoderReader` handoffs that support reusable output now return
+  consumed allocations through a private decode-local, size-classed pool.
+  Retention is bounded by two decoded chunks and at most four entries; normal
+  reads, `finish`, cancellation, terminal errors, and dropped queued messages
+  share the same RAII ownership path. Marker and specialized non-reusable
+  output remain unchanged.
 - Structural analysis now uses an inlined bit-buffer fast path and one bounded
   linear history/checksum buffer. The default no-output-limit path is
   monomorphized separately, avoiding configured-limit and redundant structural

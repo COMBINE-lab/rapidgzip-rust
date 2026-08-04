@@ -54,6 +54,14 @@ The accepted changes are:
   workers are created lazily and persistently excess ranks retire. The reader's
   final handoff separately detects consumer backpressure and temporarily caps
   admission at one worker.
+- Reusable positional-reader output now makes a bounded ownership round trip
+  through a private size-classed pool. On a deterministic 128 MiB FASTQ-like
+  single-member gzip with one worker, Valgrind DHAT reported 70,317,510 allocated
+  bytes in 74 blocks versus 145,808,062 bytes in 86 blocks on `main`: 51.8%
+  fewer allocated bytes and 14.0% fewer allocations. A paired 20-sample
+  Criterion run was statistically unchanged (218.06 versus 217.35 MiB/s), and
+  the unchanged 44-budget stored-reader control differed by 0.1% at median.
+  Marker-resolution scratch remains separately benchmark-gated.
 
 Correct overlapping-copy behavior is covered across predecessor references,
 short-distance overlap, and 32 KiB wraparound. Suffix-only window derivation is

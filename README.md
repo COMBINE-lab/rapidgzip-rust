@@ -533,7 +533,9 @@ claim that every rapidgzip CLI option is implemented.
   total for any format, rejecting overruns before handoff and underruns at end.
 - Work queues and reader handoff are bounded. Memory still scales with active
   workers and configured chunk sizes; the defaults are intended for throughput
-  on general-purpose machines rather than minimum memory use.
+  on general-purpose machines rather than minimum memory use. Reusable
+  positional-reader allocations are recycled only after consumption through a
+  decode-local pool capped at two decoded chunks and four entries.
 - Structural analysis retains one output-history window plus explicitly
   bounded stream, block, optional-header, alphabet, and detailed-reference
   results. Checked counter or allocation failure is reported as a typed
