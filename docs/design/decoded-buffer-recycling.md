@@ -1,11 +1,32 @@
-# Bounded decoded-buffer recycling
+# Bounded decoded-buffer recycling (archived experiment)
 
-Status: implemented for the evidence-backed single-member positional-reader
-path; other paths remain separately benchmark-gated
+Status: rejected for the default `DecoderReader` path after implementation and
+FASTQ benchmarking; retained on this branch for reproducibility
 
 Origin: the decode-local byte-buffer free lists proposed in PR #5
 
-## Decision
+## Archive outcome
+
+This branch preserves the strongest automatic recycling prototype, its tests,
+and the benchmark machinery used to evaluate it. It is an experimental archive,
+not a release candidate. The clean follow-up branch retains the benchmark tools
+and assessment but removes the runtime implementation.
+
+The prototype materially reduced allocation volume, but it did not pass the
+no-regression throughput gate. Fresh, isolated builds over nine paired,
+30-archive observations measured the final automatic prototype 2.4% faster for
+8 KiB reads and 4.3% slower for 1 MiB reads. Earlier unrestricted recycling
+also made one-worker dense-member paraseq about 6% slower. Admission by consumer
+shape and gzip member restored the dense-member and BGZF paths, but could not
+keep the ordinary bulk path structurally identical to `main`.
+
+Automatic cross-thread recycling was therefore rejected. Reconsideration
+requires an implementation that leaves the default `DecoderReader` and output
+hot path structurally unchanged, retains explicit byte and entry bounds, and
+passes ordinary and paraseq FASTQ matrices for single-member, multi-member, and
+BGZF inputs at representative worker counts.
+
+## Prototype design
 
 The direct `Write` path already returns a cleared output vector to sequential
 decode, and strict indexed-parallel decode already has a worker-local recycled
@@ -13,7 +34,7 @@ vector queue. A positional `DecoderReader` historically could not do this:
 ownership crossed a bounded channel, the producer continued with
 `Vec::new()`, and the reader dropped each allocation after copying its bytes.
 
-The reader now makes a bounded ownership round trip only when all of the
+The archived prototype makes a bounded ownership round trip only when all of the
 following hold:
 
 - the source is positional rather than a non-seekable stream;
@@ -26,7 +47,8 @@ following hold:
 - no completed gzip member has yet established that more output belongs to a
   later member.
 
-This preserves the allocation win on the ordinary single-member FASTQ path.
+This was intended to preserve the allocation win on the ordinary single-member
+FASTQ path.
 The consumer-shape gate keeps conventional 8 KiB buffered reads eligible while
 leaving paraseq's roughly 256 KiB batches and the 1 MiB bulk-copy control on
 their original allocation path. A buffer-size sweep found positive results at
@@ -71,7 +93,7 @@ FASTQ benchmarking rejected that design. Although allocation volume fell, the
 extra message representation and pool machinery perturbed paths that did not
 benefit, and the cache cost appeared most clearly in one-worker dense-member
 paraseq. A later two-slot pool and a boxed return channel had the same problem.
-The shipped design therefore retains the exact ordinary `Message::Data(Vec<u8>)`
+The final prototype therefore retains the exact ordinary `Message::Data(Vec<u8>)`
 representation and initializes its return mechanism only on the first eligible
 handoff.
 
@@ -179,8 +201,8 @@ Valgrind DHAT on the single-member, one-worker, 8 KiB-read fixture measured:
 | final recycler | 53,533,488 | 67 | 18,925,675 |
 
 That is 63.3% fewer allocated bytes, 19.3% fewer allocations, and a 4.0 MiB
-lower sampled heap peak. The feature is accepted only with the complete Rust
-test suite, clippy, rustdoc, valid-FASTQ parser checks, and paired shape matrix.
+lower sampled heap peak. Those allocation improvements did not outweigh the
+repeatable 1 MiB throughput regression, so the runtime feature was rejected.
 
 ## Deferred work
 

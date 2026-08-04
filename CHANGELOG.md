@@ -5,6 +5,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+> **Archive notice:** this branch preserves a rejected decoded-buffer recycling
+> experiment for reproducibility. Its recycling runtime changes are not part of
+> `main` or the release candidate.
+
 ### Fixed
 
 - Parallel task queues now publish their availability counters before making
