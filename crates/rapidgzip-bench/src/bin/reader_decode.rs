@@ -3,6 +3,7 @@
 //! This deliberately measures the public `Decoder::open` -> `Read` ->
 //! `DecoderReader::finish` path without telemetry sampling or output I/O.
 
+use paraseq::{Record, fastq};
 use rapidgzip_core::{Decoder, IndexOptions};
 use std::env;
 use std::fs::File;
@@ -21,12 +22,19 @@ struct Arguments {
     delay: Duration,
     stop_after_bytes: Option<u64>,
     iterations: usize,
-    indexed: bool,
+    workload: Workload,
+}
+
+#[derive(Clone, Copy)]
+enum Workload {
+    Ordinary,
+    Indexed,
+    Paraseq,
 }
 
 fn usage() -> &'static str {
     "usage: reader_decode INPUT.gz THREADS READ_BUFFER_BYTES EXPECTED_DECODED_BYTES \
-     [DELAY_MICROS [STOP_AFTER_BYTES|all [ITERATIONS [ordinary|indexed]]]]"
+     [DELAY_MICROS [STOP_AFTER_BYTES|all [ITERATIONS [ordinary|indexed|paraseq]]]]"
 }
 
 fn parse_usize(value: Option<String>, name: &str) -> Result<usize, String> {
@@ -88,9 +96,10 @@ fn parse_arguments() -> Result<Arguments, String> {
         })
         .transpose()?
         .unwrap_or(1);
-    let indexed = match arguments.next().as_deref() {
-        None | Some("ordinary") => false,
-        Some("indexed") => true,
+    let workload = match arguments.next().as_deref() {
+        None | Some("ordinary") => Workload::Ordinary,
+        Some("indexed") => Workload::Indexed,
+        Some("paraseq") => Workload::Paraseq,
         Some(mode) => return Err(format!("invalid reader mode {mode:?}")),
     };
     if arguments.next().is_some() {
@@ -104,7 +113,7 @@ fn parse_arguments() -> Result<Arguments, String> {
         delay: Duration::from_micros(delay_micros),
         stop_after_bytes,
         iterations,
-        indexed,
+        workload,
     })
 }
 
@@ -163,6 +172,28 @@ fn validate_report(
     Ok(())
 }
 
+fn validate_counts(
+    decompressed_bytes: u64,
+    observed_members: u64,
+    arguments: &Arguments,
+    member_count: &mut Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if decompressed_bytes != arguments.expected_decoded_bytes {
+        return Err(format!(
+            "decoded {decompressed_bytes} bytes; expected {}",
+            arguments.expected_decoded_bytes
+        )
+        .into());
+    }
+    if member_count
+        .replace(observed_members)
+        .is_some_and(|previous| previous != observed_members)
+    {
+        return Err("member count changed between iterations".into());
+    }
+    Ok(())
+}
+
 fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let decoder = Decoder::builder()
         .decoder_threads(arguments.threads)
@@ -171,17 +202,50 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let mut total_consumed = 0_u64;
     let mut member_count = None;
     for _ in 0..arguments.iterations {
-        let consumed = if arguments.indexed {
-            let source = File::open(&arguments.input)?;
-            let mut reader = decoder.reader_with_index(source, IndexOptions::default())?;
-            let consumed = consume(&mut reader, &mut output, &arguments)?;
-            validate_report(reader.finish()?.decode, &arguments, &mut member_count)?;
-            consumed
-        } else {
-            let mut reader = decoder.open(&arguments.input)?;
-            let consumed = consume(&mut reader, &mut output, &arguments)?;
-            validate_report(reader.finish()?, &arguments, &mut member_count)?;
-            consumed
+        let consumed = match arguments.workload {
+            Workload::Ordinary => {
+                let mut reader = decoder.open(&arguments.input)?;
+                let consumed = consume(&mut reader, &mut output, &arguments)?;
+                validate_report(reader.finish()?, &arguments, &mut member_count)?;
+                consumed
+            }
+            Workload::Indexed => {
+                let source = File::open(&arguments.input)?;
+                let mut reader = decoder.reader_with_index(source, IndexOptions::default())?;
+                let consumed = consume(&mut reader, &mut output, &arguments)?;
+                validate_report(reader.finish()?.decode, &arguments, &mut member_count)?;
+                consumed
+            }
+            Workload::Paraseq => {
+                if !arguments.delay.is_zero() || arguments.stop_after_bytes.is_some() {
+                    return Err("paraseq requires zero delay and stop-after=all".into());
+                }
+                let decoded = decoder.open(&arguments.input)?;
+                let handle = decoded.handle();
+                let mut reader = fastq::Reader::new(decoded);
+                let mut records = reader.new_record_set();
+                let mut record_count = 0_u64;
+                while records.fill(&mut reader)? {
+                    for record in records.iter() {
+                        let record = record?;
+                        black_box(record.id());
+                        black_box(record.seq_raw());
+                        black_box(record.qual());
+                        record_count = record_count
+                            .checked_add(1)
+                            .ok_or("FASTQ record-count overflow")?;
+                    }
+                }
+                black_box(record_count);
+                let stats = handle.stats();
+                validate_counts(
+                    stats.decompressed_bytes,
+                    stats.member_count,
+                    &arguments,
+                    &mut member_count,
+                )?;
+                stats.decompressed_bytes
+            }
         };
         total_consumed = total_consumed
             .checked_add(consumed)
@@ -196,10 +260,10 @@ fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     println!("iterations\t{}", arguments.iterations);
     println!(
         "reader_mode\t{}",
-        if arguments.indexed {
-            "indexed"
-        } else {
-            "ordinary"
+        match arguments.workload {
+            Workload::Ordinary => "ordinary",
+            Workload::Indexed => "indexed",
+            Workload::Paraseq => "paraseq",
         }
     );
     Ok(())

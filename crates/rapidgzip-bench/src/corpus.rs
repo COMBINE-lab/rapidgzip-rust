@@ -29,15 +29,39 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 
 /// Produces repeatable FASTQ-shaped bytes of exactly `length` bytes.
 pub fn fastq_like_bytes(length: usize) -> Vec<u8> {
+    const SEQUENCE: &[u8] = b"ACGTGCTAGCTAGGATCCGATCGATCGTAGCTAGCTAGCTACGATCGATCG";
+
+    assert!(
+        length >= 9,
+        "a nonempty exact-length FASTQ corpus requires at least nine bytes"
+    );
     let mut output = Vec::with_capacity(length.saturating_add(256));
     let mut record = 0_u64;
-    while output.len() < length {
-        output.extend_from_slice(format!("@read-{record}\n").as_bytes());
-        output.extend_from_slice(b"ACGTGCTAGCTAGGATCCGATCGATCGTAGCTAGCTAGCTACGATCGATCG\n+\n");
-        output.extend_from_slice(b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n");
+    loop {
+        let header = format!("@read-{record}\n");
+        let record_length = header.len() + SEQUENCE.len() * 2 + 4;
+        if output.len().saturating_add(record_length).saturating_add(9) > length {
+            break;
+        }
+        output.extend_from_slice(header.as_bytes());
+        output.extend_from_slice(SEQUENCE);
+        output.extend_from_slice(b"\n+\n");
+        output.extend(std::iter::repeat_n(b'I', SEQUENCE.len()));
+        output.push(b'\n');
         record += 1;
     }
-    output.truncate(length);
+
+    let remaining = length - output.len();
+    let id_length = if remaining.is_multiple_of(2) { 2 } else { 1 };
+    let sequence_length = (remaining - id_length - 6) / 2;
+    output.push(b'@');
+    output.extend(std::iter::repeat_n(b't', id_length));
+    output.push(b'\n');
+    output.extend(std::iter::repeat_n(b'A', sequence_length));
+    output.extend_from_slice(b"\n+\n");
+    output.extend(std::iter::repeat_n(b'I', sequence_length));
+    output.push(b'\n');
+    debug_assert_eq!(output.len(), length);
     output
 }
 
@@ -198,6 +222,7 @@ pub fn bgzf(bytes: &[u8], block_payload_bytes: usize, level: i32) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paraseq::{Record, fastq};
 
     #[test]
     fn payloads_are_exact_and_repeatable() {
@@ -208,6 +233,24 @@ mod tests {
             pseudo_random_bytes(10_000, 7)
         );
         assert_ne!(pseudo_random_bytes(64, 7), pseudo_random_bytes(64, 8));
+    }
+
+    #[test]
+    fn exact_length_fastq_is_accepted_by_paraseq() {
+        for length in [9, 10, 127, 10_000] {
+            let bytes = fastq_like_bytes(length);
+            let mut reader = fastq::Reader::new(bytes.as_slice());
+            let mut records = reader.new_record_set();
+            let mut observed = 0_usize;
+            while records.fill(&mut reader).expect("valid generated FASTQ") {
+                for record in records.iter() {
+                    let record = record.expect("valid record");
+                    assert_eq!(record.seq_raw().len(), record.qual().unwrap().len());
+                    observed += 1;
+                }
+            }
+            assert!(observed != 0);
+        }
     }
 
     #[test]
