@@ -131,8 +131,8 @@ if [[ -n $cpus ]]; then
 fi
 
 rust_binary=${RAPIDGZIP_RUST:-$repository/target/release/rapidgzip-rust}
-generator="$repository/target/release/generate_corpora"
-summarizer="$repository/target/release/summarize_results"
+generator=${GENERATE_CORPORA:-$repository/target/release/generate_corpora}
+summarizer=${SUMMARIZE_RESULTS:-$repository/target/release/summarize_results}
 if [[ ! -x $rust_binary || ! -x $generator || ! -x $summarizer ]]; then
     cargo build --release --locked -p rapidgzip-rust-cli -p rapidgzip-bench \
         --bin rapidgzip-rust --bin generate_corpora --bin summarize_results

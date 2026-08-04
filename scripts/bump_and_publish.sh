@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Prepare, validate, tag, publish, and announce a rapidgzip-rust release.
 #
-# A dry run restores Cargo.toml and Cargo.lock before exiting. A real release
-# pushes its commit and tag before uploading the publishable workspace crates,
-# so the source referenced by crates.io is already available upstream. After
-# successful crate uploads, it creates the matching GitHub release from the
-# version's CHANGELOG.md section.
+# A dry run may run from any clean branch and restores Cargo.toml and Cargo.lock
+# before exiting. A real release must run from main and pushes its commit and
+# tag before uploading the publishable workspace crates, so the source
+# referenced by crates.io is already available upstream. After successful crate
+# uploads, it creates the matching GitHub release from the version's CHANGELOG
+# section.
 
 set -euo pipefail
 
@@ -92,9 +93,12 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 branch=$(git branch --show-current)
-if [[ "$branch" != "main" ]]; then
+if [[ "$dry_run" == false && "$branch" != "main" ]]; then
     echo "error: releases must be prepared from main (current branch: $branch)" >&2
     exit 1
+fi
+if [[ "$dry_run" == true && "$branch" != "main" ]]; then
+    echo "note: validating release candidate from branch $branch; publishing still requires main"
 fi
 
 if ! git remote get-url origin >/dev/null 2>&1; then
@@ -212,6 +216,11 @@ if package_updates != 1 or dependency_updates != 1:
 
 path.write_text("".join(lines), encoding="utf-8")
 PY
+
+    # Path-package versions are recorded in Cargo.lock. Refresh only the
+    # workspace packages, without allowing a release to select newer registry
+    # dependencies, before enforcing --locked for every validation below.
+    cargo update --workspace --offline
 fi
 
 if [[ "$version_changed" == true ]]; then
@@ -235,9 +244,19 @@ if ! command -v gh >/dev/null 2>&1; then
     echo "error: the GitHub CLI (gh) is required to create the release" >&2
     exit 1
 fi
-if ! gh auth status >/dev/null 2>&1; then
-    echo "error: GitHub CLI authentication is required; run gh auth login" >&2
-    exit 1
+gh_command=(gh)
+if ! "${gh_command[@]}" api user >/dev/null 2>&1; then
+    if [[ -n "${GH_TOKEN+x}" || -n "${GITHUB_TOKEN+x}" ]] \
+        && env -u GH_TOKEN -u GITHUB_TOKEN gh api user >/dev/null 2>&1; then
+        echo "warning: an invalid GH_TOKEN or GITHUB_TOKEN masked stored gh credentials; ignoring it"
+        gh_command=(env -u GH_TOKEN -u GITHUB_TOKEN gh)
+    else
+        echo "error: GitHub CLI authentication is required; run gh auth login" >&2
+        if [[ -n "${GH_TOKEN+x}" || -n "${GITHUB_TOKEN+x}" ]]; then
+            echo "error: GH_TOKEN or GITHUB_TOKEN is set and takes precedence over stored credentials" >&2
+        fi
+        exit 1
+    fi
 fi
 cargo_credentials_dir="${CARGO_HOME:-$HOME/.cargo}"
 cargo_credentials_toml="$cargo_credentials_dir/credentials.toml"
@@ -275,7 +294,7 @@ trap - ERR
 
 git push origin main "v$version"
 cargo publish --workspace --locked
-gh release create "v$version" \
+"${gh_command[@]}" release create "v$version" \
     --verify-tag \
     --title "rapidgzip-rust v$version" \
     --notes "$release_notes"

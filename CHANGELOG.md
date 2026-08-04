@@ -5,6 +5,20 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-04
+
+### Upgrade notes
+
+- `DecodeReport` remains `Copy`, but now includes the mandatory concrete
+  `format: Format` field and optional `line_count: Option<u64>` field. Code
+  constructing reports or destructuring them without `..` must account for
+  both additions. Existing gzip decoding defaults and verification semantics
+  are unchanged.
+- The new random-access API uses the format-neutral `DeflateIndex` and returns
+  an owning `IndexedDecodeReport` only from operations that explicitly request
+  index construction. Ordinary decode operations continue to return the small
+  `Copy` `DecodeReport`.
+
 ### Fixed
 
 - Parallel task queues now publish their availability counters before making
@@ -24,6 +38,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Runtime telemetry now documents the distinction between the effective
+  `active_workers` admission target, approximate `busy_workers` decode
+  activity, and live `spawned_workers`. A worker that owns a completed bounded
+  result may remain live during consumer backpressure until output advances or
+  the decode is cancelled.
 - Programmatic-reader performance work now has an alternating A/B runner over
   validated single-member, sparse/dense multi-member, and BGZF FASTQ, including
   ordinary, indexed, and actual paraseq consumption. Reports compute paired
@@ -54,10 +73,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unfavorable workloads on zlib-rs, and preserves specialized BGZF, stored,
   and dense-member routing. `DecoderPath::MarkerAdmission` exposes the
   transient decision through existing telemetry.
-- The unreleased random-access API now uses the format-neutral `DeflateIndex`
-  name instead of `GzipIndex`. This, the new mandatory `DecodeReport::format`
-  field, and multi-format index provenance are planned for the next minor
-  release rather than a patch release.
+- The random-access API uses the format-neutral `DeflateIndex` name instead of
+  `GzipIndex`. This, the new mandatory `DecodeReport::format` field, and
+  multi-format index provenance ship in 0.2.0 rather than a 0.1.x patch.
 
 ### Added
 
@@ -203,5 +221,6 @@ Initial release of the decoder-only `rapidgzip-rust` implementation.
   cell; multi-worker parity and the zlib-ng-backed C++ performance gate are
   met on the published workloads.
 
-[Unreleased]: https://github.com/COMBINE-lab/rapidgzip-rust/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/COMBINE-lab/rapidgzip-rust/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/COMBINE-lab/rapidgzip-rust/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/COMBINE-lab/rapidgzip-rust/releases/tag/v0.1.0
