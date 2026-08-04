@@ -15,6 +15,44 @@ ratio between the two groups isolates indexing overhead on identical data.
 Record checkpoint count, serialized native-index size, and peak RSS alongside
 throughput when evaluating a release candidate.
 
+Programmatic-reader changes use the alternating FASTQ A/B runner rather than
+only a synthetic Criterion group. Generate a validated corpus once, build the
+same `reader_decode` target from exact `main` and the candidate in separate
+worktrees, and run:
+
+```bash
+benchmarks/run-reader-ab.sh \
+  --corpus-dir target/bench-corpora \
+  --baseline /path/to/main/target/release/reader_decode \
+  --candidate target/release/reader_decode \
+  --threads "1 4 16" \
+  --buffers "8192 1048576" \
+  --iterations 20 \
+  --reader-mode ordinary \
+  --cpus 0-21
+
+# Actual FASTQ parsing; the parser owns its internal Read buffer.
+benchmarks/run-reader-ab.sh \
+  --corpus-dir target/bench-corpora \
+  --baseline /path/to/main/target/release/reader_decode \
+  --candidate target/release/reader_decode \
+  --threads "1 4 16" \
+  --buffers "1048576" \
+  --iterations 20 \
+  --reader-mode paraseq \
+  --cpus 0-21
+```
+
+The default fixture set is valid FASTQ encoded as one gzip member, four sparse
+members, 512 dense members, and BGZF. `reader_decode` validates decoded bytes
+and members on every iteration; paraseq mode also parses every FASTQ record.
+The runner records independent medians for inspection, but its Markdown report
+uses the median of within-repetition candidate/`main` deltas as the primary A/B
+statistic. Pairing before aggregation reduces bias from CPU-frequency and NUMA
+state changes between neighboring runs. A reader optimization must preserve
+all four shapes and both small and bulk ordinary reads; a single-member win
+cannot justify a dense-member or BGZF regression.
+
 The `structural_analysis_fastq` group compares one-worker verified zlib-rs
 decode with the sequential structural walker on the same generated 16 MiB
 FASTQ-like gzip member. Both paths validate the complete container and discard
