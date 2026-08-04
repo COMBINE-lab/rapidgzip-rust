@@ -56,6 +56,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Deterministic, self-verifying release benchmark corpora covering ordinary
+  single/multi-member gzip, true BGZF, stored DEFLATE, low-compression data,
+  zlib, and raw DEFLATE. The fair runner uses explicit competitor identities,
+  decoded SHA-256 preflight, prebuilt indexes, affinity, rotated sample order,
+  complete failure rows, provenance capture, and strict Rust-generated TSV and
+  Markdown summaries. Hosted CI validates reproducibility and harness behavior
+  without imposing a timing threshold.
+
 - Bounded structural analysis through `Decoder::analyze`,
   `Decoder::analyze_with_options`, and streaming counterparts. The structured,
   deterministic result covers gzip/zlib/raw framing, every DEFLATE block,

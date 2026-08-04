@@ -136,28 +136,75 @@ configuration. The generated Criterion group
 `indexed_parallel_vs_ordinary` provides a repository-local regression fixture;
 the binary is the retained FASTQ check.
 
-For corpus and competitor runs, build the Rust release binary and use the
-matrix driver:
+## Reproducible cross-tool runner
+
+Release comparisons use `run-fair.sh`. The runner generates or accepts
+corpora, verifies decoded size and SHA-256 before timing, prepares each tool's
+own index outside timed cells, rotates tool order by repetition, and retains
+every attempted command in `raw.tsv`:
 
 ```bash
-cargo build --locked --release
-RUNS=9 \
-DECODED_BYTES=268435456 \
 RAPIDGZIP_CPP_ISAL=/path/to/rapidgzip-with-isal \
 RAPIDGZIP_CPP_ZLIB_NG=/path/to/rapidgzip-with-zlib-ng \
 GZIPPY=/path/to/gzippy \
-benchmarks/run-matrix.sh corpus.fastq.gz > results.tsv
+benchmarks/run-fair.sh \
+  --generate \
+  --decoded-mib 256 \
+  --threads "1 4 16 44" \
+  --modes "verify stdout indexed stdin" \
+  --cpus 0-43 \
+  --runs 9 \
+  --warmups 2
 ```
 
-The driver runs 1, 4, 16, and 44 threads by default, records wall/user/system
-time and peak RSS, and reports the ISA-L and zlib-ng rapidgzip builds separately.
-It includes gzippy whenever its executable is available. `RAPIDGZIP_CPP` remains
-an alias for `RAPIDGZIP_CPP_ZLIB_NG` for older invocations. The competitor is
-named `gzippy`; references to "zippy" in benchmark discussions mean that same
-program.
-Set `THREAD_CELLS` or `RUNS` to override the matrix. The Rust CLI uses the push
-API in `--test` mode; Criterion separately measures the paraseq-facing pull
-API.
+Competitors are opt-in and their backend labels come only from the explicit
+environment variable names. The runner never scans a binary or library to
+guess its backend. Configured tools must be executable, report a version, and
+pass correctness preflight. The initial C++ command template deliberately
+supports rapidgzip 0.16.x. Missing optional tools are recorded in
+`environment.tsv`; a configured but broken tool fails before timing.
+
+`--generate` creates deterministic single-member, sparse/dense ordinary
+multi-member, true BGZF, stored, low-compression, zlib, and raw-DEFLATE inputs
+under `target/bench-corpora`. Every stream is decoded and checked internally
+before `manifest.tsv` is published. In particular, every BGZF block carries a
+matching `BC`/`BSIZE` field and the generated stream is required to select the
+specialized BGZF decoder path. Generate a corpus separately with:
+
+```bash
+cargo run --release -p rapidgzip-bench --bin generate_corpora -- \
+  --output target/bench-corpora --decoded-mib 256 --seed 1
+```
+
+Caller-supplied gzip files can be measured in the same workflow:
+
+```bash
+RAPIDGZIP_CPP_ZLIB_NG=/path/to/rapidgzip-with-zlib-ng \
+benchmarks/run-fair.sh --modes "verify stdout" reads.fastq.gz
+```
+
+Normal gzip release runs require at least one independent decoder. Use
+`--rust-only` only for a labeled harness smoke test; it cannot establish
+cross-decoder correctness. zlib and raw-DEFLATE generated controls are also
+explicitly labeled Rust-only because the registered competitors are
+gzip-specific.
+
+Each invocation writes `environment.tsv`, `corpora.tsv`, `commands.tsv`,
+`parity.tsv`, `raw.tsv`, `summary.tsv`, `SUMMARY.md`, and retained failure logs
+to a timestamped directory under `target/bench-results`. `raw.tsv` is the
+source of truth. The standard-library-only `summarize_results` binary validates
+the exact schema, rejects duplicates and inconsistent decoded sizes, includes
+failed attempts in group counts, and computes deterministic medians from
+successful rows. Hosted CI exercises a two-worker Rust-only matrix solely to
+validate the harness; hosted timing is not a performance gate.
+
+`run-matrix.sh` is a deprecated one-release compatibility wrapper. It
+translates `RUNS`, `WARMUPS`, `THREAD_CELLS`, `RAPIDGZIP_CPP`, and the explicit
+tool variables into a verify-only fair run, then prints the expanded raw TSV.
+It no longer guesses that an arbitrary `rapidgzip` on `PATH` is a zlib-ng
+build. The competitor is named `gzippy`; references to "zippy" in benchmark
+discussions mean that same program. Criterion separately measures the
+paraseq-facing pull API.
 
 For release comparisons, record:
 

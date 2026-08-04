@@ -1,130 +1,21 @@
 //! Public-reader throughput benchmark.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use libz_rs_sys as z;
+use rapidgzip_bench::corpus::{
+    bgzf, deflate_with_level, fastq_like_bytes, pseudo_random_bytes, stored_gzip_member,
+};
 use rapidgzip_core::{Decoder, Format, IndexOptions};
 use std::io;
-use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut value = u32::MAX;
-    for &byte in bytes {
-        value ^= u32::from(byte);
-        for _ in 0..8 {
-            value = (value >> 1) ^ (0xEDB8_8320 & 0_u32.wrapping_sub(value & 1));
-        }
-    }
-    !value
-}
-
-fn stored_member(bytes: &[u8]) -> Vec<u8> {
-    let mut encoded = b"\x1f\x8b\x08\x00\0\0\0\0\x00\xff".to_vec();
-    let chunks = bytes.chunks(u16::MAX as usize);
-    let count = chunks.len();
-    for (index, chunk) in chunks.enumerate() {
-        encoded.push(u8::from(index + 1 == count));
-        let length = chunk.len() as u16;
-        encoded.extend_from_slice(&length.to_le_bytes());
-        encoded.extend_from_slice(&(!length).to_le_bytes());
-        encoded.extend_from_slice(chunk);
-    }
-    encoded.extend_from_slice(&crc32(bytes).to_le_bytes());
-    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    encoded
-}
-
-fn stored_bgzf(bytes: &[u8], block_payload: usize) -> Vec<u8> {
-    assert!(block_payload <= 60 * 1024);
-    let mut encoded = Vec::new();
-    for chunk in bytes.chunks(block_payload) {
-        let mut deflate = Vec::with_capacity(chunk.len() + 5);
-        deflate.push(1);
-        let length = chunk.len() as u16;
-        deflate.extend_from_slice(&length.to_le_bytes());
-        deflate.extend_from_slice(&(!length).to_le_bytes());
-        deflate.extend_from_slice(chunk);
-        let total = 18 + deflate.len() + 8;
-        let mut block = b"\x1f\x8b\x08\x04\0\0\0\0\x00\xff\x06\x00BC\x02\x00".to_vec();
-        block.extend_from_slice(&((total - 1) as u16).to_le_bytes());
-        block.extend_from_slice(&deflate);
-        block.extend_from_slice(&crc32(chunk).to_le_bytes());
-        block.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
-        encoded.extend_from_slice(&block);
-    }
-    encoded.extend_from_slice(&[
-        31, 139, 8, 4, 0, 0, 0, 0, 0, 255, 6, 0, 66, 67, 2, 0, 27, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ]);
-    encoded
-}
-
 fn deflate_with(bytes: &[u8], window_bits: i32) -> Vec<u8> {
-    deflate_with_level(bytes, window_bits, 1)
-}
-
-fn deflate_with_level(bytes: &[u8], window_bits: i32, level: i32) -> Vec<u8> {
-    let mut stream = z::z_stream::default();
-    // SAFETY: `stream` is live and uniquely borrowed, the zlib-rs version
-    // string is static and NUL-terminated, and the ABI structure size matches.
-    let status = unsafe {
-        z::deflateInit2_(
-            &mut stream,
-            level,
-            z::Z_DEFLATED,
-            window_bits,
-            8,
-            z::Z_DEFAULT_STRATEGY,
-            z::zlibVersion(),
-            size_of::<z::z_stream>() as i32,
-        )
-    };
-    assert_eq!(status, z::Z_OK);
-    let mut output = vec![0_u8; bytes.len() + bytes.len() / 16 + 1024];
-    stream.next_in = bytes.as_ptr();
-    stream.avail_in = u32::try_from(bytes.len()).unwrap();
-    stream.next_out = output.as_mut_ptr();
-    stream.avail_out = u32::try_from(output.len()).unwrap();
-    // SAFETY: input and output point to live, non-overlapping slices matching
-    // the counts above; this is the only active call on `stream`.
-    let status = unsafe { z::deflate(&mut stream, z::Z_FINISH) };
-    assert_eq!(status, z::Z_STREAM_END);
-    let produced = output.len() - stream.avail_out as usize;
-    // SAFETY: initialization succeeded and the stream is ended exactly once.
-    let status = unsafe { z::deflateEnd(&mut stream) };
-    assert_eq!(status, z::Z_OK);
-    output.truncate(produced);
-    output
-}
-
-fn pseudo_random_bytes(length: usize) -> Vec<u8> {
-    let mut state = 0x243f_6a88_u32;
-    (0..length)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect()
-}
-
-fn fastq_like_bytes(length: usize) -> Vec<u8> {
-    let mut output = Vec::with_capacity(length + 256);
-    let mut record = 0_u64;
-    while output.len() < length {
-        output.extend_from_slice(format!("@read-{record}\n").as_bytes());
-        output.extend_from_slice(b"ACGTGCTAGCTAGGATCCGATCGATCGTAGCTAGCTAGCTACGATCGATCG\n+\n");
-        output.extend_from_slice(b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n");
-        record += 1;
-    }
-    output.truncate(length);
-    output
+    deflate_with_level(bytes, window_bits, 1).unwrap()
 }
 
 fn decode_reader(criterion: &mut Criterion) {
     let decoded = vec![0xA5; 16 * 1024 * 1024];
-    let compressed: Arc<[u8]> = stored_member(&decoded).into();
+    let compressed: Arc<[u8]> = stored_gzip_member(&decoded).into();
     let mut group = criterion.benchmark_group("decoder_reader_stored");
     group.throughput(Throughput::Bytes(decoded.len() as u64));
     for threads in [1, 4, 16, 44] {
@@ -163,7 +54,7 @@ fn decode_reader(criterion: &mut Criterion) {
     group.finish();
 
     let decoded = fastq_like_bytes(16 * 1024 * 1024);
-    let compressed: Arc<[u8]> = deflate_with_level(&decoded, 31, 6).into();
+    let compressed: Arc<[u8]> = deflate_with_level(&decoded, 31, 6).unwrap().into();
     let decoder = Decoder::builder().decoder_threads(1).build().unwrap();
     let mut group = criterion.benchmark_group("structural_analysis_fastq");
     group.throughput(Throughput::Bytes(decoded.len() as u64));
@@ -176,7 +67,7 @@ fn decode_reader(criterion: &mut Criterion) {
     group.finish();
 
     let decoded = fastq_like_bytes(32 * 1024 * 1024);
-    let compressed: Arc<[u8]> = stored_bgzf(&decoded, 4 * 1024).into();
+    let compressed: Arc<[u8]> = bgzf(&decoded, 4 * 1024, 0).unwrap().into();
     for (name, build_index) in [("count", false), ("count_with_index", true)] {
         let mut group = criterion.benchmark_group(format!("bgzf_line_{name}"));
         group.throughput(Throughput::Bytes(decoded.len() as u64));
@@ -211,7 +102,7 @@ fn decode_reader(criterion: &mut Criterion) {
     }
 
     let decoded = fastq_like_bytes(32 * 1024 * 1024);
-    let compressed: Arc<[u8]> = deflate_with_level(&decoded, 31, 6).into();
+    let compressed: Arc<[u8]> = deflate_with_level(&decoded, 31, 6).unwrap().into();
     let index_options = IndexOptions {
         checkpoint_spacing: NonZeroU64::new(1024 * 1024).expect("nonzero"),
         ..IndexOptions::default()
@@ -249,7 +140,7 @@ fn decode_reader(criterion: &mut Criterion) {
     }
     group.finish();
 
-    let decoded = pseudo_random_bytes(16 * 1024 * 1024);
+    let decoded = pseudo_random_bytes(16 * 1024 * 1024, 1);
     let encoded: Vec<_> = [
         ("gzip", Format::Gzip, 31),
         ("zlib", Format::Zlib, 15),
