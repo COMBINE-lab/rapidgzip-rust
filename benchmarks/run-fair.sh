@@ -117,7 +117,11 @@ require_command awk
 require_command sha256sum
 require_command realpath
 require_command /usr/bin/time
-if ! /usr/bin/time --version 2>&1 | head -1 | grep -q 'GNU time'; then
+time_version=$(/usr/bin/time --version 2>&1) || {
+    echo "unable to query /usr/bin/time" >&2
+    exit 2
+}
+if [[ ${time_version,,} != *gnu*time* ]]; then
     echo "release benchmarks require GNU /usr/bin/time" >&2
     exit 2
 fi
@@ -243,6 +247,7 @@ git_dirty=false
     printf 'ci_smoke\t%s\n' "$ci_smoke"
     printf 'rustc\t%s\n' "$(sanitize "$(rustc --version --verbose)")"
     printf 'cargo\t%s\n' "$(sanitize "$(cargo --version)")"
+    printf 'gnu_time\t%s\n' "$(sanitize "$time_version")"
     printf 'RUSTFLAGS\t%s\n' "$(sanitize "${RUSTFLAGS:-}")"
     printf 'LD_LIBRARY_PATH\t%s\n' "$(sanitize "${LD_LIBRARY_PATH:-}")"
     if [[ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
