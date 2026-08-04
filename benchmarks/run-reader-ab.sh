@@ -16,6 +16,7 @@ warmups=2
 delay_micros=0
 stop_after=all
 iterations=1
+reader_mode=ordinary
 cpus=${TASKSET_CPUS:-}
 results_dir=
 
@@ -37,6 +38,7 @@ Matrix:
   --delay-micros N    sleep after each successful Read (default: 0)
   --stop-after N      call finish after consuming N bytes (default: all)
   --iterations N      archives decoded per timed process (default: 1)
+  --reader-mode MODE  ordinary or indexed (default: ordinary)
   --cpus LIST         taskset CPU list applied to both implementations
   --results-dir DIR   explicit new output directory
 EOF
@@ -44,7 +46,7 @@ EOF
 
 while (($#)); do
     case $1 in
-        --corpus-dir|--baseline|--candidate|--corpora|--threads|--buffers|--runs|--warmups|--delay-micros|--stop-after|--iterations|--cpus|--results-dir)
+        --corpus-dir|--baseline|--candidate|--corpora|--threads|--buffers|--runs|--warmups|--delay-micros|--stop-after|--iterations|--reader-mode|--cpus|--results-dir)
             (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
             case $1 in
                 --corpus-dir) corpus_dir=$2 ;;
@@ -58,6 +60,7 @@ while (($#)); do
                 --delay-micros) delay_micros=$2 ;;
                 --stop-after) stop_after=$2 ;;
                 --iterations) iterations=$2 ;;
+                --reader-mode) reader_mode=$2 ;;
                 --cpus) cpus=$2 ;;
                 --results-dir) results_dir=$2 ;;
             esac
@@ -75,6 +78,10 @@ done
 [[ $warmups =~ ^[0-9]+$ ]] || { echo "--warmups must be an integer" >&2; exit 2; }
 [[ $delay_micros =~ ^[0-9]+$ ]] || { echo "--delay-micros must be an integer" >&2; exit 2; }
 [[ $iterations =~ ^[1-9][0-9]*$ ]] || { echo "--iterations must be nonzero" >&2; exit 2; }
+[[ $reader_mode == ordinary || $reader_mode == indexed ]] || {
+    echo "--reader-mode must be ordinary or indexed" >&2
+    exit 2
+}
 [[ $stop_after == all || $stop_after =~ ^[0-9]+$ ]] || {
     echo "--stop-after must be 'all' or an integer" >&2
     exit 2
@@ -154,6 +161,7 @@ printf 'timestamp_utc\tcorpus\tmode\ttool\tbackend\tthreads\trepetition\torder\t
     printf 'delay_micros\t%s\n' "$delay_micros"
     printf 'stop_after\t%s\n' "$stop_after"
     printf 'iterations\t%s\n' "$iterations"
+    printf 'reader_mode\t%s\n' "$reader_mode"
     printf 'runs\t%s\n' "$runs"
     printf 'warmups\t%s\n' "$warmups"
     printf 'uname\t%s\n' "$(uname -a)"
@@ -174,7 +182,7 @@ fi
 
 build_command() {
     local binary=$1 input=$2 thread_count=$3 buffer_bytes=$4 decoded=$5
-    command=("$binary" "$input" "$thread_count" "$buffer_bytes" "$decoded" "$delay_micros" "$stop_after" "$iterations")
+    command=("$binary" "$input" "$thread_count" "$buffer_bytes" "$decoded" "$delay_micros" "$stop_after" "$iterations" "$reader_mode")
 }
 
 run_warmup() {
@@ -193,7 +201,7 @@ run_timed() {
     local corpus=$1 tool=$2 binary=$3 thread_count=$4 buffer_bytes=$5 repetition=$6 order=$7
     local input=${corpus_path[$corpus]} decoded=${corpus_decoded[$corpus]}
     local work_bytes=$((decoded * iterations))
-    local mode="read-${buffer_bytes}b-delay-${delay_micros}us-stop-${stop_after}-iterations-${iterations}"
+    local mode="$reader_mode-read-${buffer_bytes}b-delay-${delay_micros}us-stop-${stop_after}-iterations-${iterations}"
     local prefix="$results_dir/logs/$corpus.$mode.$tool.t$thread_count.r$repetition"
     local timing="$prefix.time" stdout="$prefix.stdout" stderr="$prefix.stderr"
     local timestamp started finished elapsed exit_status status throughput timing_values
