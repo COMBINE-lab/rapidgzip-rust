@@ -131,7 +131,8 @@ The pool is created with the positional reader's coordinator and shared with
 its `ChannelOutput`. Streaming readers remain synchronous and keep threading
 their one existing vector through `next_chunk`; they do not need a pool.
 
-The channel transports a private `PooledChunk` rather than a bare vector:
+Reusable channel emissions transport a private `PooledChunk` rather than a
+bare vector:
 
 ```rust,ignore
 struct PooledChunk {
@@ -145,6 +146,11 @@ exit, including normal read completion, `finish`, reader cancellation, a
 queued message dropped after receiver shutdown, and a terminal error. The
 reader holds the wrapper as its current chunk and reads the byte slice without
 changing message or public-reader semantics.
+
+`Output::emit`, which gives the producer no replacement allocation, remains an
+unpooled channel message in phase one. Otherwise marker and specialized paths
+could fill the retained pool without having any code that calls `take`. Only
+`emit_reusable` opts into the ownership round-trip.
 
 After `ChannelOutput::emit_reusable` sends one `PooledChunk`, it calls
 `pool.take(configured_chunk_size)` and returns that distinct empty allocation
@@ -160,6 +166,12 @@ constants remain benchmark-tunable internal policy.
 
 Direct push decoding continues returning its own allocation and does not use
 the pool. This provides an otherwise-identical allocation-light control.
+
+This phase therefore benefits sequential positional readers and strict
+indexed-parallel reader handoff, both of which call `emit_reusable`. The generic
+marker path currently calls `emit` for resolved parts and is intentionally
+unchanged until phase two. A one-worker FASTQ win must not be presented as a
+multi-worker marker win.
 
 ## Phase two: marker-resolution output
 
