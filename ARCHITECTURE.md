@@ -363,11 +363,14 @@ could release.
 The adaptive target is combined with the application ceiling exposed by
 `DecoderHandle::set_worker_limit`. Workers have stable ranks and are created
 lazily only when the effective target grows. A worker above a reduced target
-finishes its current task, stops taking queue work, and exits after a 250 ms
-hysteresis interval if the reduction persists. The coordinator observes that
-exit and can recreate the missing rank if demand later returns. Thread creation
-and retirement therefore remain bounded by the same scoped lifetime as the
-source borrowed by a decode.
+finishes its current task and publishes any completed result it owns, stops
+taking queue work, and exits after a 250 ms hysteresis interval if the reduction
+persists. The coordinator observes that exit and can recreate the missing rank
+if demand later returns. If a bounded result handoff is full, a result-owning
+worker cannot retire without dropping output or moving it outside that bound;
+it remains live, normally parked between retry checks, until output advances or
+the decode is cancelled. Thread creation and retirement remain bounded by the
+same scoped lifetime as the source borrowed by a decode.
 
 `DecoderReader` supplies an additional feedback signal at the only queue that
 unambiguously represents its consumer: the final synchronous output handoff.
@@ -375,8 +378,12 @@ When that queue fills, task admission falls to one. A successful send that had
 to wait does not immediately clear the condition; a later send must complete
 without encountering a full queue. This small hysteresis prevents a slow parser
 from repeatedly restoring the full adaptive target for one available slot.
-Sustained backpressure consequently retires excess workers, while transient
-handoff jitter normally ends before their retirement timeout.
+Sustained backpressure consequently lowers the admission target and observed
+decode activity to one. Excess workers retire once they can publish any result
+they already own; until then, `spawned_workers` can remain above
+`active_workers` even though those result-owning threads perform no further
+decode work. Transient handoff jitter normally ends before the retirement
+timeout.
 
 The active limit also controls the decode/resolve scheduling horizon because
 each speculative result commonly owns several MiB of `u16` symbols. Enabled

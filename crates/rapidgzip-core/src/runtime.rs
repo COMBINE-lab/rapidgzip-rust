@@ -105,10 +105,19 @@ pub struct DecoderStats {
     /// Current application-controlled ceiling on decoder workers.
     pub worker_limit: usize,
     /// Effective decode-concurrency target after application and adaptive limits.
+    ///
+    /// This is an admission target, not the number of tasks currently executing
+    /// or the number of live operating-system threads.
     pub active_workers: usize,
-    /// Decoder workers, or the synchronous sequential caller, currently decoding.
+    /// Approximate number of decoder workers, or the synchronous sequential
+    /// caller, currently decoding.
     pub busy_workers: usize,
     /// Live decoder-worker operating-system threads.
+    ///
+    /// This can temporarily exceed [`Self::active_workers`] while a lower limit
+    /// takes effect. In particular, a worker that owns a completed result may
+    /// remain parked on a bounded handoff until output advances or the decode is
+    /// cancelled.
     pub spawned_workers: usize,
     /// Live coordinator and scanner operating-system threads.
     pub auxiliary_threads: usize,
@@ -189,10 +198,12 @@ impl DecoderHandle {
 
     /// Changes the maximum number of decoder workers that may accept work.
     ///
-    /// The method is nonblocking. Workers already executing a task finish that
-    /// task before a lower limit takes effect; persistently excess workers then
-    /// retire. Raising the limit allows the coordinator to create replacement
-    /// workers lazily when useful work is available.
+    /// The method is nonblocking. Workers already executing a task finish it and
+    /// publish any completed result they own before retiring. A worker whose
+    /// bounded result handoff is blocked therefore remains live until output
+    /// advances or the decode is cancelled. Raising the limit allows the
+    /// coordinator to create replacement workers lazily when useful work is
+    /// available.
     ///
     /// # Errors
     ///
