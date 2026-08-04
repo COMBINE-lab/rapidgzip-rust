@@ -74,17 +74,17 @@ jobs:
       - run: bash -n benchmarks/run-fair.sh benchmarks/run-matrix.sh
       - name: Prove deterministic corpus generation
         run: |
-          target/release/generate_corpora --output target/ci-corpus-a --decoded-mib 2 --seed 7
-          target/release/generate_corpora --output target/ci-corpus-b --decoded-mib 2 --seed 7
-          diff -qr target/ci-corpus-a target/ci-corpus-b
+          target/release/generate_corpora --output "$RUNNER_TEMP/rapidgzip-ci-corpus-a" --decoded-mib 2 --seed 7
+          target/release/generate_corpora --output "$RUNNER_TEMP/rapidgzip-ci-corpus-b" --decoded-mib 2 --seed 7
+          diff -qr "$RUNNER_TEMP/rapidgzip-ci-corpus-a" "$RUNNER_TEMP/rapidgzip-ci-corpus-b"
       - name: Exercise the complete Rust-only harness
-        run: benchmarks/run-fair.sh --ci-smoke --corpus-dir target/ci-corpus-a --results-dir target/ci-benchmark-results
+        run: benchmarks/run-fair.sh --ci-smoke --corpus-dir "$RUNNER_TEMP/rapidgzip-ci-corpus-a" --results-dir "$RUNNER_TEMP/rapidgzip-ci-benchmark-results"
       - name: Prove deterministic raw-result summarization
         run: |
-          target/release/summarize_results --input target/ci-benchmark-results/raw.tsv --summary-tsv target/summary-copy.tsv --summary-markdown target/SUMMARY-copy.md
-          diff target/ci-benchmark-results/summary.tsv target/summary-copy.tsv
-          test -s target/ci-benchmark-results/parity.tsv
-          test -s target/ci-benchmark-results/corpora.tsv
+          target/release/summarize_results --input "$RUNNER_TEMP/rapidgzip-ci-benchmark-results/raw.tsv" --summary-tsv "$RUNNER_TEMP/rapidgzip-summary-copy.tsv" --summary-markdown "$RUNNER_TEMP/rapidgzip-SUMMARY-copy.md"
+          diff "$RUNNER_TEMP/rapidgzip-ci-benchmark-results/summary.tsv" "$RUNNER_TEMP/rapidgzip-summary-copy.tsv"
+          test -s "$RUNNER_TEMP/rapidgzip-ci-benchmark-results/parity.tsv"
+          test -s "$RUNNER_TEMP/rapidgzip-ci-benchmark-results/corpora.tsv"
 
   msrv:
     runs-on: ubuntu-latest
