@@ -104,6 +104,15 @@ dispatch:
   automatically advantageous for irregular marker loads.
 - A conventional bit reservoir and eager multi-megabyte output preallocation
   also regressed this workload.
+- Cross-thread `DecoderReader` buffer recycling reduced a 128 MiB
+  single-member allocation profile from 145,807,326 bytes in 83 blocks to
+  53,533,488 bytes in 67 blocks, but failed the FASTQ throughput gate. Nine
+  paired, 30-archive observations with fresh builds measured the final
+  automatic prototype 2.4% faster for 8 KiB reads and 4.3% slower for 1 MiB
+  reads. Dense multi-member paraseq was initially about 6% slower, and consumer
+  and member-shape gates could not preserve the default bulk path. The core
+  implementation was removed; the full assessment and reproducible harness are
+  retained in [decoded-buffer-recycling.md](docs/design/decoded-buffer-recycling.md).
 
 These results answer the earlier AVX2 question: runtime AVX2 remains valuable
 inside zlib-rs, but the AVX2 marker design tested here was not a winner. Shipped

@@ -24,6 +24,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Programmatic-reader performance work now has an alternating A/B runner over
+  validated single-member, sparse/dense multi-member, and BGZF FASTQ, including
+  ordinary, indexed, and actual paraseq consumption. Reports compute paired
+  candidate/`main` deltas before aggregation to reduce host-state bias.
+
 - Structural analysis now uses an inlined bit-buffer fast path and one bounded
   linear history/checksum buffer. The default no-output-limit path is
   monomorphized separately, avoiding configured-limit and redundant structural

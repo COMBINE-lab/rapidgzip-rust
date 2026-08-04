@@ -40,6 +40,34 @@ struct Group {
     throughput: Vec<f64>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PairIdentity {
+    corpus: String,
+    mode: String,
+    threads: usize,
+    repetition: usize,
+}
+
+struct PairObservation {
+    wall: f64,
+    rss: f64,
+    throughput: f64,
+}
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ComparisonKey {
+    corpus: String,
+    mode: String,
+    threads: usize,
+}
+
+#[derive(Default)]
+struct Comparison {
+    throughput_percent: Vec<f64>,
+    wall_percent: Vec<f64>,
+    rss_percent: Vec<f64>,
+}
+
 struct Outputs {
     tsv: String,
     markdown: String,
@@ -126,6 +154,10 @@ fn metric(value: Option<f64>) -> String {
     value.map_or_else(String::new, |value| format!("{value:.6}"))
 }
 
+fn percent_delta(candidate: f64, baseline: f64) -> Option<f64> {
+    (baseline > 0.0).then_some((candidate / baseline - 1.0) * 100.0)
+}
+
 fn markdown_cell(value: &str) -> String {
     value.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
@@ -139,6 +171,8 @@ fn summarize(raw: &str, result_directory: &str) -> Result<Outputs, String> {
     let mut groups: BTreeMap<Key, Group> = BTreeMap::new();
     let mut attempts = BTreeSet::new();
     let mut corpus_sizes = BTreeMap::new();
+    let mut paired_observations: BTreeMap<PairIdentity, BTreeMap<String, PairObservation>> =
+        BTreeMap::new();
     for (offset, line) in lines.enumerate() {
         let line_number = offset + 2;
         if line.is_empty() {
@@ -217,15 +251,32 @@ fn summarize(raw: &str, result_directory: &str) -> Result<Outputs, String> {
         {
             return Err(format!("line {line_number}: group decoded sizes disagree"));
         }
-        group.wall.push(parse_metric(&fields, 8, "wall_seconds")?);
-        group.user.push(parse_metric(&fields, 9, "user_seconds")?);
-        group
-            .system
-            .push(parse_metric(&fields, 10, "system_seconds")?);
-        group.rss.push(parse_metric(&fields, 11, "max_rss_kib")?);
-        group
-            .throughput
-            .push(parse_metric(&fields, 13, "decoded_mib_per_second")?);
+        let wall = parse_metric(&fields, 8, "wall_seconds")?;
+        let user = parse_metric(&fields, 9, "user_seconds")?;
+        let system = parse_metric(&fields, 10, "system_seconds")?;
+        let rss = parse_metric(&fields, 11, "max_rss_kib")?;
+        let throughput = parse_metric(&fields, 13, "decoded_mib_per_second")?;
+        group.wall.push(wall);
+        group.user.push(user);
+        group.system.push(system);
+        group.rss.push(rss);
+        group.throughput.push(throughput);
+        paired_observations
+            .entry(PairIdentity {
+                corpus: key.corpus,
+                mode: key.mode,
+                threads: key.threads,
+                repetition,
+            })
+            .or_default()
+            .insert(
+                key.tool,
+                PairObservation {
+                    wall,
+                    rss,
+                    throughput,
+                },
+            );
     }
     if groups.is_empty() {
         return Err("raw input has no observations".to_owned());
@@ -277,6 +328,48 @@ fn summarize(raw: &str, result_directory: &str) -> Result<Outputs, String> {
             metric(throughput),
             metric(rss),
         ));
+    }
+
+    let mut comparisons: BTreeMap<ComparisonKey, Comparison> = BTreeMap::new();
+    for (identity, observations) in paired_observations {
+        let (Some(baseline), Some(candidate)) =
+            (observations.get("main"), observations.get("candidate"))
+        else {
+            continue;
+        };
+        let comparison = comparisons
+            .entry(ComparisonKey {
+                corpus: identity.corpus,
+                mode: identity.mode,
+                threads: identity.threads,
+            })
+            .or_default();
+        if let Some(value) = percent_delta(candidate.throughput, baseline.throughput) {
+            comparison.throughput_percent.push(value);
+        }
+        if let Some(value) = percent_delta(candidate.wall, baseline.wall) {
+            comparison.wall_percent.push(value);
+        }
+        if let Some(value) = percent_delta(candidate.rss, baseline.rss) {
+            comparison.rss_percent.push(value);
+        }
+    }
+    if !comparisons.is_empty() {
+        markdown.push_str("\n## Paired A/B comparison\n\nEach delta compares candidate and `main` within the same repetition before taking the median. Positive throughput is faster; negative wall time and RSS are lower.\n\n");
+        markdown.push_str("| Corpus | Mode | Threads | Complete pairs | Median throughput delta | Median wall delta | Median RSS delta |\n|---|---|---:|---:|---:|---:|---:|\n");
+        for (key, mut comparison) in comparisons {
+            let pair_count = comparison.throughput_percent.len();
+            markdown.push_str(&format!(
+                "| {} | {} | {} | {} | {}% | {}% | {}% |\n",
+                markdown_cell(&key.corpus),
+                markdown_cell(&key.mode),
+                key.threads,
+                pair_count,
+                metric(median(&mut comparison.throughput_percent)),
+                metric(median(&mut comparison.wall_percent)),
+                metric(median(&mut comparison.rss_percent)),
+            ));
+        }
     }
     Ok(Outputs { tsv, markdown })
 }
@@ -370,5 +463,27 @@ mod tests {
         let duplicate = row(1, "1.0", "success", 0);
         let raw = format!("{RAW_HEADER}\n{duplicate}\n{duplicate}\n");
         assert!(summarize(&raw, "results").is_err());
+    }
+
+    #[test]
+    fn candidate_and_main_are_compared_within_each_repetition() {
+        let paired_row = |tool: &str, repetition: usize, wall: &str, throughput: &str| {
+            format!(
+                "2026-08-03T00:00:00Z\tfixture\treader\t{tool}\tgzip-rs\t1\t{repetition}\t1\t{wall}\t1.0\t0.1\t100\t1048576\t{throughput}\t0\tsuccess\t\t"
+            )
+        };
+        let raw = format!(
+            "{RAW_HEADER}\n{}\n{}\n{}\n{}\n",
+            paired_row("main", 1, "2.0", "10.0"),
+            paired_row("candidate", 1, "1.0", "20.0"),
+            paired_row("main", 2, "4.0", "5.0"),
+            paired_row("candidate", 2, "2.0", "10.0"),
+        );
+        let output = summarize(&raw, "results").unwrap();
+        assert!(
+            output
+                .markdown
+                .contains("| fixture | reader | 1 | 2 | 100.000000% | -50.000000% | 0.000000% |")
+        );
     }
 }
