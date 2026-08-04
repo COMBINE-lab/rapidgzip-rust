@@ -129,9 +129,12 @@ Prefetch uses a dedicated `IndexedReaderHandle`, not `DecoderHandle`.
 decode; random seeks may decode the same bytes repeatedly and may never finish
 a member. Reusing those fields would make existing telemetry lie.
 
-The handle is cloneable and contains control/statistics state, but does not own
-the compressed source or index. Therefore an outstanding handle does not
-prevent `IndexedReader::into_inner` from returning `R` after workers join.
+The handle is cloneable and owns the control/statistics state plus a
+`Weak<PrefetchWorkContext>` used to submit ranges. It does not strongly own the
+compressed source or index. Submission upgrades that weak pointer only for the
+call; after reader shutdown it returns a closed-reader error. Therefore an
+outstanding handle does not prevent `IndexedReader::into_inner` from returning
+`R` after workers join.
 
 The initial control surface is:
 
@@ -312,4 +315,3 @@ peak RSS. Prefetch is accepted only if it improves at least one representative
 multi-range trace materially, leaves the default uncached path statistically
 unchanged, obeys the thread and memory bounds, and does not make the linear
 control slower when disabled.
-
