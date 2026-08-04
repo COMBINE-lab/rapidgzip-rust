@@ -63,6 +63,29 @@ jobs:
       - run: cargo test -p rapidgzip-core --test index_interop --locked -- --ignored --nocapture
       - run: cargo test -p rapidgzip-rust-cli --test analyze_interop --locked -- --ignored --nocapture
 
+  benchmark-tools:
+    # Validate benchmark correctness and reproducibility, never hosted-runner speed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p rapidgzip-rust-cli -p rapidgzip-bench --bin rapidgzip-rust --bin generate_corpora --bin summarize_results
+      - run: bash -n benchmarks/run-fair.sh benchmarks/run-matrix.sh
+      - name: Prove deterministic corpus generation
+        run: |
+          target/release/generate_corpora --output target/ci-corpus-a --decoded-mib 2 --seed 7
+          target/release/generate_corpora --output target/ci-corpus-b --decoded-mib 2 --seed 7
+          diff -qr target/ci-corpus-a target/ci-corpus-b
+      - name: Exercise the complete Rust-only harness
+        run: benchmarks/run-fair.sh --ci-smoke --corpus-dir target/ci-corpus-a --results-dir target/ci-benchmark-results
+      - name: Prove deterministic raw-result summarization
+        run: |
+          target/release/summarize_results --input target/ci-benchmark-results/raw.tsv --summary-tsv target/summary-copy.tsv --summary-markdown target/SUMMARY-copy.md
+          diff target/ci-benchmark-results/summary.tsv target/summary-copy.tsv
+          test -s target/ci-benchmark-results/parity.tsv
+          test -s target/ci-benchmark-results/corpora.tsv
+
   msrv:
     runs-on: ubuntu-latest
     steps:

@@ -1,6 +1,6 @@
 # Reproducible fair benchmark tooling
 
-Status: proposed and warranted
+Status: implemented by PR #23
 
 Origin: the corpus generator, parity comparison, and one-shot fair runner in
 PR #5

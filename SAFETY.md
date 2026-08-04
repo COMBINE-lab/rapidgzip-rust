@@ -74,6 +74,15 @@ only the reported produced count. Multiple internal blocks may append to one
 allocation, but the capacity proof is repeated before every call. The worker
 owns the inflater, cursor, and vector exclusively for its lifetime.
 
+The unpublished benchmark crate has a smaller DEFLATE-only adapter for corpus
+generation. It validates both slice and output-buffer lengths as `u32` before
+initializing zlib-rs, gives `deflate` live non-overlapping input and output
+allocations that cannot move during the call, and exposes only the produced
+prefix reported through `avail_out`. Initialization, the sole `Z_FINISH` call,
+and `deflateEnd` are serialized on one uniquely owned local `z_stream`;
+`deflateEnd` runs exactly once after every successful initialization. No unsafe
+function or value from this unpublished helper is part of a public decoder API.
+
 ## Resumable decoder `Send`
 
 `SequentialDecoder<C>` has a private `unsafe impl<C: Send> Send`. Its zlib-rs

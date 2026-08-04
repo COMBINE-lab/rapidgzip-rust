@@ -566,6 +566,19 @@ measurements rather than treating these results as a universal speed claim:
 - [PERFORMANCE_AUDIT.md] records the ISA-L comparison and optimization audit.
 - [CHANGELOG.md] summarizes each published release.
 
+The release runner can generate self-verified single-member, multi-member,
+true-BGZF, stored, zlib, and raw-DEFLATE controls without downloading data:
+
+```console
+benchmarks/run-fair.sh --generate --cpus 0-43
+```
+
+ISA-L, zlib-ng, and gzippy competitors are configured through explicit paths;
+the runner records their identities and versions, requires decoded SHA-256
+parity before timing, rotates measured order, and writes raw observations plus
+deterministic summaries under `target/bench-results`. See
+[BENCHMARKING.md] for the complete interface and release-host requirements.
+
 ## Platform and compatibility policy
 
 - Rust edition: 2024
