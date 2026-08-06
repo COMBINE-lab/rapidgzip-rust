@@ -29,7 +29,7 @@ use libz_rs_sys as z;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2838,6 +2838,77 @@ struct NativeResult {
     result: Result<crate::parallel::deflate::Chunk, NativeError>,
 }
 
+/// Coordinator-owned native results that have arrived ahead of output order.
+///
+/// Decode and marker-resolution work share one worker pool but publish through
+/// separate bounded channels. A coordinator waiting for resolution must keep
+/// draining this inbox so every worker cannot become blocked publishing native
+/// work. The scheduler bounds the number of queued and in-flight decode tasks;
+/// moving their completed results here therefore preserves the existing memory
+/// bound without making either result channel unbounded.
+struct NativeResultInbox {
+    receiver: mpsc::Receiver<NativeResult>,
+    pending: BTreeMap<usize, Result<crate::parallel::deflate::Chunk, NativeError>>,
+}
+
+impl NativeResultInbox {
+    fn new(receiver: mpsc::Receiver<NativeResult>) -> Self {
+        Self {
+            receiver,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    fn retain_from(&mut self, next_index: usize) {
+        self.pending.retain(|index, _| *index >= next_index);
+    }
+
+    #[inline]
+    fn offer(&mut self, result: NativeResult, next_index: usize) {
+        if result.index >= next_index {
+            self.pending.insert(result.index, result.result);
+        }
+    }
+
+    /// Moves every currently available native result out of the bounded
+    /// worker channel, discarding results made stale by a member transition.
+    fn drain_available(&mut self, next_index: usize) {
+        while let Ok(result) = self.receiver.try_recv() {
+            self.offer(result, next_index);
+        }
+    }
+
+    /// Receives one native result in task-index order.
+    #[inline]
+    fn receive(
+        &mut self,
+        next_index: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<Result<crate::parallel::deflate::Chunk, NativeError>, DecodeError> {
+        loop {
+            if let Some(result) = self.pending.remove(&next_index) {
+                return Ok(result);
+            }
+            match self.receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => self.offer(result, next_index),
+                Err(RecvTimeoutError::Timeout) => {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Err(DecodeError::Cancelled);
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(DecodeError::WorkerPanicked);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_indices(&self) -> Vec<usize> {
+        self.pending.keys().copied().collect()
+    }
+}
+
 struct ResolveTask {
     sequence: usize,
     predecessor: Window,
@@ -3370,21 +3441,44 @@ fn emit_resolved_parts<O: Output>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wait_for_resolved(
-    receiver: &mpsc::Receiver<ResolveResult>,
-    pending: &mut BTreeMap<usize, Result<ResolvedParts, crate::parallel::MarkerError>>,
+    resolve_receiver: &mpsc::Receiver<ResolveResult>,
+    resolve_pending: &mut BTreeMap<usize, Result<ResolvedParts, crate::parallel::MarkerError>>,
+    native_results: &mut NativeResultInbox,
+    next_native_index: usize,
     next_sequence: usize,
     cancelled: &AtomicBool,
     bit_offset: u64,
 ) -> Result<ResolvedParts, DecodeError> {
     let result = loop {
-        if let Some(result) = pending.remove(&next_sequence) {
+        if let Some(result) = resolve_pending.remove(&next_sequence) {
             break result;
         }
-        match receiver.recv_timeout(Duration::from_millis(10)) {
+
+        // Preserve the original immediate-result fast path. Native draining
+        // is needed only when the required resolution is not already waiting.
+        match resolve_receiver.try_recv() {
+            Ok(result) if result.sequence < next_sequence => continue,
+            Ok(result) if result.sequence == next_sequence => break result.result,
+            Ok(result) => {
+                resolve_pending.insert(result.sequence, result.result);
+                continue;
+            }
+            Err(TryRecvError::Disconnected) => return Err(DecodeError::WorkerPanicked),
+            Err(TryRecvError::Empty) => {}
+        }
+
+        // A resolution worker cannot run if every shared worker is blocked on
+        // the bounded native-result channel. Drain that channel before each
+        // short resolution wait to break the circular dependency. The short
+        // interval also bounds the race in which native results arrive after
+        // the drain but before this receive begins.
+        native_results.drain_available(next_native_index);
+        match resolve_receiver.recv_timeout(Duration::from_millis(1)) {
             Ok(result) if result.sequence < next_sequence => {}
             Ok(result) => {
-                pending.insert(result.sequence, result.result);
+                resolve_pending.insert(result.sequence, result.result);
             }
             Err(RecvTimeoutError::Timeout) => {
                 if cancelled.load(Ordering::Relaxed) {
@@ -3450,8 +3544,10 @@ fn enqueue_native_resolution(
 
 #[allow(clippy::too_many_arguments)]
 fn drain_native_resolutions<O: Output>(
-    receiver: &mpsc::Receiver<ResolveResult>,
-    pending: &mut BTreeMap<usize, Result<ResolvedParts, crate::parallel::MarkerError>>,
+    resolve_receiver: &mpsc::Receiver<ResolveResult>,
+    resolve_pending: &mut BTreeMap<usize, Result<ResolvedParts, crate::parallel::MarkerError>>,
+    native_results: &mut NativeResultInbox,
+    next_native_index: usize,
     next_sequence: &mut usize,
     outstanding: &mut usize,
     cancelled: &AtomicBool,
@@ -3462,7 +3558,15 @@ fn drain_native_resolutions<O: Output>(
     total_output: &mut u64,
 ) -> Result<(), DecodeError> {
     while *outstanding != 0 {
-        let parts = wait_for_resolved(receiver, pending, *next_sequence, cancelled, bit_offset)?;
+        let parts = wait_for_resolved(
+            resolve_receiver,
+            resolve_pending,
+            native_results,
+            next_native_index,
+            *next_sequence,
+            cancelled,
+            bit_offset,
+        )?;
         emit_resolved_parts(parts, config, output, accounting, total_output)?;
         *next_sequence += 1;
         *outstanding -= 1;
@@ -3944,12 +4048,10 @@ where
         Arc::clone(runtime),
     ));
     let worker_pool_count = adaptive_workers.worker_pool_limit().min(worker_count);
-    // Result channels need spare slots beyond the active ranks because the
-    // same pool executes marker resolution. If every worker blocks while
-    // publishing speculative decode, no rank remains to resolve an exact
-    // member bridge. The configured window carries the usual two-slot slack;
-    // the scheduling horizon below still follows the adaptive active limit, so
-    // this capacity does not admit extra speculative tasks.
+    // Decode and marker-resolution tasks share this worker pool. Both result
+    // channels use the bounded scheduling horizon; resolution waits drain the
+    // native inbox so its backpressure cannot keep every worker from servicing
+    // the higher-priority resolution queue.
     let pipeline_capacity = config
         .in_flight_chunks
         .max(worker_pool_count)
@@ -3967,7 +4069,7 @@ where
     let mut current_bit = first_deflate_bit;
     let mut next_to_schedule = initial_task_window;
     let mut next_to_emit = 0_usize;
-    let mut pending = BTreeMap::new();
+    let mut native_results = NativeResultInbox::new(receiver);
     let mut prepared_total_output = 0_u64;
     let mut next_resolve_sequence = 0_usize;
     let mut next_resolve_to_emit = 0_usize;
@@ -4033,6 +4135,8 @@ where
                 drain_native_resolutions(
                     &resolve_receiver,
                     &mut resolve_pending,
+                    &mut native_results,
+                    next_to_emit,
                     &mut next_resolve_to_emit,
                     &mut outstanding_resolves,
                     cancelled,
@@ -4135,7 +4239,7 @@ where
                     continue 'decode;
                 }
 
-                pending.retain(|index, _| *index >= target_index);
+                native_results.retain_from(target_index);
                 next_to_emit = target_index;
                 if next_to_schedule < target_index {
                     next_to_schedule = target_index;
@@ -4193,6 +4297,8 @@ where
                             let parts = wait_for_resolved(
                                 &resolve_receiver,
                                 &mut resolve_pending,
+                                &mut native_results,
+                                next_to_emit,
                                 next_resolve_to_emit,
                                 cancelled,
                                 current_bit,
@@ -4232,25 +4338,7 @@ where
             if cancelled.load(Ordering::Relaxed) {
                 return Err(DecodeError::Cancelled);
             }
-            let result = loop {
-                if let Some(result) = pending.remove(&next_to_emit) {
-                    break result;
-                }
-                match receiver.recv_timeout(Duration::from_millis(10)) {
-                    Ok(result) if result.index < next_to_emit => {}
-                    Ok(result) => {
-                        pending.insert(result.index, result.result);
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
-                        if cancelled.load(Ordering::Relaxed) {
-                            return Err(DecodeError::Cancelled);
-                        }
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        return Err(DecodeError::WorkerPanicked);
-                    }
-                }
-            };
+            let result = native_results.receive(next_to_emit, cancelled)?;
 
             let mut gap_bridge = None;
             let chunk = match result {
@@ -4277,6 +4365,8 @@ where
                 drain_native_resolutions(
                     &resolve_receiver,
                     &mut resolve_pending,
+                    &mut native_results,
+                    next_to_emit,
                     &mut next_resolve_to_emit,
                     &mut outstanding_resolves,
                     cancelled,
@@ -4325,6 +4415,8 @@ where
                     let parts = wait_for_resolved(
                         &resolve_receiver,
                         &mut resolve_pending,
+                        &mut native_results,
+                        next_to_emit,
                         next_resolve_to_emit,
                         cancelled,
                         current_bit,
@@ -4353,6 +4445,8 @@ where
                 let parts = wait_for_resolved(
                     &resolve_receiver,
                     &mut resolve_pending,
+                    &mut native_results,
+                    next_to_emit,
                     next_resolve_to_emit,
                     cancelled,
                     current_bit,
@@ -4382,6 +4476,8 @@ where
                 drain_native_resolutions(
                     &resolve_receiver,
                     &mut resolve_pending,
+                    &mut native_results,
+                    next_to_emit,
                     &mut next_resolve_to_emit,
                     &mut outstanding_resolves,
                     cancelled,
@@ -4902,10 +4998,16 @@ where
 mod tests {
     use super::{
         INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES, InputCursor, MAX_EXACT_GAP_BITS, MemberAccounting,
-        MemberHeader, SourceCursor, Window, batch_independent_headers, bridge_exact_gap,
-        find_gzip_magic, find_gzip_magic_scalar, independent_member_task_candidate_limit,
-        inflate_tail, validate_footer,
+        MemberHeader, NativeError, NativeResult, NativeResultInbox, ResolveResult, SourceCursor,
+        Window, batch_independent_headers, bridge_exact_gap, find_gzip_magic,
+        find_gzip_magic_scalar, independent_member_task_candidate_limit, inflate_tail,
+        send_native_result, send_resolve_result, validate_footer, wait_for_resolved,
     };
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+    use std::time::Duration;
 
     fn header(start: u64) -> MemberHeader {
         MemberHeader {
@@ -5118,5 +5220,68 @@ mod tests {
         let mut cursor = SourceCursor::new(encoded.as_slice(), 4).unwrap();
         assert_eq!(validate_footer(&mut cursor, 6, 0, &accounting).unwrap(), 0);
         assert_eq!(cursor.position(), 8);
+    }
+
+    #[test]
+    fn resolution_wait_drains_native_results_without_losing_order() {
+        let (finished_sender, finished_receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let stopped = Arc::new(AtomicBool::new(false));
+            let (native_sender, native_receiver) = mpsc::sync_channel(2);
+            let (resolve_sender, resolve_receiver) = mpsc::sync_channel(1);
+            for index in [0, 1] {
+                native_sender
+                    .send(NativeResult {
+                        index,
+                        result: Err(NativeError::UnexpectedEof),
+                    })
+                    .unwrap();
+            }
+
+            let worker_stopped = Arc::clone(&stopped);
+            let worker = thread::spawn(move || {
+                send_native_result(
+                    &native_sender,
+                    &worker_stopped,
+                    NativeResult {
+                        index: 2,
+                        result: Err(NativeError::UnexpectedEof),
+                    },
+                );
+                send_resolve_result(
+                    &resolve_sender,
+                    &worker_stopped,
+                    ResolveResult {
+                        sequence: 0,
+                        result: Ok((vec![1], vec![2], vec![3])),
+                    },
+                );
+            });
+
+            let mut native_results = NativeResultInbox::new(native_receiver);
+            let mut resolve_pending = BTreeMap::new();
+            let resolved = wait_for_resolved(
+                &resolve_receiver,
+                &mut resolve_pending,
+                &mut native_results,
+                1,
+                0,
+                &stopped,
+                0,
+            )
+            .unwrap();
+            worker.join().unwrap();
+            native_results.drain_available(1);
+            finished_sender
+                .send((resolved, native_results.pending_indices()))
+                .unwrap();
+        });
+
+        let (resolved, native_indices) = finished_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("resolution wait deadlocked behind the full native-result channel");
+        assert_eq!(resolved, (vec![1], vec![2], vec![3]));
+        assert_eq!(native_indices, [1, 2]);
     }
 }
