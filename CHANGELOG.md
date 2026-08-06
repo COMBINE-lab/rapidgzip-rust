@@ -5,6 +5,16 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Marker/window resolution waits now drain the bounded speculative-result
+  channel. This prevents all shared workers from blocking while publishing
+  decode results when the coordinator needs queued resolution work to finish.
+- Parallel-encoder sync flushes can no longer force an otherwise suitable
+  gzip or zlib stream off the marker/window path. Small discontinuities between
+  speculative chunks are exact-decoded with authenticated history and retain
+  the existing safe fallback for invalid or larger gaps.
+
 ## [0.2.0] - 2026-08-04
 
 ### Upgrade notes
