@@ -2,7 +2,8 @@
 
 use paraseq::{Record, fastq};
 use rapidgzip_core::{
-    DecodeError, DecodeReport, Decoder, DecoderHandle, DecoderPath, DecoderPressure, ReadAt,
+    DecodeError, DecodeReport, Decoder, DecoderHandle, DecoderPath, DecoderPool, DecoderPressure,
+    ReadAt,
 };
 use std::io::{self, Read};
 use std::sync::mpsc::{self, SyncSender};
@@ -303,6 +304,7 @@ fn assert_handle_traits<T: Clone + Send + Sync + Unpin>() {}
 #[test]
 fn decoder_handle_is_clone_send_sync_and_unpin() {
     assert_handle_traits::<DecoderHandle>();
+    assert_handle_traits::<DecoderPool>();
 }
 
 #[test]
@@ -617,6 +619,155 @@ fn runtime_limit_lazily_grows_and_retires_dense_workers() {
         handle.stats().spawned_workers <= 1
     }));
     drop(reader);
+}
+
+#[test]
+fn shared_pool_resizes_running_dense_decoders_without_overspending() {
+    let visible = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let width = visible.min(4);
+    if width < 2 {
+        return;
+    }
+
+    let pool = DecoderPool::builder()
+        .workers(width)
+        .initial_worker_limit(1)
+        .build()
+        .unwrap();
+    let decoder = Decoder::builder()
+        .decoder_threads(width)
+        .decoder_pool(pool.clone())
+        .in_flight_chunks(1)
+        .build()
+        .unwrap();
+    let (member, expected_member) = dynamic_multiblock_fixture();
+    let source_a = GatedReadAt::new(member.repeat(256));
+    let source_b = GatedReadAt::new(member.repeat(256));
+    let reader_a = decoder.reader(source_a.clone()).unwrap();
+    let reader_b = decoder.reader(source_b.clone()).unwrap();
+    reader_a.request_workers(width).unwrap();
+    reader_b.request_workers(width).unwrap();
+
+    assert!(wait_until(Duration::from_secs(5), || {
+        let stats = pool.stats();
+        stats.attached_decoders == 2
+            && stats.worker_limit == 1
+            && stats.busy_workers == 1
+            && stats.busy_workers <= stats.worker_limit
+    }));
+
+    pool.set_worker_limit(width).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        let stats = pool.stats();
+        stats.busy_workers == width
+            && stats.active_workers == width
+            && stats.busy_workers <= stats.worker_limit
+    }));
+
+    source_a.open();
+    source_b.open();
+    let expected_bytes = expected_member.len() * 256;
+    let drain = |mut reader: rapidgzip_core::DecoderReader| {
+        thread::spawn(move || {
+            let mut decoded = Vec::new();
+            reader.read_to_end(&mut decoded).unwrap();
+            let report = reader.finish().unwrap();
+            (decoded.len(), report.member_count)
+        })
+    };
+    let a = drain(reader_a).join().unwrap();
+    let b = drain(reader_b).join().unwrap();
+    assert_eq!(a, (expected_bytes, 256));
+    assert_eq!(b, (expected_bytes, 256));
+    assert!(wait_until(Duration::from_secs(5), || {
+        let stats = pool.stats();
+        stats.attached_decoders == 0
+            && stats.busy_workers == 0
+            && stats.spawned_workers == 0
+            && stats.auxiliary_threads == 0
+    }));
+}
+
+#[test]
+fn backpressured_reader_does_not_hold_the_shared_decode_slot() {
+    let (member, expected_member) = dynamic_multiblock_fixture();
+    let compressed = member.repeat(64);
+    let pool = DecoderPool::builder().workers(1).build().unwrap();
+    let decoder = Decoder::builder()
+        .decoder_threads(4)
+        .decoder_pool(pool.clone())
+        .in_flight_chunks(1)
+        .build()
+        .unwrap();
+
+    let stalled = decoder.reader(compressed.clone()).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        matches!(
+            stalled.stats().pressure,
+            DecoderPressure::ConsumerBound { .. }
+        )
+    }));
+
+    let mut progressing = decoder.reader(compressed).unwrap();
+    let mut decoded = Vec::new();
+    progressing.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, expected_member.repeat(64));
+    assert_eq!(progressing.finish().unwrap().member_count, 64);
+    assert_eq!(pool.stats().busy_workers, 0);
+    drop(stalled);
+}
+
+#[test]
+fn shared_pool_preserves_single_multi_member_and_bgzf_decoding() {
+    let pool = DecoderPool::builder().workers(2).build().unwrap();
+    let decoder = Decoder::builder()
+        .decoder_threads(4)
+        .decoder_pool(pool.clone())
+        .build()
+        .unwrap();
+    let single_expected = b"single-member\n".repeat(4096);
+    let single = member(&single_expected);
+    let (dense_member, dense_expected_member) = dynamic_multiblock_fixture();
+    let dense = dense_member.repeat(64);
+    let dense_expected = dense_expected_member.repeat(64);
+    let mut bgzf = Vec::new();
+    let mut bgzf_expected = Vec::new();
+    for index in 0..64_u32 {
+        let block = format!("@read-{index}\nACGT\n+\n!!!!\n").into_bytes();
+        bgzf.extend(bgzf_member(&block));
+        bgzf_expected.extend(block);
+    }
+    bgzf.extend(bgzf_eof());
+
+    for (compressed, expected, members) in [
+        (single, single_expected, 1),
+        (dense, dense_expected, 64),
+        (bgzf, bgzf_expected, 65),
+    ] {
+        let mut decoded = Vec::new();
+        let report = decoder.decode(&compressed, &mut decoded).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(report.member_count, members);
+        assert_eq!(pool.stats().busy_workers, 0);
+    }
+}
+
+#[test]
+fn completed_reader_detaches_from_pool_while_its_handle_remains_live() {
+    let pool = DecoderPool::builder().workers(2).build().unwrap();
+    let decoder = Decoder::builder()
+        .decoder_threads(4)
+        .decoder_pool(pool.clone())
+        .build()
+        .unwrap();
+    let (member, _) = dynamic_multiblock_fixture();
+    let mut reader = decoder.reader(member.repeat(64)).unwrap();
+    let handle = reader.handle();
+    io::copy(&mut reader, &mut io::sink()).unwrap();
+    reader.finish().unwrap();
+
+    assert!(matches!(handle.stats().pressure, DecoderPressure::Finished));
+    assert_eq!(pool.stats().attached_decoders, 0);
 }
 
 #[test]

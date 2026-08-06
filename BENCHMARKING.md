@@ -53,6 +53,86 @@ state changes between neighboring runs. A reader optimization must preserve
 all four shapes and both small and bulk ordinary reads; a single-member win
 cannot justify a dense-member or BGZF regression.
 
+Shared-pool work uses the concurrent `shared_reader_decode` target. The
+following paired commands compare two equal readers under the same aggregate
+16-worker budget: the private control gives each file the informed even split,
+while the shared case gives each file broad headroom and lets the pool allocate
+the same total dynamically.
+
+```bash
+cargo build --release --locked -p rapidgzip-bench --bin shared_reader_decode
+
+target/release/shared_reader_decode \
+  target/bench-corpora/fastq-single.gz \
+  2 16 8 1048576 268435456 1 20 private read
+
+target/release/shared_reader_decode \
+  target/bench-corpora/fastq-single.gz \
+  2 16 16 1048576 268435456 1 20 shared read
+
+# Exercise the actual downstream FASTQ parser instead of bulk Read.
+target/release/shared_reader_decode \
+  target/bench-corpora/fastq-single.gz \
+  2 16 16 1048576 268435456 1 20 shared paraseq
+
+# Force every decoder to advertise its complete headroom. Pool fairness still
+# enforces the same aggregate limit.
+target/release/shared_reader_decode \
+  target/bench-corpora/fastq-single.gz \
+  2 16 16 1048576 268435456 1 20 growing paraseq
+```
+
+Replace the decoded size and following member count with the exact
+`decoded_bytes` and `member_count` from `manifest.tsv`; the example above
+assumes a 256 MiB single-member corpus. Repeat the paired cells for
+`fastq-sparse-members`, `fastq-dense-members`, and `fastq-bgzf`, and alternate
+invocation order across at least nine measured repetitions. Include one-reader
+cells with equal `GLOBAL_WORKERS` and `DECODER_WORKERS` to isolate shared-pool
+coordination overhead. Multi-reader controls should divide the global budget
+evenly when inputs are equal, while the shared case should retain the global
+budget as every decoder's headroom. The driver verifies decoded bytes and
+member counts per reader and reports peak aggregate busy, active, spawned,
+auxiliary, queued, attached, and waiting telemetry plus sampled mean busy and
+active widths. A separate sampler observes the pool at 1 kHz so its sleep
+interval is not charged as reader-completion latency. Shared runs start the
+pool at one slot, wait for every reader to attach, and then raise the global
+limit. This exercises reliable runtime growth without letting whichever format
+scan finishes first spawn the whole budget.
+`shared` retains empirical per-decoder demand; `growing` additionally calls
+`request_workers(DECODER_WORKERS)` on every reader.
+
+A shared-pool change fails its performance gate if it materially regresses the
+one-reader private equivalent or an informed private split on equal inputs.
+Capacity-borrowing wins on unequal inputs do not excuse a standard FASTQ-shape
+regression. During an unchanged pool limit, peak `busy_workers` must not exceed
+that limit; live `spawned_workers` may be higher because retired or zero-grant
+representatives are OS-thread telemetry rather than occupied execution slots.
+
+The initial shared-pool gate ran on 2026-08-06 with CPUs 0-21, a 16-worker
+aggregate budget, five paired repetitions of five 128 MiB decodes, and private
+controls of 16, 8, or 4 workers per file for 1, 2, or 4 equal readers. Values
+below are median throughput deltas versus that private control; positive is
+faster. `growing` deliberately requests the complete 16-worker per-file floor,
+so its one-reader losses on BGZF and dense members measure an intentionally
+overwide policy rather than shared-pool coordination overhead.
+
+| FASTQ shape / consumer | shared 1 / 2 / 4 readers | growing 1 / 2 / 4 readers |
+| --- | ---: | ---: |
+| single gzip / `Read` | +1.01% / -0.37% / -1.06% | +0.96% / +0.68% / +0.74% |
+| single gzip / paraseq | -1.59% / +6.38% / +3.47% | +0.59% / +0.39% / +0.55% |
+| sparse members / `Read` | -0.91% / +0.06% / -1.85% | -0.67% / +0.28% / -0.48% |
+| sparse members / paraseq | +0.86% / +7.83% / +5.19% | -0.10% / -2.37% / +0.77% |
+| 512 dense members / `Read` | +1.04% / +86.10% / +134.69% | -8.90% / +99.98% / +162.61% |
+| 512 dense members / paraseq | +0.79% / -0.80% / +10.86% | 0.00% / +0.50% / +10.54% |
+| BGZF / `Read` | +10.64% / +7.07% / -0.35% | -6.32% / +14.58% / -0.82% |
+| BGZF / paraseq | -1.15% / -0.85% / -1.00% | -5.10% / -0.56% / -0.75% |
+
+Every shared/growing sample stayed at or below 16 simultaneously busy decode
+regions, and every invocation verified the exact decoded byte and gzip-member
+counts. The adaptive shared policy's worst median loss was 1.85%; its large
+dense-member wins come from retaining broad per-file scheduling/buffer
+headroom without overspending the aggregate execution budget.
+
 The `structural_analysis_fastq` group compares one-worker verified zlib-rs
 decode with the sequential structural walker on the same generated 16 MiB
 FASTQ-like gzip member. Both paths validate the complete container and discard

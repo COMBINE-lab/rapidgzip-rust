@@ -767,11 +767,15 @@ fn flush_decoded(
     kind: IndexKind,
     decoded: &mut Vec<u8>,
     sink: &SpanSink<'_>,
+    runtime: &RuntimeState,
 ) -> Result<(), DecodeError> {
     if decoded.is_empty() {
         return Ok(());
     }
-    let checksum = checksum_chunk(kind, decoded);
+    let checksum = {
+        let _busy = runtime.begin_pool_task();
+        checksum_chunk(kind, decoded)
+    };
     sink.send(SpanEvent::Data {
         bytes: std::mem::take(decoded),
         checksum,
@@ -789,6 +793,7 @@ fn decode_span<R: ReadAt + ?Sized>(
     resources: &mut WorkerResources<'_, R>,
     recycled: &Injector<Vec<u8>>,
     sink: &SpanSink<'_>,
+    runtime: &RuntimeState,
 ) -> Result<u64, DecodeError> {
     resources
         .cursor
@@ -857,10 +862,14 @@ fn decode_span<R: ReadAt + ?Sized>(
         resources.inflater.stream.avail_out = output_space as u32;
         let input_before = resources.inflater.stream.avail_in;
         let output_before = resources.inflater.stream.avail_out;
-        // SAFETY: the inflater is initialized and uniquely borrowed. The input
-        // cursor does not move during the call, and the output pointer covers
-        // exactly the vector's spare capacity advertised through `avail_out`.
-        let status = unsafe { z::inflate(&mut resources.inflater.stream, z::Z_BLOCK) };
+        let status = {
+            let _busy = runtime.begin_pool_task();
+            // SAFETY: the inflater is initialized and uniquely borrowed. The
+            // input cursor does not move during the call, and the output
+            // pointer covers exactly the vector's spare capacity advertised
+            // through `avail_out`.
+            unsafe { z::inflate(&mut resources.inflater.stream, z::Z_BLOCK) }
+        };
         let consumed = (input_before - resources.inflater.stream.avail_in) as usize;
         let produced = (output_before - resources.inflater.stream.avail_out) as usize;
         resources.inflater.stream.next_in = std::ptr::null();
@@ -894,7 +903,7 @@ fn decode_span<R: ReadAt + ?Sized>(
             span_output = next;
         }
         if resources.decoded.len() == config.decoded_chunk_size {
-            flush_decoded(plan.kind, &mut resources.decoded, sink)?;
+            flush_decoded(plan.kind, &mut resources.decoded, sink, runtime)?;
         }
 
         let unused_bits = u64::try_from(resources.inflater.stream.data_type & 0x3f)
@@ -912,7 +921,7 @@ fn decode_span<R: ReadAt + ?Sized>(
             // A footer is an ordered checksum boundary, so all bytes from the
             // completed member must precede its event even when a span crosses
             // into the next member.
-            flush_decoded(plan.kind, &mut resources.decoded, sink)?;
+            flush_decoded(plan.kind, &mut resources.decoded, sink, runtime)?;
             match plan.kind {
                 IndexKind::Gzip | IndexKind::Bgzf => match finish_gzip_member(
                     source,
@@ -959,7 +968,7 @@ fn decode_span<R: ReadAt + ?Sized>(
                 let target_bit = target.compressed_offset_in_bits;
                 if matches!(target.kind, CheckpointKind::DeflateBlock) {
                     if current_bit == target_bit {
-                        flush_decoded(plan.kind, &mut resources.decoded, sink)?;
+                        flush_decoded(plan.kind, &mut resources.decoded, sink, runtime)?;
                         verify_span_output(span, span_output)?;
                         sink.send(SpanEvent::Finished)?;
                         return Ok(span_output);
@@ -1082,7 +1091,10 @@ fn worker_loop<R: ReadAt + ?Sized>(
             }
         }
         let result = {
-            let _busy = adaptive.runtime.begin_task();
+            // The historical private path used one coarse telemetry guard.
+            // Shared pools instead acquire only around the inflate/checksum
+            // regions inside `decode_span`, never around a bounded send.
+            let _busy = adaptive.runtime.begin_private_task();
             decode_span(
                 source,
                 config,
@@ -1093,6 +1105,7 @@ fn worker_loop<R: ReadAt + ?Sized>(
                 resources.as_mut().expect("initialized above"),
                 recycled,
                 &sink,
+                &adaptive.runtime,
             )
         };
         let bytes = result.as_ref().copied().unwrap_or(0);
@@ -1267,6 +1280,11 @@ where
     let mut total_output = 0_u64;
     let mut line_counter = LineCounter::new(config.count_lines);
     let mut line_verifier = ImportedLineVerifier::new(index, config.count_lines);
+
+    // Make prospective work visible before the first pool allowance is read;
+    // this avoids a one-worker cold start when an idle shared pool could admit
+    // the full adaptive bootstrap immediately.
+    runtime.set_queued_tasks(plan.spans.len().min(worker_pool));
 
     let result = thread::scope(|scope| -> Result<(), DecodeError> {
         let _stop = StopGuard {

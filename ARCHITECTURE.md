@@ -210,12 +210,13 @@ annotations because it intentionally does not scan the skipped prefix.
 ## Marker/window algorithm
 
 Before the generic marker grid starts, path admission derives a useful worker
-width from the configured budget, current application ceiling,
-affinity-visible processors, the adaptive machine bootstrap, and available
-grid work. Inputs shorter than sixteen normal grid tasks, inputs without two
-complete waves, and effective one-worker runs stay sequential. Specialized
-stored, BGZF, and dense-member paths are classified first and never pay for
-this screen.
+width from immutable configured decoder/pool capacity, affinity-visible
+processors, the adaptive machine bootstrap, and available grid work. The live
+application ceiling batches screen execution but does not reduce this
+prospective width. Inputs shorter than sixteen normal grid tasks, inputs
+without two complete waves, and configured effective one-worker runs stay
+sequential. Specialized stored, BGZF, and dense-member paths are classified
+first and never pay for this screen.
 
 Eligible inputs compare the best of three exact zlib-rs service samples over a
 128 KiB compressed prefix with one concurrent adjacent 128 KiB marker task per
@@ -347,6 +348,51 @@ the effective target. This preserves a larger configured request as headroom
 without immediately multiplying worker stacks, inflaters, buffers, and
 speculative output by every processor.
 
+An optional `DecoderPool` adds a process-wide ceiling across decoder
+operations. It is an execution-slot allocator, not a permanent untyped thread
+pool: format-specific scoped worker loops keep borrowed inputs, concrete task
+types, initialized inflaters, and scratch buffers local. CPU-intensive worker,
+scanner, checksum, sequential-inflate, and coordinator fallback regions acquire
+a pool permit. No permit is retained across a bounded result or final reader
+handoff that would block, so a consumer-blocked decoder cannot occupy the
+shared budget while a peer has runnable work.
+
+The uncontended pool path uses an atomic compare-exchange. Contended tasks join
+a FIFO ticket queue under one mutex/condition variable. Spawn allowances are
+distributed round-robin with max-min fairness across attached members and their
+declared demand. Queue-empty transitions still drive `runnable_decoders`
+telemetry, but do not redistribute OS-thread allowances on every brief parser
+stall. Terminal or explicit demand decreases release reservations; growth
+caused only by a peer finishing waits for enough subsequent queue activity to
+amortize new path-local threads. Explicit demand changes and pool-limit raises
+apply immediately.
+
+The execution count is strictly bounded while live OS worker count can
+temporarily exceed the limit as ranks retire. Lowering the pool limit is
+nonblocking and lets existing permit holders finish. Queue-depth publications
+never take the scheduler mutex. Aggregate queue depth and active allowances are
+summed under a brief member-registry lock when `DecoderPool::stats` is sampled;
+the snapshot is still approximate. A completed operation detaches from
+aggregate membership after its workers join even when a cloned `DecoderHandle`
+retains the terminal per-decoder snapshot.
+
+BGZF blocks and dense tiny gzip members use a reusable worker-local slot lease.
+The lease may cross only a successful nonblocking result handoff and an
+immediately available next task; it is released before an empty-queue wait, a
+full bounded channel, cancellation, or loss of the worker's grant. This
+amortizes global permit cache-line traffic without weakening the execution
+ceiling or the no-slot-across-blocking invariant.
+
+For a shared positional reader, broad worker headroom would otherwise also
+create a broad decoded-output backlog per file. `in_flight_chunks` remains the
+physical ceiling. When a member owns less than the complete live pool, a
+sampled logical high watermark follows its current allowance plus two chunks;
+the limiter clears below the allowance and is bypassed while one decoder owns
+the pool. A short yield interval handles fast-reader jitter before parking.
+Sampling avoids adding shared-counter traffic to the unconstrained hot path;
+after the limiter activates, every handoff is checked until the low watermark
+clears it. This keeps persistent parser backpressure responsive.
+
 Streams with enough work empirically probe upward from that conservative
 bootstrap in bootstrap-sized steps while throughput materially improves, then
 probe downward around the best setting and prefer a lower count within a 3%
@@ -371,6 +417,16 @@ worker cannot retire without dropping output or moving it outside that bound;
 it remains live, normally parked between retry checks, until output advances or
 the decode is cancelled. Thread creation and retirement remain bounded by the
 same scoped lifetime as the source borrowed by a decode.
+
+`DecoderHandle::request_workers` supplies a persistent growth floor to that
+adaptive target. The hard application ceiling, consumer-backpressure cap,
+available tasks, machine affinity, and any shared-pool grant can still keep
+effective concurrency lower. Clearing the request returns target selection to
+the empirical controller. Admission into the marker/window algorithm is based
+on immutable configured decoder and pool capacity, not the transient runtime
+ceiling. A low ceiling still bounds the admission screen's simultaneous task
+execution, but cannot make the terminal path decision irreversible before an
+application later asks the decoder to grow.
 
 `DecoderReader` supplies an additional feedback signal at the only queue that
 unambiguously represents its consumer: the final synchronous output handoff.

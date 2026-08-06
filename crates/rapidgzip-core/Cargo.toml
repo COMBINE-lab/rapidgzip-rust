@@ -13,6 +13,7 @@ keywords = ["gzip", "deflate", "parallel", "zlib", "bgzf"]
 categories = ["compression", "filesystem"]
 
 [dependencies]
+bon.workspace = true
 crossbeam-deque.workspace = true
 libz-rs-sys.workspace = true
 

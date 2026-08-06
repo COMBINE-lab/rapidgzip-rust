@@ -14,6 +14,8 @@ The project provides:
   BGZF, and zlib, plus structurally validated raw DEFLATE;
 - both a push API over `std::io::Write` and an owned `std::io::Read + Send`
   stream suitable for parsers such as [paraseq];
+- opt-in process-wide decode pools, aggregate telemetry, and additive runtime
+  shrink/grow controls for multi-file consumers;
 - opt-in random-access index construction, interoperable index formats, and a
   decoded-output `Read + Seek` adapter;
 - opt-in newline counting, line-annotated indexes, and indexed seeking by
@@ -115,6 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A process-wide scheduler can reduce or restore the decoder's ceiling.
     control.set_worker_limit(8)?;
+    control.request_workers(8)?;
     let stats = control.stats();
     if matches!(stats.pressure, DecoderPressure::ConsumerBound { .. }) {
         control.set_worker_limit(2)?;
@@ -145,10 +148,95 @@ rapidgzip task activity rather than operating-system CPU utilization.
 
 For ordinary gzip, zlib, and raw-DEFLATE files, telemetry may briefly report
 `DecoderPath::MarkerAdmission`. This bounded input-aware screen compares exact
-zlib-rs work with a useful-width speculative marker wave after applying the
-configured budget, runtime ceiling, visible processors, and available task
-count. Its terminal path is `Sequential` or `MarkerWindow`; BGZF, stored, and
-dense-member inputs retain their specialized routes.
+zlib-rs work with a useful-width speculative marker wave derived from the
+immutable configured budget, visible processors, and available task count.
+The live application limit throttles how many screen tasks execute at once but
+does not irreversibly force the sequential path. A decoder opened with broad
+headroom can therefore start at a low limit and grow later. Its terminal path
+is `Sequential` or `MarkerWindow`; BGZF, stored, and dense-member inputs retain
+their specialized routes.
+
+### Shared decoder pool and explicit growth
+
+Attach cloned decoder configurations to one [`DecoderPool`] when several files
+must share a process-wide decode budget:
+
+```rust,no_run
+use rapidgzip_core::{Decoder, DecoderPool};
+use std::io;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pool = DecoderPool::builder()
+        .workers(24)
+        .initial_worker_limit(8)
+        .build()?;
+    let decoder = Decoder::builder()
+        // Per-file headroom; the pool is the aggregate ceiling.
+        .decoder_threads(24)
+        .decoder_pool(pool.clone())
+        .build()?;
+
+    let mut first = decoder.open("sample-R1.fastq.gz")?;
+    let mut second = decoder.open("sample-R2.fastq.gz")?;
+    first.request_workers(12)?;
+    second.request_workers(12)?;
+
+    // A supervisor can change the budget for all attached decoders.
+    pool.set_worker_limit(16)?;
+    let aggregate = pool.stats();
+    assert_eq!(aggregate.configured_workers, 24);
+
+    // Real applications normally drain the readers concurrently.
+    io::copy(&mut first, &mut io::sink())?;
+    io::copy(&mut second, &mut io::sink())?;
+    Ok(())
+}
+```
+
+The pool is opt-in. Omitting `decoder_pool` preserves private elastic workers
+and the existing `set_worker_limit` shrinking policy. A pool limits
+CPU-intensive decode execution slots rather than promising permanent OS
+threads: each format retains its scoped worker loop and reusable inflater
+scratch. Work blocked on ordered or final output releases its slot first, so a
+slow parser cannot strand the global execution budget. FIFO permit admission
+prevents one busy file from starving its peers.
+
+Spawn allowances use round-robin max-min allocation across attached decoders'
+declared demand, rather than reacting to every short empty-queue or parser
+stall. That stability avoids creating many path-local OS threads that become
+idle almost immediately. A terminal decoder releases its reservation; peers
+grow only after enough queued work remains to amortize new threads. Explicit
+per-decoder requests and pool-limit changes apply immediately, so an external
+scheduler can reallocate sooner when its telemetry says the change is useful.
+
+[`DecoderPool::stats`] reports aggregate busy slots, distributed active
+allowances, live decoder and auxiliary threads, queued tasks, attached/runnable
+decoders, and pool waiters. `spawned_workers` can exceed `worker_limit`: ranks
+retire asynchronously after a decrease. `busy_workers` is the hard execution
+count, except that tasks already running when a limit is lowered are allowed to
+finish. Aggregate queue and active-allowance fields briefly lock the small
+member registry to sum per-decoder counters; other counters are atomic and all
+snapshots remain approximate.
+
+[`DecoderHandle::request_workers`] is a persistent growth floor, while
+`set_worker_limit` remains a hard per-decoder ceiling. Requests are bounded by
+the immutable `decoder_threads`, can be constrained by consumer backpressure or
+pool contention, and remain recorded if the hard ceiling is temporarily lower.
+Call `clear_worker_request` to return growth entirely to empirical control.
+`DecoderStats::desired_workers` is the target before pool contention and
+`pool_limited` distinguishes shared-budget pressure from a decoder that simply
+has no useful parallel work.
+
+Shared positional readers also keep broad `decoder_threads` headroom from
+multiplying decoded buffers. The configured `in_flight_chunks` remains the
+physical maximum. When a decoder owns only part of the live pool, a sampled
+logical backlog activates above its allowance plus two output chunks and
+clears below the allowance. It applies consumer backpressure before a
+persistently slow parser fills the broad physical window, while a decoder that
+owns the whole pool bypasses the check. Brief yielding lets a fast `Read`
+consumer drain transient backlog before the producer parks. Sampling is sparse
+until the limiter activates, then observes each handoff until the backlog
+clears.
 
 ### Push decoding
 
@@ -608,8 +696,8 @@ The integration suite covers gzip, zlib, raw DEFLATE, multi-member streams,
 BGZF, corruption, format detection across short/interrupted reads, false header
 candidates, output limits and exact sizes, index construction, indexed
 full-stream parallel decode, seeking, cancellation, one-byte consumer buffers,
-line counting and seeking, CLI index/range workflows, and direct paraseq
-consumption. Generated benchmark corpora and large
+line counting and seeking, shared-pool contention/resizing/backpressure, CLI
+index/range workflows, and direct paraseq consumption. Generated benchmark corpora and large
 sequencing files are deliberately not stored in the repository.
 
 ## Releasing
@@ -649,6 +737,9 @@ MIT. See [LICENSE-BSD-3-CLAUSE] and [LICENSE-MIT].
 [`Decoder::stream_reader`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.Decoder.html#method.stream_reader
 [`DeflateIndex`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DeflateIndex.html
 [`DecoderHandle`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderHandle.html
+[`DecoderHandle::request_workers`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderHandle.html#method.request_workers
+[`DecoderPool`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderPool.html
+[`DecoderPool::stats`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderPool.html#method.stats
 [`DecoderPath::IndexedParallel`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/enum.DecoderPath.html#variant.IndexedParallel
 [`DecoderPath::Sequential`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/enum.DecoderPath.html#variant.Sequential
 [`DecoderReader::handle`]: https://docs.rs/rapidgzip-core/latest/rapidgzip_core/struct.DecoderReader.html#method.handle

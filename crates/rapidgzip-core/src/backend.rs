@@ -18,7 +18,7 @@ use crate::parallel::deflate::{
     ChunkOutput, Error as NativeError, InitialHistory, ResolvedParts, decode_to_estimated_boundary,
     find_next_structural_candidate,
 };
-use crate::runtime::{DecoderPath, RuntimeState};
+use crate::runtime::{DecoderPath, ReusableTaskSlot, RuntimeState};
 use crate::zlib::{self, Adler32};
 use crate::{
     DecodeError, DecodeReport, DeflateErrorKind, Format, GzipErrorKind, IndexedDecodeReport,
@@ -335,7 +335,10 @@ where
     // BGZF block starts are normally tens of KiB apart and only their short
     // headers are needed for indexing. A small page avoids reading the
     // complete compressed payload before decoding.
-    let bgzf_index = index_bgzf(source, config.input_page_size.min(256))?;
+    let bgzf_index = {
+        let _busy = runtime.begin_pool_task();
+        index_bgzf(source, config.input_page_size.min(256))?
+    };
     if let Some(index) = bgzf_index {
         if let Some(collector) = collector {
             collector.set_kind(IndexKind::Bgzf);
@@ -349,7 +352,11 @@ where
         }
     }
     if config.decoder_threads > 1 {
-        if let Some(index) = index_stored_stream(source, config.input_page_size.min(256))? {
+        let stored_index = {
+            let _busy = runtime.begin_pool_task();
+            index_stored_stream(source, config.input_page_size.min(256))?
+        };
+        if let Some(index) = stored_index {
             if index.tasks.len() > 1 {
                 runtime.set_path(DecoderPath::Stored);
                 if let Some(collector) = collector {
@@ -358,7 +365,7 @@ where
                 return decode_stored_parallel(source, config, cancelled, output, &index, runtime);
             }
         }
-        if let Some(index) = index_independent_members(source, config)? {
+        if let Some(index) = index_independent_members(source, config, runtime)? {
             runtime.set_path(DecoderPath::DenseMembers);
             return decode_independent_members(
                 source, config, cancelled, output, &index, runtime, collector,
@@ -762,7 +769,14 @@ where
             while let Some(result) = reordered.remove(&next_to_emit) {
                 let task = &index.tasks[next_to_emit];
                 let decoded = result?;
-                emit_accounted(decoded, config, output, &mut accounting, &mut total_output)?;
+                emit_accounted(
+                    decoded,
+                    config,
+                    output,
+                    &mut accounting,
+                    &mut total_output,
+                    runtime,
+                )?;
                 if task.last_in_member {
                     let member = index.members[task.member];
                     let (actual_crc, actual_size) = accounting
@@ -1452,7 +1466,11 @@ where
     );
     let mut reusable = Vec::with_capacity(config.decoded_chunk_size);
     loop {
-        match decoder.next_chunk(cancelled, reusable)? {
+        let item = {
+            let _busy = runtime.begin_pool_task();
+            decoder.next_chunk(cancelled, reusable)?
+        };
+        match item {
             SequentialItem::Chunk(chunk) => reusable = output.emit_reusable(chunk)?,
             SequentialItem::Finished(report) => return Ok(report),
         }
@@ -1680,6 +1698,7 @@ fn scan_independent_headers<R, F>(
     mut scan_start: u64,
     scan_end: u64,
     stopped: Option<&AtomicBool>,
+    runtime: &RuntimeState,
     mut found: F,
 ) -> Result<(), DecodeError>
 where
@@ -1703,10 +1722,12 @@ where
         let source_remaining =
             usize::try_from(compressed_size.saturating_sub(scan_start)).unwrap_or(usize::MAX);
         let read_length = source_remaining.min(unique_length.saturating_add(9));
-        read_range_reuse(source, scan_start, read_length, &mut scan)?;
-
-        let candidate_limit = unique_length.min(scan.len().saturating_sub(9));
-        find_gzip_magic(&scan, candidate_limit, &mut candidates);
+        {
+            let _busy = runtime.begin_pool_task();
+            read_range_reuse(source, scan_start, read_length, &mut scan)?;
+            let candidate_limit = unique_length.min(scan.len().saturating_sub(9));
+            find_gzip_magic(&scan, candidate_limit, &mut candidates);
+        }
         for &relative in &candidates {
             if scan[relative + 1] != 0x8B
                 || scan[relative + 2] != 8
@@ -1753,6 +1774,7 @@ where
 fn index_independent_members<R: ReadAt + ?Sized>(
     source: &R,
     config: &Config,
+    runtime: &RuntimeState,
 ) -> Result<Option<IndependentMemberIndex>, DecodeError> {
     let mut header_cursor = SourceCursor::new(source, config.input_page_size.min(256))?;
     if header_cursor.at_end() {
@@ -1768,6 +1790,7 @@ fn index_independent_members<R: ReadAt + ?Sized>(
         0,
         probe_end,
         None,
+        runtime,
         |header| headers.push(header),
     )?;
 
@@ -1992,15 +2015,21 @@ fn send_independent_result(
     sender: &mpsc::SyncSender<IndependentResult>,
     stopped: &AtomicBool,
     mut result: IndependentResult,
+    task_slot: &mut ReusableTaskSlot<'_>,
 ) -> bool {
     loop {
         if stopped.load(Ordering::Relaxed) {
+            task_slot.release();
             return false;
         }
         match sender.try_send(result) {
             Ok(()) => return true,
-            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Disconnected(_)) => {
+                task_slot.release();
+                return false;
+            }
             Err(TrySendError::Full(returned)) => {
+                task_slot.release();
                 result = returned;
                 thread::park_timeout(Duration::from_millis(1));
             }
@@ -2012,6 +2041,7 @@ fn send_finished_independent_run(
     active: &mut Option<PendingIndependentRun>,
     sender: &mpsc::SyncSender<IndependentResult>,
     stopped: &AtomicBool,
+    task_slot: &mut ReusableTaskSlot<'_>,
 ) -> bool {
     let Some(run) = active.take() else {
         return true;
@@ -2025,6 +2055,7 @@ fn send_finished_independent_run(
             candidate_count,
             result: Ok(run.decoded),
         },
+        task_slot,
     )
 }
 
@@ -2039,7 +2070,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
     inflater: &mut RawInflater,
     compressed: &mut Vec<u8>,
     sender: &mpsc::SyncSender<IndependentResult>,
-    runtime: &RuntimeState,
+    task_slot: &mut ReusableTaskSlot<'_>,
 ) -> Option<usize> {
     let target_result_size = config
         .decoded_chunk_size
@@ -2056,7 +2087,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
         if active
             .as_ref()
             .is_some_and(|run| run.decoded.end != header.start)
-            && !send_finished_independent_run(&mut active, sender, stopped)
+            && !send_finished_independent_run(&mut active, sender, stopped, task_slot)
         {
             return None;
         }
@@ -2076,20 +2107,19 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
             },
         });
         let member_output_start = run.decoded.bytes.len();
-        let result = {
-            let _busy = runtime.begin_task();
-            inflate_independent_member_into(
-                source,
-                config,
-                cancelled,
-                0,
-                header,
-                compressed_size,
-                inflater,
-                compressed,
-                &mut run.decoded.bytes,
-            )
-        };
+        task_slot.begin();
+        let result = inflate_independent_member_into(
+            source,
+            config,
+            cancelled,
+            0,
+            header,
+            compressed_size,
+            inflater,
+            compressed,
+            &mut run.decoded.bytes,
+        );
+        task_slot.end();
         match result {
             Ok(end) => {
                 let member_size = run.decoded.bytes.len() - member_output_start;
@@ -2098,7 +2128,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
                 run.decoded.push_member(header, member_size);
                 if (member_size > maximum_collatable_member_size
                     || run.decoded.bytes.len() >= target_result_size)
-                    && !send_finished_independent_run(&mut active, sender, stopped)
+                    && !send_finished_independent_run(&mut active, sender, stopped, task_slot)
                 {
                     return None;
                 }
@@ -2107,7 +2137,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
                 run.decoded.bytes.truncate(member_output_start);
                 if run.decoded.member_count() == 0 {
                     active = None;
-                } else if !send_finished_independent_run(&mut active, sender, stopped) {
+                } else if !send_finished_independent_run(&mut active, sender, stopped, task_slot) {
                     return None;
                 }
                 if !send_independent_result(
@@ -2118,6 +2148,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
                         candidate_count: 1,
                         result: Err(error),
                     },
+                    task_slot,
                 ) {
                     return None;
                 }
@@ -2125,7 +2156,7 @@ fn decode_independent_task<R: ReadAt + ?Sized>(
         }
     }
 
-    send_finished_independent_run(&mut active, sender, stopped).then_some(decoded_bytes)
+    send_finished_independent_run(&mut active, sender, stopped, task_slot).then_some(decoded_bytes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2148,13 +2179,16 @@ fn spawn_independent_worker<'scope, 'env: 'scope, R>(
 {
     scope.spawn(move || {
         let _registration = adaptive_workers.runtime.register_worker();
+        let mut task_slot = adaptive_workers.runtime.reusable_task_slot();
         let mut inflater = None;
         let mut compressed = Vec::new();
         loop {
             if stopped.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+                task_slot.release();
                 break;
             }
             if !adaptive_workers.worker_enabled(worker_index) {
+                task_slot.release();
                 if adaptive_workers.wait_until_enabled_or_retire(worker_index, &stopped) {
                     continue;
                 }
@@ -2171,6 +2205,7 @@ fn spawn_independent_worker<'scope, 'env: 'scope, R>(
                     }
                     Steal::Retry => std::hint::spin_loop(),
                     Steal::Empty => {
+                        task_slot.release();
                         if stopped.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
                             let _ = exited_sender.send(worker_index);
                             return;
@@ -2213,6 +2248,7 @@ fn spawn_independent_worker<'scope, 'env: 'scope, R>(
                                 candidate_count,
                                 result: Err(error),
                             },
+                            &mut task_slot,
                         ) {
                             let _ = exited_sender.send(worker_index);
                             return;
@@ -2233,7 +2269,7 @@ fn spawn_independent_worker<'scope, 'env: 'scope, R>(
                     .expect("the inflater was initialized immediately above"),
                 &mut compressed,
                 &sender,
-                &adaptive_workers.runtime,
+                &mut task_slot,
             ) else {
                 let _ = exited_sender.send(worker_index);
                 return;
@@ -2375,6 +2411,7 @@ where
                     index.scan_start,
                     index.compressed_size,
                     Some(&scanner_stopped),
+                    &scanner_runtime,
                     |header| {
                         if let Some(task) = builder.push(header) {
                             enqueue(task);
@@ -2710,10 +2747,14 @@ fn emit_accounted<O: Output>(
     output: &mut O,
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
+    runtime: &RuntimeState,
 ) -> Result<(), DecodeError> {
     let next_total = config.checked_output_total(*total_output, decoded.len())?;
     *total_output = next_total;
-    accounting.update(&decoded);
+    {
+        let _busy = runtime.begin_pool_task();
+        accounting.update(&decoded);
+    }
     if !decoded.is_empty() {
         output.emit(decoded)?;
     }
@@ -2731,6 +2772,7 @@ fn inflate_from_block<R, O>(
     window_bits: u8,
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
+    runtime: &RuntimeState,
 ) -> Result<u64, DecodeError>
 where
     R: ReadAt + ?Sized,
@@ -2772,10 +2814,13 @@ where
         let input_before = inflater.stream.avail_in;
         let output_before = inflater.stream.avail_out;
 
-        // SAFETY: identical pointer and lifetime argument to the main raw
-        // inflate loop above; this stream additionally has valid primed bits
-        // and a copied dictionary.
-        let status = unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) };
+        let status = {
+            let _busy = runtime.begin_pool_task();
+            // SAFETY: identical pointer and lifetime argument to the main raw
+            // inflate loop above; this stream additionally has valid primed
+            // bits and a copied dictionary.
+            unsafe { z::inflate(&mut inflater.stream, z::Z_NO_FLUSH) }
+        };
         let consumed =
             usize::try_from(input_before - inflater.stream.avail_in).expect("zlib uInt fits usize");
         let produced = usize::try_from(output_before - inflater.stream.avail_out)
@@ -2783,7 +2828,7 @@ where
         cursor.advance(consumed);
         decoded.truncate(produced);
         if !decoded.is_empty() {
-            emit_accounted(decoded, config, output, accounting, total_output)?;
+            emit_accounted(decoded, config, output, accounting, total_output, runtime)?;
         }
         match status {
             z::Z_STREAM_END => {
@@ -3433,11 +3478,19 @@ fn emit_resolved_parts<O: Output>(
     output: &mut O,
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
+    runtime: &RuntimeState,
 ) -> Result<(), DecodeError> {
     let (marked, clean, backend_tail) = parts;
-    emit_accounted(marked, config, output, accounting, total_output)?;
-    emit_accounted(clean, config, output, accounting, total_output)?;
-    emit_accounted(backend_tail, config, output, accounting, total_output)?;
+    emit_accounted(marked, config, output, accounting, total_output, runtime)?;
+    emit_accounted(clean, config, output, accounting, total_output, runtime)?;
+    emit_accounted(
+        backend_tail,
+        config,
+        output,
+        accounting,
+        total_output,
+        runtime,
+    )?;
     Ok(())
 }
 
@@ -3556,6 +3609,7 @@ fn drain_native_resolutions<O: Output>(
     output: &mut O,
     accounting: &mut MemberAccounting,
     total_output: &mut u64,
+    runtime: &RuntimeState,
 ) -> Result<(), DecodeError> {
     while *outstanding != 0 {
         let parts = wait_for_resolved(
@@ -3567,7 +3621,7 @@ fn drain_native_resolutions<O: Output>(
             cancelled,
             bit_offset,
         )?;
-        emit_resolved_parts(parts, config, output, accounting, total_output)?;
+        emit_resolved_parts(parts, config, output, accounting, total_output, runtime)?;
         *next_sequence += 1;
         *outstanding -= 1;
     }
@@ -3665,24 +3719,38 @@ fn run_admission_wave<R: ReadAt + ?Sized>(
     cancelled: &AtomicBool,
     runtime: &Arc<RuntimeState>,
 ) -> Result<Option<AdmissionWave>, DecodeError> {
-    let results = thread::scope(|scope| {
-        let mut workers = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            let worker_runtime = Arc::clone(runtime);
-            workers.push(scope.spawn(move || {
-                let _registration = worker_runtime.register_worker();
-                let _busy = worker_runtime.begin_task();
-                let mut compressed = Vec::new();
-                let task_started = Instant::now();
-                let result =
-                    run_estimated_task(source, task, maximum_output, window_bits, &mut compressed);
-                (result, task_started.elapsed())
-            }));
+    let execution_limit = runtime.application_worker_limit().max(1);
+    let results = thread::scope(|scope| -> Result<Vec<_>, DecodeError> {
+        let mut results = Vec::with_capacity(tasks.len());
+        // Admission asks whether the configured width would be useful, but it
+        // must not violate a lower live throttle while answering. Execute the
+        // screen in bounded waves and measure each task only after it acquires
+        // any shared-pool slot. The maximum per-task service time remains the
+        // conservative prospective-width input to the admission model.
+        for batch in tasks.chunks(execution_limit) {
+            let mut workers = Vec::with_capacity(batch.len());
+            for task in batch {
+                let worker_runtime = Arc::clone(runtime);
+                workers.push(scope.spawn(move || {
+                    let _registration = worker_runtime.register_worker();
+                    let _busy = worker_runtime.begin_task();
+                    let mut compressed = Vec::new();
+                    let task_started = Instant::now();
+                    let result = run_estimated_task(
+                        source,
+                        task,
+                        maximum_output,
+                        window_bits,
+                        &mut compressed,
+                    );
+                    (result, task_started.elapsed())
+                }));
+            }
+            for worker in workers {
+                results.push(worker.join().map_err(|_| DecodeError::WorkerPanicked)?);
+            }
         }
-        workers
-            .into_iter()
-            .map(|worker| worker.join().map_err(|_| DecodeError::WorkerPanicked))
-            .collect::<Result<Vec<_>, _>>()
+        Ok(results)
     })?;
     if cancelled.load(Ordering::Relaxed) {
         return Err(DecodeError::Cancelled);
@@ -3695,6 +3763,7 @@ fn run_admission_wave<R: ReadAt + ?Sized>(
     let mut decode_elapsed = Duration::ZERO;
     let mut bridge_compressed = Vec::new();
     for (result, task_elapsed) in results {
+        let _busy = runtime.begin_pool_task();
         decode_elapsed = decode_elapsed.max(task_elapsed);
         let Ok(chunk) = result else {
             return Ok(None);
@@ -3778,18 +3847,18 @@ fn probe_marker_admission<R: ReadAt + ?Sized>(
 
     const EXACT_SCREEN_SAMPLES: usize = 3;
     let mut compressed = Vec::new();
-    let exact_started = Instant::now();
-    let exact_result = {
+    let (exact_result, first_exact_elapsed) = {
         let _busy = runtime.begin_task();
-        run_estimated_task(
+        let exact_started = Instant::now();
+        let result = run_estimated_task(
             source,
             &screen_tasks[0],
             maximum_output,
             window_bits,
             &mut compressed,
-        )
+        );
+        (result, exact_started.elapsed())
     };
-    let first_exact_elapsed = exact_started.elapsed();
 
     if cancelled.load(Ordering::Relaxed) {
         return Err(DecodeError::Cancelled);
@@ -3810,18 +3879,19 @@ fn probe_marker_admission<R: ReadAt + ?Sized>(
     };
     let mut exact_elapsed_samples = [first_exact_elapsed; EXACT_SCREEN_SAMPLES];
     for elapsed in exact_elapsed_samples.iter_mut().skip(1) {
-        let started = Instant::now();
-        let repeated = {
+        let (repeated, repeated_elapsed) = {
             let _busy = runtime.begin_task();
-            run_estimated_task(
+            let started = Instant::now();
+            let result = run_estimated_task(
                 source,
                 &screen_tasks[0],
                 maximum_output,
                 window_bits,
                 &mut compressed,
-            )
+            );
+            (result, started.elapsed())
         };
-        *elapsed = started.elapsed();
+        *elapsed = repeated_elapsed;
         let Ok(repeated) = repeated else {
             return Ok(MarkerAdmission::Sequential);
         };
@@ -3855,9 +3925,7 @@ fn probe_marker_admission<R: ReadAt + ?Sized>(
 
     let exact_sample = WorkSample::new(exact_bytes, exact_elapsed);
     let screen_sample = WorkSample::new(screen.decoded_bytes, screen.elapsed);
-    if runtime.application_worker_limit() < effective_workers
-        || !screen_admits_marker(effective_workers, exact_sample, screen_sample)
-    {
+    if !screen_admits_marker(effective_workers, exact_sample, screen_sample) {
         return Ok(MarkerAdmission::Sequential);
     }
     Ok(MarkerAdmission::MarkerWindow)
@@ -3947,9 +4015,10 @@ where
     .unwrap_or(usize::MAX)
     .max(1);
     let machine_parallelism = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let admission_budget = runtime.admission_worker_budget();
     let effective_workers = effective_parallelism(
-        config.decoder_threads,
-        runtime.application_worker_limit(),
+        admission_budget,
+        admission_budget,
         machine_parallelism,
         nominal_task_count,
     );
@@ -4056,11 +4125,16 @@ where
         .in_flight_chunks
         .max(worker_pool_count)
         .min(tasks.len());
+    // Publish prospective work before consulting the pool-distributed spawn
+    // allowance. Otherwise a newly attached decoder has no runnable grant yet
+    // and would seed only one task even when the shared pool is idle.
+    runtime.set_queued_tasks(pipeline_capacity);
     let initial_task_window = adaptive_workers.current_limit().min(pipeline_capacity);
     for index in 0..initial_task_window {
         task_queue.push(index);
     }
     available_decode_tasks.store(initial_task_window, Ordering::Release);
+    runtime.set_queued_tasks(initial_task_window);
     let (sender, receiver) = mpsc::sync_channel::<NativeResult>(pipeline_capacity);
     let (resolve_sender, resolve_receiver) = mpsc::sync_channel::<ResolveResult>(pipeline_capacity);
 
@@ -4145,6 +4219,7 @@ where
                     output,
                     &mut accounting,
                     &mut total_output,
+                    runtime,
                 )?;
                 if format == Format::Zlib {
                     frame_cursor.seek(offset)?;
@@ -4234,6 +4309,7 @@ where
                         window_bits,
                         &mut accounting,
                         &mut total_output,
+                        runtime,
                     )?);
                     prepared_total_output = total_output;
                     continue 'decode;
@@ -4269,13 +4345,16 @@ where
                         .min(length_bits),
                     exact_start: true,
                 };
-                let bridge_result = run_estimated_task(
-                    source,
-                    &bridge,
-                    maximum_output,
-                    window_bits,
-                    &mut bridge_compressed,
-                );
+                let bridge_result = {
+                    let _busy = runtime.begin_pool_task();
+                    run_estimated_task(
+                        source,
+                        &bridge,
+                        maximum_output,
+                        window_bits,
+                        &mut bridge_compressed,
+                    )
+                };
                 match bridge_result {
                     Ok(chunk) if chunk.start_bit as u64 == current_bit => {
                         let reached_stream_end = enqueue_native_resolution(
@@ -4309,6 +4388,7 @@ where
                                 output,
                                 &mut accounting,
                                 &mut total_output,
+                                runtime,
                             )?;
                             next_resolve_to_emit += 1;
                             outstanding_resolves -= 1;
@@ -4328,6 +4408,7 @@ where
                             window_bits,
                             &mut accounting,
                             &mut total_output,
+                            runtime,
                         )?);
                         prepared_total_output = total_output;
                     }
@@ -4345,6 +4426,7 @@ where
                 Ok(chunk) if chunk.start_bit as u64 == current_bit => Some(chunk),
                 Ok(chunk) => {
                     gap_bridge = usize::try_from(current_bit).ok().and_then(|start_bit| {
+                        let _busy = runtime.begin_pool_task();
                         bridge_exact_gap(
                             source,
                             start_bit,
@@ -4375,6 +4457,7 @@ where
                     output,
                     &mut accounting,
                     &mut total_output,
+                    runtime,
                 )?;
                 footer_offset = Some(inflate_from_block(
                     source,
@@ -4386,6 +4469,7 @@ where
                     window_bits,
                     &mut accounting,
                     &mut total_output,
+                    runtime,
                 )?);
                 prepared_total_output = total_output;
                 continue 'decode;
@@ -4421,7 +4505,14 @@ where
                         cancelled,
                         current_bit,
                     )?;
-                    emit_resolved_parts(parts, config, output, &mut accounting, &mut total_output)?;
+                    emit_resolved_parts(
+                        parts,
+                        config,
+                        output,
+                        &mut accounting,
+                        &mut total_output,
+                        runtime,
+                    )?;
                     next_resolve_to_emit += 1;
                     outstanding_resolves -= 1;
                 }
@@ -4451,7 +4542,14 @@ where
                     cancelled,
                     current_bit,
                 )?;
-                emit_resolved_parts(parts, config, output, &mut accounting, &mut total_output)?;
+                emit_resolved_parts(
+                    parts,
+                    config,
+                    output,
+                    &mut accounting,
+                    &mut total_output,
+                    runtime,
+                )?;
                 next_resolve_to_emit += 1;
                 outstanding_resolves -= 1;
             }
@@ -4486,6 +4584,7 @@ where
                     output,
                     &mut accounting,
                     &mut total_output,
+                    runtime,
                 )?;
                 footer_offset = Some(inflate_from_block(
                     source,
@@ -4497,6 +4596,7 @@ where
                     window_bits,
                     &mut accounting,
                     &mut total_output,
+                    runtime,
                 )?);
                 prepared_total_output = total_output;
             }
@@ -4702,14 +4802,21 @@ fn send_bgzf_result(
     sender: &mpsc::SyncSender<BgzfResult>,
     stopped: &AtomicBool,
     mut result: BgzfResult,
+    task_slot: &mut ReusableTaskSlot<'_>,
 ) {
     loop {
         if stopped.load(Ordering::Relaxed) {
+            task_slot.release();
             return;
         }
         match sender.try_send(result) {
-            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Ok(()) => return,
+            Err(TrySendError::Disconnected(_)) => {
+                task_slot.release();
+                return;
+            }
             Err(TrySendError::Full(returned)) => {
+                task_slot.release();
                 result = returned;
                 thread::park_timeout(Duration::from_millis(1));
             }
@@ -4718,6 +4825,7 @@ fn send_bgzf_result(
 }
 
 const BGZF_BLOCKS_PER_TASK: usize = 8;
+const SHARED_POOL_BGZF_TASK_PREFETCH: usize = 2;
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_bgzf_worker<'scope, 'env: 'scope, R>(
@@ -4726,6 +4834,7 @@ fn spawn_bgzf_worker<'scope, 'env: 'scope, R>(
     source: &'env R,
     cancelled: &'env AtomicBool,
     ranges: &'env [BgzfRange],
+    blocks_per_task: usize,
     queue: Arc<Injector<usize>>,
     stopped: Arc<AtomicBool>,
     available_tasks: Arc<AtomicUsize>,
@@ -4738,6 +4847,7 @@ fn spawn_bgzf_worker<'scope, 'env: 'scope, R>(
 {
     scope.spawn(move || {
         let _registration = adaptive_workers.runtime.register_worker();
+        let mut task_slot = adaptive_workers.runtime.reusable_task_slot();
         let mut compressed = Vec::new();
         let mut inflater = None;
         loop {
@@ -4745,6 +4855,7 @@ fn spawn_bgzf_worker<'scope, 'env: 'scope, R>(
                 break;
             }
             if !adaptive_workers.worker_enabled(worker_index) {
+                task_slot.release();
                 if adaptive_workers.wait_until_enabled_or_retire(worker_index, &stopped) {
                     continue;
                 }
@@ -4761,6 +4872,7 @@ fn spawn_bgzf_worker<'scope, 'env: 'scope, R>(
                     }
                     Steal::Retry => std::hint::spin_loop(),
                     Steal::Empty => {
+                        task_slot.release();
                         if stopped.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
                             let _ = exited_sender.send(worker_index);
                             return;
@@ -4785,40 +4897,39 @@ fn spawn_bgzf_worker<'scope, 'env: 'scope, R>(
                 continue;
             };
             let generation = adaptive_workers.start_work();
-            let first_block = task_index * BGZF_BLOCKS_PER_TASK;
-            let past_last_block = (first_block + BGZF_BLOCKS_PER_TASK).min(ranges.len());
+            let first_block = task_index * blocks_per_task;
+            let past_last_block = (first_block + blocks_per_task).min(ranges.len());
             let mut decoded =
                 Vec::with_capacity((past_last_block - first_block).saturating_mul(64 * 1024));
-            let result = {
-                let _busy = adaptive_workers.runtime.begin_task();
-                (|| {
-                    if inflater.is_none() {
-                        inflater = Some(RawInflater::new()?);
+            task_slot.begin();
+            let result = (|| {
+                if inflater.is_none() {
+                    inflater = Some(RawInflater::new()?);
+                }
+                let inflater = inflater
+                    .as_mut()
+                    .expect("the inflater was initialized immediately above");
+                for (range_index, &range) in ranges
+                    .iter()
+                    .enumerate()
+                    .take(past_last_block)
+                    .skip(first_block)
+                {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Err(DecodeError::Cancelled);
                     }
-                    let inflater = inflater
-                        .as_mut()
-                        .expect("the inflater was initialized immediately above");
-                    for (range_index, &range) in ranges
-                        .iter()
-                        .enumerate()
-                        .take(past_last_block)
-                        .skip(first_block)
-                    {
-                        if cancelled.load(Ordering::Relaxed) {
-                            return Err(DecodeError::Cancelled);
-                        }
-                        decode_bgzf_block_into(
-                            source,
-                            range,
-                            range_index as u64,
-                            &mut compressed,
-                            &mut decoded,
-                            inflater,
-                        )?;
-                    }
-                    Ok(decoded)
-                })()
-            };
+                    decode_bgzf_block_into(
+                        source,
+                        range,
+                        range_index as u64,
+                        &mut compressed,
+                        &mut decoded,
+                        inflater,
+                    )?;
+                }
+                Ok(decoded)
+            })();
+            task_slot.end();
             let decoded_bytes = result.as_ref().map_or(0, Vec::len);
             adaptive_workers.observe_work(generation, decoded_bytes);
             send_bgzf_result(
@@ -4828,6 +4939,7 @@ fn spawn_bgzf_worker<'scope, 'env: 'scope, R>(
                     index: task_index,
                     result,
                 },
+                &mut task_slot,
             );
         }
         let _ = exited_sender.send(worker_index);
@@ -4846,7 +4958,8 @@ where
     R: ReadAt + ?Sized,
     O: Output,
 {
-    let task_count = ranges.len().div_ceil(BGZF_BLOCKS_PER_TASK);
+    let blocks_per_task = BGZF_BLOCKS_PER_TASK;
+    let task_count = ranges.len().div_ceil(blocks_per_task);
     let worker_count = config.decoder_threads.min(task_count);
     let machine_parallelism = thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let adaptive_workers = Arc::new(AdaptiveWorkers::new(
@@ -4861,8 +4974,16 @@ where
     let stopped = Arc::new(AtomicBool::new(false));
     let available_tasks = Arc::new(AtomicUsize::new(0));
     let work_signal = Arc::new((Mutex::new(()), Condvar::new()));
-    let task_window = adaptive_workers.current_limit().min(task_count);
+    runtime.set_queued_tasks(task_count);
     let pending_limit = config.in_flight_chunks.max(worker_pool_count);
+    let task_window = if runtime.uses_shared_pool() {
+        adaptive_workers
+            .current_limit()
+            .saturating_mul(SHARED_POOL_BGZF_TASK_PREFETCH)
+            .min(task_count)
+    } else {
+        adaptive_workers.current_limit().min(task_count)
+    };
     for index in 0..task_window {
         task_queue.push(index);
     }
@@ -4900,6 +5021,7 @@ where
                     source,
                     cancelled,
                     ranges,
+                    blocks_per_task,
                     Arc::clone(&task_queue),
                     Arc::clone(&stopped),
                     Arc::clone(&available_tasks),
@@ -4941,13 +5063,16 @@ where
                     output.emit(decoded)?;
                 }
                 next_to_emit += 1;
-                runtime.set_member_count(
-                    (next_to_emit * BGZF_BLOCKS_PER_TASK).min(ranges.len()) as u64
-                );
+                runtime.set_member_count((next_to_emit * blocks_per_task).min(ranges.len()) as u64);
             }
 
             let active_limit = adaptive_workers.current_limit();
-            while running < active_limit
+            let scheduling_limit = if runtime.uses_shared_pool() {
+                active_limit.saturating_mul(SHARED_POOL_BGZF_TASK_PREFETCH)
+            } else {
+                active_limit
+            };
+            while running < scheduling_limit
                 && next_to_schedule < task_count
                 && reordered.len() < pending_limit
             {

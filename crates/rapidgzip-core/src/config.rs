@@ -3,6 +3,7 @@ use crate::backend::{
 };
 use crate::format::FormatSelection;
 use crate::gzip::StreamCursor;
+use crate::pool::DecoderPool;
 use crate::reader;
 use crate::runtime::RuntimeState;
 use crate::{
@@ -44,6 +45,7 @@ pub(crate) struct Config {
     pub(crate) expected_uncompressed_size: Option<u64>,
     pub(crate) count_lines: bool,
     pub(crate) format: FormatSelection,
+    pub(crate) decoder_pool: Option<DecoderPool>,
 }
 
 impl Config {
@@ -106,9 +108,10 @@ impl Config {
 /// Defaults use [`std::thread::available_parallelism`] as the maximum decoder
 /// budget, 4 MiB decoded chunks, 1 MiB positional input pages and compressed
 /// grid spacing, `decoder_threads + 2` in-flight chunks, strict gzip framing,
-/// no output limit or exact-size expectation, and no line counting. The defaults favor
-/// throughput; applications with tight memory budgets can
-/// reduce the worker budget, decoded chunk size, or in-flight count.
+/// no output limit or exact-size expectation, no line counting, and no shared
+/// decoder pool. The defaults favor throughput; applications with tight
+/// memory budgets can reduce the worker budget, decoded chunk size, or
+/// in-flight count.
 #[derive(Clone, Debug)]
 pub struct DecoderBuilder {
     config: Config,
@@ -130,6 +133,7 @@ impl Default for DecoderBuilder {
                 expected_uncompressed_size: None,
                 count_lines: false,
                 format: FormatSelection::default(),
+                decoder_pool: None,
             },
         }
     }
@@ -240,6 +244,18 @@ impl DecoderBuilder {
         self
     }
 
+    /// Attaches every decode created by this reusable configuration to a
+    /// process-wide execution-slot pool.
+    ///
+    /// The pool is opt-in. Without it, every decoder retains the existing
+    /// private elastic-worker behavior. With it, `decoder_threads` remains the
+    /// per-decoder maximum while the pool enforces an additional aggregate
+    /// limit across every attached operation.
+    pub fn decoder_pool(mut self, pool: DecoderPool) -> Self {
+        self.config.decoder_pool = Some(pool);
+        self
+    }
+
     /// Validates the configuration and creates a reusable decoder.
     ///
     /// # Errors
@@ -302,7 +318,10 @@ impl Decoder {
     {
         let cancelled = AtomicBool::new(false);
         let mut sink = DirectOutput::new(output);
-        let runtime = RuntimeState::new(self.config.decoder_threads);
+        let runtime = RuntimeState::new(
+            self.config.decoder_threads,
+            self.config.decoder_pool.as_ref(),
+        );
         decode_source(source, &self.config, &cancelled, &mut sink, &runtime)
     }
 
@@ -404,7 +423,10 @@ impl Decoder {
     {
         let cancelled = AtomicBool::new(false);
         let mut sink = DirectOutput::new(output);
-        let runtime = RuntimeState::new(self.config.decoder_threads);
+        let runtime = RuntimeState::new(
+            self.config.decoder_threads,
+            self.config.decoder_pool.as_ref(),
+        );
         decode_source_with_index(
             source,
             &self.config,
@@ -473,7 +495,10 @@ impl Decoder {
         let plan = crate::indexed_parallel::IndexedPlan::build(source, &self.config, index)?;
         let cancelled = AtomicBool::new(false);
         let mut sink = DirectOutput::new(output);
-        let runtime = RuntimeState::new(self.config.decoder_threads);
+        let runtime = RuntimeState::new(
+            self.config.decoder_threads,
+            self.config.decoder_pool.as_ref(),
+        );
         crate::indexed_parallel::decode(
             source,
             &self.config,
@@ -621,7 +646,10 @@ impl Decoder {
     {
         let cancelled = AtomicBool::new(false);
         let mut sink = DirectOutput::new(output);
-        let runtime = RuntimeState::new(self.config.decoder_threads);
+        let runtime = RuntimeState::new(
+            self.config.decoder_threads,
+            self.config.decoder_pool.as_ref(),
+        );
         let mut cursor = StreamCursor::new(source, self.config.input_page_size);
         decode_stream(&mut cursor, &self.config, &cancelled, &mut sink, &runtime)
     }
@@ -649,7 +677,10 @@ impl Decoder {
     {
         let cancelled = AtomicBool::new(false);
         let mut sink = DirectOutput::new(output);
-        let runtime = RuntimeState::new(self.config.decoder_threads);
+        let runtime = RuntimeState::new(
+            self.config.decoder_threads,
+            self.config.decoder_pool.as_ref(),
+        );
         let mut cursor = StreamCursor::new(source, self.config.input_page_size);
         decode_stream_with_index(
             &mut cursor,

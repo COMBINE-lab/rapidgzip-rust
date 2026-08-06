@@ -93,6 +93,41 @@
 //! workers finish their current task and retire; sustained reader backpressure
 //! also reduces admission automatically.
 //!
+//! # Shared decode budgets
+//!
+//! [`DecoderPool`] is an opt-in process-wide execution budget for applications
+//! decoding several files at once. Clone one pool into each reusable
+//! [`DecoderBuilder::decoder_pool`] configuration. Stable max-min spawn
+//! allowances follow attached decoders' declared demand, while CPU-intensive
+//! tasks acquire a fair global slot and release it before a bounded output
+//! handoff would block. Completion releases reservations, and explicit demand
+//! or pool-limit changes redistribute them immediately. Without a pool, the
+//! existing private elastic-worker behavior is unchanged.
+//!
+//! ```no_run
+//! use rapidgzip_core::{Decoder, DecoderPool};
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let pool = DecoderPool::builder().workers(16).build()?;
+//! let decoder = Decoder::builder()
+//!     .decoder_threads(16)
+//!     .decoder_pool(pool.clone())
+//!     .build()?;
+//! let reader = decoder.open("reads.fastq.gz")?;
+//! let control = reader.handle();
+//! control.request_workers(8)?;
+//! pool.set_worker_limit(12)?;
+//! # drop(reader);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`DecoderHandle::request_workers`] sets a persistent growth floor distinct
+//! from the hard ceiling set by [`DecoderHandle::set_worker_limit`].
+//! [`DecoderStats::desired_workers`] exposes demand before pool contention and
+//! [`DecoderStats::pool_limited`] identifies shared-budget pressure. Algorithm
+//! admission uses immutable configured capacity; a low live throttle therefore
+//! cannot permanently latch an otherwise suitable input to sequential decode.
+//!
 //! # Structural analysis
 //!
 //! [`Decoder::analyze`] and [`Decoder::analyze_stream`] verify the complete
@@ -149,6 +184,7 @@ mod indexed;
 mod indexed_parallel;
 mod inflate;
 mod line;
+mod pool;
 mod read_at;
 mod reader;
 mod runtime;
@@ -173,6 +209,9 @@ pub use index::{
     IndexReadOptions, StoredWindow, WindowMap, WindowStorage,
 };
 pub use indexed::{IndexedReader, IndexedReaderError};
+pub use pool::{DecoderPool, DecoderPoolConfigError, DecoderPoolLimitError, DecoderPoolStats};
 pub use read_at::ReadAt;
 pub use reader::{DecoderReader, IndexingDecoderReader};
-pub use runtime::{DecoderHandle, DecoderPath, DecoderPressure, DecoderStats, WorkerLimitError};
+pub use runtime::{
+    DecoderHandle, DecoderPath, DecoderPressure, DecoderStats, WorkerLimitError, WorkerRequestError,
+};

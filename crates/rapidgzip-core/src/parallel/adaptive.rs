@@ -88,6 +88,7 @@ impl AdaptiveConcurrency {
     }
 
     /// Largest worker rank that calibration can enable for this machine.
+    #[cfg(test)]
     pub(crate) const fn worker_pool_limit(&self) -> usize {
         self.maximum
     }
@@ -279,6 +280,7 @@ pub(crate) struct AdaptiveWorkers {
     calibrating: AtomicBool,
     worker_pool_limit: usize,
     observed_limit_epoch: AtomicUsize,
+    observed_pool_limit_epoch: AtomicUsize,
     pub(crate) runtime: Arc<RuntimeState>,
 }
 
@@ -295,7 +297,12 @@ impl AdaptiveWorkers {
         let current_limit = controller.current_limit();
         let generation = controller.generation();
         let calibrating = !controller.is_stable();
-        let worker_pool_limit = controller.worker_pool_limit();
+        // Preserve the complete configured extent for an explicit runtime
+        // growth request even when a short input does not justify empirical
+        // calibration. Worker threads and scratch remain lazily created.
+        let worker_pool_limit = maximum
+            .min(machine_parallelism.max(1))
+            .min(work_items.max(1));
         runtime.set_adaptive_target(current_limit);
         runtime.set_best_workers(controller.best_limit());
         Self {
@@ -304,6 +311,7 @@ impl AdaptiveWorkers {
             calibrating: AtomicBool::new(calibrating),
             worker_pool_limit,
             observed_limit_epoch: AtomicUsize::new(runtime.limit_epoch()),
+            observed_pool_limit_epoch: AtomicUsize::new(runtime.pool_limit_epoch()),
             runtime,
         }
     }
@@ -331,22 +339,40 @@ impl AdaptiveWorkers {
     }
 
     pub(crate) fn start_work(&self) -> Option<usize> {
-        if !self.calibrating.load(Ordering::Acquire) {
+        if self.runtime.request_saturates_configured_workers() {
             return None;
+        }
+        if !self.calibrating.load(Ordering::Acquire) {
+            let limit_unchanged =
+                self.observed_limit_epoch.load(Ordering::Relaxed) == self.runtime.limit_epoch();
+            let pool_unchanged = self.observed_pool_limit_epoch.load(Ordering::Relaxed)
+                == self.runtime.pool_limit_epoch();
+            if limit_unchanged && pool_unchanged {
+                return None;
+            }
+            self.calibrating.store(true, Ordering::Release);
         }
         let generation = self.generation.load(Ordering::Acquire);
         let limit_epoch = self.runtime.limit_epoch();
+        let pool_limit_epoch = self.runtime.pool_limit_epoch();
         let mut controller = self
             .controller
             .lock()
             .expect("adaptive worker mutex poisoned");
-        if self
+        let epoch_changed = self
             .observed_limit_epoch
             .swap(limit_epoch, Ordering::AcqRel)
             != limit_epoch
-            || self.current_limit() != controller.current_limit()
-        {
+            || self
+                .observed_pool_limit_epoch
+                .swap(pool_limit_epoch, Ordering::AcqRel)
+                != pool_limit_epoch;
+        let target_mismatch = self.current_limit() != controller.current_limit();
+        if epoch_changed || target_mismatch {
             controller.pause_observation();
+            if target_mismatch {
+                self.calibrating.store(false, Ordering::Release);
+            }
             return None;
         }
         controller.start_work(generation, Instant::now());

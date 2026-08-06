@@ -5,6 +5,36 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in `DecoderPool` process-wide decode budgets with a validated `bon`
+  builder, runtime resizing, stable max-min cross-decoder allocation, fair
+  contended admission, and aggregate queue/thread/activity telemetry. Existing
+  decoders retain private elastic scheduling unless a pool is attached.
+- Persistent runtime growth through `DecoderHandle::request_workers` and
+  reader forwarding methods. `DecoderStats` now exposes the explicit request,
+  desired concurrency before pool contention, and whether the shared pool is
+  limiting progress.
+- A concurrent programmatic-reader benchmark driver for shared versus private
+  scheduling through both ordinary `Read` and paraseq FASTQ parsing.
+
+### Changed
+
+- Marker/window admission now uses immutable configured decoder and pool
+  capacity rather than the transient application ceiling. A low early throttle
+  bounds screen execution but no longer permanently latches a suitable stream
+  to the sequential path, allowing reliable later growth.
+- Pool execution accounting covers specialized workers, sequential chunks,
+  bounded format scans, coordinator bridges/fallbacks, and ordered checksums.
+  Permits are released before bounded result and final reader handoffs so a
+  backpressured decoder cannot strand capacity needed by another file.
+- Shared BGZF and dense-member workers amortize global permit traffic with a
+  worker-local lease that is retained only across nonblocking handoffs and
+  immediately available work. Shared positional readers sample an
+  allowance-sized logical output backlog only when the pool is divided, so
+  broad per-file headroom does not multiply persistent parser buffering or
+  penalize a sole fast reader.
+
 ## [0.2.1] - 2026-08-05
 
 ### Fixed

@@ -9,14 +9,14 @@ use crate::indexed_parallel::IndexedPlan;
 use crate::runtime::{AuxiliaryKind, RuntimeState};
 use crate::{
     DecodeError, DecodeReport, DecoderHandle, DecoderStats, IndexedDecodeReport, IndexingError,
-    ReadAt, WorkerLimitError,
+    ReadAt, WorkerLimitError, WorkerRequestError,
 };
 use std::io::{self, IoSliceMut, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 enum Message {
     Data(Vec<u8>),
@@ -38,14 +38,74 @@ struct ChannelOutput {
     sender: SyncSender<Message>,
     cancelled: Arc<AtomicBool>,
     runtime: Arc<RuntimeState>,
+    shared_backlog: bool,
+    backlog_limited: bool,
+    backlog_probe_count: usize,
+    backlog_clear_probes: usize,
 }
 
 impl ChannelOutput {
-    fn send(&self, mut message: Message) -> Result<(), DecodeError> {
+    const SHARED_BACKLOG_PROBE_INTERVAL: usize = 8;
+    const SHARED_BACKLOG_CLEAR_PROBES: usize = 4;
+    const SHARED_BACKLOG_YIELD_TIME: Duration = Duration::from_micros(250);
+
+    fn send(&mut self, mut message: Message, byte_count: usize) -> Result<(), DecodeError> {
         let mut observed_full = false;
+        let mut logical_backlog_started = None;
+        let sample_backlog = if byte_count == 0 || !self.shared_backlog {
+            false
+        } else if self.backlog_limited {
+            // Once sustained lag crosses the high watermark, observe every
+            // handoff until the low watermark clears it. This makes the
+            // limiter responsive for parsers without charging the ordinary
+            // fast path for per-chunk cross-thread counter loads.
+            true
+        } else {
+            self.backlog_probe_count = self.backlog_probe_count.wrapping_add(1);
+            // The byte counters are already maintained for telemetry, but
+            // loading the consumer-owned counter for every tiny BGZF result
+            // creates measurable cache-line traffic. Sampling once per small
+            // batch bounds overshoot while leaving a fast Read consumer's hot
+            // path close to the ordinary bounded channel.
+            self.backlog_probe_count
+                .is_multiple_of(Self::SHARED_BACKLOG_PROBE_INTERVAL)
+        };
+        if sample_backlog
+            && !self.backlog_limited
+            && self.runtime.shared_output_backlog_pressure(byte_count).0
+        {
+            self.backlog_limited = true;
+            self.backlog_clear_probes = 0;
+        }
+        let probe_backlog = sample_backlog && self.backlog_limited;
         loop {
             if self.cancelled.load(Ordering::Relaxed) {
                 return Err(DecodeError::Cancelled);
+            }
+            if probe_backlog {
+                let (full, below_low_watermark) =
+                    self.runtime.shared_output_backlog_pressure(byte_count);
+                if full {
+                    self.backlog_clear_probes = 0;
+                    observed_full = true;
+                    self.runtime.set_consumer_blocked(true);
+                    let started = *logical_backlog_started.get_or_insert_with(Instant::now);
+                    if started.elapsed() < Self::SHARED_BACKLOG_YIELD_TIME {
+                        thread::yield_now();
+                    } else {
+                        thread::park_timeout(Duration::from_millis(1));
+                    }
+                    continue;
+                }
+                if below_low_watermark {
+                    self.backlog_clear_probes += 1;
+                    if self.backlog_clear_probes >= Self::SHARED_BACKLOG_CLEAR_PROBES {
+                        self.backlog_limited = false;
+                        self.backlog_clear_probes = 0;
+                    }
+                } else {
+                    self.backlog_clear_probes = 0;
+                }
             }
             match self.sender.try_send(message) {
                 Ok(()) => {
@@ -69,7 +129,7 @@ impl ChannelOutput {
 impl Output for ChannelOutput {
     fn emit(&mut self, chunk: Vec<u8>) -> Result<(), DecodeError> {
         let byte_count = chunk.len();
-        self.send(Message::Data(chunk))?;
+        self.send(Message::Data(chunk), byte_count)?;
         self.runtime.add_decompressed_bytes(byte_count);
         Ok(())
     }
@@ -125,6 +185,7 @@ fn spawn_coordinator<F>(
     decode: F,
     in_flight_chunks: usize,
     configured_workers: usize,
+    decoder_pool: Option<&crate::DecoderPool>,
 ) -> Result<DecoderReader, DecodeError>
 where
     F: FnOnce(
@@ -137,7 +198,8 @@ where
 {
     let (sender, receiver) = mpsc::sync_channel(in_flight_chunks);
     let cancelled = Arc::new(AtomicBool::new(false));
-    let runtime = RuntimeState::new(configured_workers);
+    let runtime = RuntimeState::new(configured_workers, decoder_pool);
+    let shared_backlog = decoder_pool.is_some();
     let handle = DecoderHandle::new(Arc::clone(&runtime));
     let worker_cancelled = Arc::clone(&cancelled);
     let worker_runtime = Arc::clone(&runtime);
@@ -149,6 +211,10 @@ where
                 sender,
                 cancelled: Arc::clone(&worker_cancelled),
                 runtime: Arc::clone(&worker_runtime),
+                shared_backlog,
+                backlog_limited: false,
+                backlog_probe_count: 0,
+                backlog_clear_probes: 0,
             };
             let terminal = match decode(&worker_cancelled, &mut output, &worker_runtime) {
                 Ok(completion) => {
@@ -166,7 +232,7 @@ where
                 Err(IndexingError::Decode(error)) => Message::Failed(Failure::Decode(error)),
                 Err(error) => Message::Failed(Failure::Indexing(error)),
             };
-            let _ = output.send(terminal);
+            let _ = output.send(terminal, 0);
         })
         .map_err(DecodeError::output_io)?;
 
@@ -189,6 +255,7 @@ where
 {
     let in_flight_chunks = config.in_flight_chunks;
     let configured_workers = config.decoder_threads;
+    let decoder_pool = config.decoder_pool.clone();
     spawn_coordinator(
         move |cancelled, output, runtime| {
             decode_source(&source, &config, cancelled, output, runtime)
@@ -197,6 +264,7 @@ where
         },
         in_flight_chunks,
         configured_workers,
+        decoder_pool.as_ref(),
     )
 }
 
@@ -210,6 +278,7 @@ where
 {
     let in_flight_chunks = config.in_flight_chunks;
     let configured_workers = config.decoder_threads;
+    let decoder_pool = config.decoder_pool.clone();
     spawn_coordinator(
         move |cancelled, output, runtime| {
             decode_source_with_index(&source, &config, cancelled, output, runtime, options)
@@ -217,6 +286,7 @@ where
         },
         in_flight_chunks,
         configured_workers,
+        decoder_pool.as_ref(),
     )
     .map(|inner| IndexingDecoderReader { inner })
 }
@@ -232,6 +302,7 @@ where
 {
     let in_flight_chunks = config.in_flight_chunks;
     let configured_workers = config.decoder_threads;
+    let decoder_pool = config.decoder_pool.clone();
     spawn_coordinator(
         move |cancelled, output, runtime| {
             crate::indexed_parallel::decode(
@@ -242,6 +313,7 @@ where
         },
         in_flight_chunks,
         configured_workers,
+        decoder_pool.as_ref(),
     )
 }
 
@@ -257,7 +329,7 @@ where
     let source: Box<dyn Read + Send> = Box::new(source);
     let mut cursor = StreamCursor::new(source, config.input_page_size);
     validate_initial_stream(&mut cursor, &config)?;
-    let runtime = RuntimeState::new(config.decoder_threads);
+    let runtime = RuntimeState::new(config.decoder_threads, config.decoder_pool.as_ref());
     let handle = DecoderHandle::new(Arc::clone(&runtime));
     let decoder = SequentialDecoder::new(
         cursor,
@@ -293,7 +365,7 @@ where
     let source: Box<dyn Read + Send> = Box::new(source);
     let mut cursor = StreamCursor::new(source, config.input_page_size);
     validate_initial_stream(&mut cursor, &config)?;
-    let runtime = RuntimeState::new(config.decoder_threads);
+    let runtime = RuntimeState::new(config.decoder_threads, config.decoder_pool.as_ref());
     let handle = DecoderHandle::new(Arc::clone(&runtime));
     let collector = IndexCollector::new(options, config.count_lines);
     let decoder = SequentialDecoder::new(
@@ -347,6 +419,23 @@ impl DecoderReader {
     /// worker budget.
     pub fn set_worker_limit(&self, workers: usize) -> Result<(), WorkerLimitError> {
         self.handle.set_worker_limit(workers)
+    }
+
+    /// Requests a persistent adaptive growth floor.
+    ///
+    /// This forwards to [`DecoderHandle::request_workers`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerRequestError`] for zero or a value above the configured
+    /// worker budget.
+    pub fn request_workers(&self, workers: usize) -> Result<(), WorkerRequestError> {
+        self.handle.request_workers(workers)
+    }
+
+    /// Clears a persistent adaptive growth request.
+    pub fn clear_worker_request(&self) {
+        self.handle.clear_worker_request();
     }
 
     /// Returns the report after verified EOF has been observed.
@@ -435,6 +524,7 @@ impl DecoderReader {
                     Ok(()) => Terminal::Finished(completion),
                     Err(error) => Terminal::Failed(Failure::Decode(error)),
                 };
+                self.handle.state.detach_pool();
                 self.terminal = terminal;
             }
             Some(Message::Failed(error)) => {
@@ -443,6 +533,7 @@ impl DecoderReader {
                     Ok(()) => Terminal::Failed(error),
                     Err(join_error) => Terminal::Failed(Failure::Decode(join_error)),
                 };
+                self.handle.state.detach_pool();
                 self.terminal = terminal;
             }
             None => {
@@ -451,6 +542,7 @@ impl DecoderReader {
                     .join_worker()
                     .err()
                     .unwrap_or(DecodeError::WorkerPanicked);
+                self.handle.state.detach_pool();
                 self.terminal = Terminal::Failed(Failure::Decode(error));
             }
         }
@@ -533,6 +625,21 @@ impl IndexingDecoderReader {
     /// worker budget.
     pub fn set_worker_limit(&self, workers: usize) -> Result<(), WorkerLimitError> {
         self.inner.set_worker_limit(workers)
+    }
+
+    /// Requests a persistent adaptive growth floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerRequestError`] for zero or a value above the configured
+    /// worker budget.
+    pub fn request_workers(&self, workers: usize) -> Result<(), WorkerRequestError> {
+        self.inner.request_workers(workers)
+    }
+
+    /// Clears a persistent adaptive growth request.
+    pub fn clear_worker_request(&self) {
+        self.inner.clear_worker_request();
     }
 
     /// Returns the indexed result after verified EOF has been observed.
@@ -632,6 +739,7 @@ impl Drop for DecoderReader {
             receiver.take();
             let _ = self.join_worker();
         }
+        self.handle.state.detach_pool();
     }
 }
 
