@@ -156,6 +156,12 @@ enum Terminal {
 /// and joined on drop. A non-seekable source is decoded synchronously as this
 /// reader is pulled, so dropping it immediately drops the source and never
 /// leaves a blocked coordinator thread behind.
+///
+/// Obtain [`Self::handle`] before moving this value into a parser or
+/// `Box<dyn Read + Send>` when another component needs telemetry or runtime
+/// worker control. [`Self::stats`], [`Self::set_worker_limit`],
+/// [`Self::request_workers`], and [`Self::clear_worker_request`] are convenience
+/// methods for callers that retain the concrete reader.
 #[must_use]
 pub struct DecoderReader {
     mode: ReaderMode,
@@ -397,12 +403,15 @@ impl DecoderReader {
     /// Returns a cloneable telemetry and runtime-control handle.
     ///
     /// The handle can be retained after moving this reader into a parser or a
-    /// `Box<dyn Read + Send>`.
+    /// `Box<dyn Read + Send>`. Clones observe and control the same operation.
     pub fn handle(&self) -> DecoderHandle {
         self.handle.clone()
     }
 
     /// Returns an approximate lock-free snapshot of decoder activity.
+    ///
+    /// See [`DecoderStats`] for the distinction between configured headroom,
+    /// the active target, executing tasks, and live threads.
     pub fn stats(&self) -> DecoderStats {
         self.handle.stats()
     }
@@ -411,7 +420,8 @@ impl DecoderReader {
     ///
     /// This is a convenience forwarding method for
     /// [`DecoderHandle::set_worker_limit`]. Retain a handle when the reader
-    /// will be moved into another component.
+    /// will be moved into another component. The value is a hard ceiling, not
+    /// a request to use that many workers.
     ///
     /// # Errors
     ///
@@ -423,7 +433,9 @@ impl DecoderReader {
 
     /// Requests a persistent adaptive growth floor.
     ///
-    /// This forwards to [`DecoderHandle::request_workers`].
+    /// This forwards to [`DecoderHandle::request_workers`]. The request is a
+    /// floor under adaptive demand but remains subject to the hard worker
+    /// ceiling, shared-pool capacity, available work, and backpressure.
     ///
     /// # Errors
     ///
@@ -434,6 +446,8 @@ impl DecoderReader {
     }
 
     /// Clears a persistent adaptive growth request.
+    ///
+    /// The current hard worker ceiling is not changed.
     pub fn clear_worker_request(&self) {
         self.handle.clear_worker_request();
     }
@@ -608,16 +622,23 @@ pub struct IndexingDecoderReader {
 
 impl IndexingDecoderReader {
     /// Returns a cloneable telemetry and runtime-control handle.
+    ///
+    /// Retain this before moving the reader into a parser or trait object.
     pub fn handle(&self) -> DecoderHandle {
         self.inner.handle()
     }
 
     /// Returns an approximate lock-free snapshot of decoder activity.
+    ///
+    /// See [`DecoderStats`] for field relationships and snapshot limitations.
     pub fn stats(&self) -> DecoderStats {
         self.inner.stats()
     }
 
     /// Changes the maximum number of workers that may accept decoder tasks.
+    ///
+    /// This is a hard ceiling rather than a request to use that many workers;
+    /// it forwards to [`DecoderHandle::set_worker_limit`].
     ///
     /// # Errors
     ///
@@ -629,6 +650,9 @@ impl IndexingDecoderReader {
 
     /// Requests a persistent adaptive growth floor.
     ///
+    /// The request remains subject to the hard worker ceiling, shared-pool
+    /// capacity, available work, and consumer backpressure.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerRequestError`] for zero or a value above the configured
@@ -638,6 +662,8 @@ impl IndexingDecoderReader {
     }
 
     /// Clears a persistent adaptive growth request.
+    ///
+    /// The current hard worker ceiling is not changed.
     pub fn clear_worker_request(&self) {
         self.inner.clear_worker_request();
     }

@@ -112,6 +112,11 @@ impl Config {
 /// decoder pool. The defaults favor throughput; applications with tight
 /// memory budgets can reduce the worker budget, decoded chunk size, or
 /// in-flight count.
+///
+/// A built [`Decoder`] is cheap to clone and can start multiple operations.
+/// Each operation receives its own runtime telemetry and control handle. If a
+/// [`DecoderPool`] is attached, those operations additionally share the pool's
+/// aggregate execution budget.
 #[derive(Clone, Debug)]
 pub struct DecoderBuilder {
     config: Config,
@@ -142,9 +147,15 @@ impl Default for DecoderBuilder {
 impl DecoderBuilder {
     /// Sets the maximum decoder-worker budget.
     ///
-    /// Individual paths may use fewer active workers when the input exposes
-    /// less parallelism or when a larger speculative window would reduce
-    /// throughput through memory pressure.
+    /// This is immutable headroom for each operation started by the built
+    /// [`Decoder`], not an eager operating-system thread count or a requested
+    /// steady-state width. Individual paths may use fewer active workers when
+    /// the input exposes less parallelism, the consumer is backpressured, or
+    /// empirical control finds that a wider speculative window would not
+    /// improve throughput. Use [`crate::DecoderHandle::stats`] to observe the
+    /// selected width, [`crate::DecoderHandle::set_worker_limit`] for a mutable
+    /// hard ceiling, and [`crate::DecoderHandle::request_workers`] for an
+    /// explicit growth floor.
     ///
     /// This also resets the in-flight chunk count to `threads + 2`. Call
     /// [`DecoderBuilder::in_flight_chunks`] afterward to override that value.
@@ -250,7 +261,9 @@ impl DecoderBuilder {
     /// The pool is opt-in. Without it, every decoder retains the existing
     /// private elastic-worker behavior. With it, `decoder_threads` remains the
     /// per-decoder maximum while the pool enforces an additional aggregate
-    /// limit across every attached operation.
+    /// limit across every attached operation. Clone the same pool into every
+    /// builder whose work should participate in that budget; cloning the pool
+    /// does not allocate threads.
     pub fn decoder_pool(mut self, pool: DecoderPool) -> Self {
         self.config.decoder_pool = Some(pool);
         self

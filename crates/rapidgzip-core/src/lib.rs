@@ -85,13 +85,38 @@
 //! streaming inflater synchronously from [`std::io::Read::read`], so dropping it
 //! immediately drops the source and cannot strand a thread blocked on input.
 //!
-//! [`DecoderBuilder::decoder_threads`] sets a maximum worker budget rather than
-//! eagerly creating that many threads. Parallel paths grow an elastic worker
-//! population from an affinity- and budget-aware bootstrap. A cloned
-//! [`DecoderHandle`] provides lock-free telemetry and can change the runtime
-//! ceiling after a [`DecoderReader`] moves into another component. Excess
-//! workers finish their current task and retire; sustained reader backpressure
-//! also reduces admission automatically.
+//! # Worker budgets and runtime control
+//!
+//! [`DecoderBuilder::decoder_threads`] sets immutable per-operation headroom;
+//! it is neither an eager thread count nor a promise that every input will use
+//! that width. Parallel paths grow an elastic worker population from an
+//! affinity-, budget-, and workload-aware bootstrap, probe wider settings only
+//! when enough independent work exists, and prefer a narrower setting when its
+//! measured throughput is effectively tied. Sequential and short inputs can
+//! therefore use much less than the configured maximum.
+//!
+//! A cloned [`DecoderHandle`] remains usable after a [`DecoderReader`] moves
+//! into another component. Its controls have deliberately different meanings:
+//!
+//! - [`DecoderHandle::set_worker_limit`] changes a hard per-operation ceiling;
+//! - [`DecoderHandle::request_workers`] supplies a persistent growth floor
+//!   beneath that ceiling; and
+//! - when configured, [`DecoderPool::set_worker_limit`] changes the aggregate
+//!   execution ceiling shared by attached operations.
+//!
+//! Ignoring temporary consumer backpressure, the per-operation target is
+//! conceptually:
+//!
+//! ```text
+//! min(worker_limit, max(adaptive_target, requested_workers))
+//! ```
+//!
+//! Available tasks and an optional shared-pool grant can reduce actual
+//! concurrency further. Excess workers finish their current task and retire;
+//! sustained reader backpressure also reduces local admission automatically.
+//! [`DecoderStats`] separates configured headroom, application policy, the
+//! adaptive target, pool-limited admission, executing tasks, and live threads.
+//! Its snapshots are instantaneous rather than high-water measurements.
 //!
 //! # Shared decode budgets
 //!

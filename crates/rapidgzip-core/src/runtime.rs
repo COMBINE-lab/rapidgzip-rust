@@ -96,7 +96,23 @@ pub enum DecoderPressure {
 ///
 /// Fields are loaded independently with relaxed atomic ordering. A snapshot is
 /// therefore suitable for telemetry and scheduling feedback, but is not a
-/// transactionally consistent record of a single instant.
+/// transactionally consistent record of a single instant. Every counter is a
+/// current value rather than a lifetime high-water mark.
+///
+/// Worker fields form the following hierarchy:
+///
+/// 1. [`Self::configured_workers`] is immutable per-operation headroom;
+/// 2. [`Self::worker_limit`] is the application's hard ceiling;
+/// 3. [`Self::requested_workers`] is an optional floor under adaptive demand;
+/// 4. [`Self::desired_workers`] is the resulting target before pool contention;
+/// 5. [`Self::active_workers`] is the target after an optional pool grant;
+/// 6. [`Self::busy_workers`] counts tasks executing now; and
+/// 7. [`Self::spawned_workers`] counts live decoder-worker OS threads.
+///
+/// Available tasks, path selection, worker startup/retirement, and handoff
+/// backpressure mean these values need not be equal. For example, a final
+/// `spawned_workers` sample cannot prove the maximum width used during an
+/// earlier adaptive probe.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct DecoderStats {
@@ -108,7 +124,10 @@ pub struct DecoderStats {
     pub worker_limit: usize,
     /// Persistent application growth request before hard ceilings.
     ///
-    /// `None` leaves the target entirely under adaptive control.
+    /// `None` leaves the target entirely under adaptive control. `Some(n)` is
+    /// set by [`DecoderHandle::request_workers`] and can remain above the
+    /// current [`Self::worker_limit`] so a later ceiling increase takes effect
+    /// without repeating the request.
     pub requested_workers: Option<usize>,
     /// Worker count requested after adaptive and application policy but before
     /// shared-pool contention.
@@ -132,6 +151,9 @@ pub struct DecoderStats {
     /// Live coordinator and scanner operating-system threads.
     pub auxiliary_threads: usize,
     /// Empirically selected worker count, once calibration has completed.
+    ///
+    /// This remains the controller's unconstrained choice even when an
+    /// explicit request or shared-pool grant changes actual admission.
     pub best_workers: Option<usize>,
     /// Decompressed bytes emitted into the final output handoff.
     pub decompressed_bytes: u64,
@@ -215,7 +237,35 @@ impl Error for WorkerRequestError {}
 /// Cloneable telemetry and control handle for a running [`crate::DecoderReader`].
 ///
 /// The handle remains usable after the reader has moved into another component
-/// such as a FASTQ parser. Cloning a handle does not create decoder workers.
+/// such as a FASTQ parser. Cloning a handle does not create decoder workers and
+/// does not keep the decode alive after its reader and coordinator finish.
+/// Retained handles continue to expose the terminal snapshot.
+///
+/// # Examples
+///
+/// ```no_run
+/// use rapidgzip_core::{Decoder, DecoderPressure};
+/// use std::io::Read;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let reader = Decoder::builder()
+///     .decoder_threads(32)
+///     .build()?
+///     .open("reads.fastq.gz")?;
+/// let control = reader.handle();
+/// let mut parser_input: Box<dyn Read + Send> = Box::new(reader);
+///
+/// // Existing callers can impose only a hard ceiling.
+/// control.set_worker_limit(8)?;
+/// // A scheduler can also ask adaptive control to grow up to that ceiling.
+/// control.request_workers(8)?;
+/// if matches!(control.stats().pressure, DecoderPressure::ConsumerBound { .. }) {
+///     control.set_worker_limit(2)?;
+/// }
+/// std::io::copy(&mut parser_input, &mut std::io::sink())?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct DecoderHandle {
     pub(crate) state: Arc<RuntimeState>,
@@ -236,6 +286,10 @@ impl DecoderHandle {
     }
 
     /// Returns an approximate lock-free snapshot of decoder activity.
+    ///
+    /// Sampling does not coordinate with worker threads and is suitable for a
+    /// supervisory polling loop. See [`DecoderStats`] for field relationships
+    /// and snapshot limitations.
     pub fn stats(&self) -> DecoderStats {
         self.state.stats()
     }
@@ -247,7 +301,10 @@ impl DecoderHandle {
     /// bounded result handoff is blocked therefore remains live until output
     /// advances or the decode is cancelled. Raising the limit allows the
     /// coordinator to create replacement workers lazily when useful work is
-    /// available.
+    /// available. This method changes permission, not adaptive demand: raising
+    /// the ceiling alone does not force the decoder to use more workers. Use
+    /// [`Self::request_workers`] when the application has made that allocation
+    /// decision explicitly.
     ///
     /// # Errors
     ///
@@ -265,7 +322,8 @@ impl DecoderHandle {
     /// retained, so raising that ceiling later can grow without another
     /// request. Consumer backpressure, insufficient tasks, a sequential path,
     /// and contention in an attached [`DecoderPool`] can all keep actual
-    /// concurrency below the request.
+    /// concurrency below the request. Worker threads are still created lazily;
+    /// this method does not synchronously spawn or reserve `workers` threads.
     ///
     /// # Errors
     ///
@@ -277,6 +335,9 @@ impl DecoderHandle {
 
     /// Clears a persistent growth request and returns targeting entirely to
     /// the decoder's adaptive controller.
+    ///
+    /// The hard ceiling last set through [`Self::set_worker_limit`] is
+    /// unchanged.
     pub fn clear_worker_request(&self) {
         self.state.clear_worker_request();
     }

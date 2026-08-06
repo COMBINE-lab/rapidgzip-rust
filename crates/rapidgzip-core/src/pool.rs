@@ -53,7 +53,10 @@ impl Error for DecoderPoolLimitError {}
 ///
 /// Fields are sampled independently. The member list is held briefly while
 /// aggregate queue depth is summed, but the snapshot is not a transactionally
-/// consistent view of a single instant.
+/// consistent view of a single instant. Counts describe current state, not
+/// lifetime maxima. In particular, `spawned_workers` can exceed `worker_limit`
+/// while threads retire after a decrease, and `busy_workers` can temporarily
+/// exceed a newly lowered limit while already-admitted tasks finish.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct DecoderPoolStats {
@@ -64,6 +67,9 @@ pub struct DecoderPoolStats {
     /// Decode tasks currently holding a pool execution slot.
     pub busy_workers: usize,
     /// Worker allowances currently distributed across attached decoders.
+    ///
+    /// An allowance permits a decoder to keep a worker representative; it is
+    /// not an occupied execution slot. Compare with [`Self::busy_workers`].
     pub active_workers: usize,
     /// Live decoder-worker operating-system threads attached to the pool.
     pub spawned_workers: usize,
@@ -87,6 +93,46 @@ pub struct DecoderPoolStats {
 /// storage, while CPU-intensive tasks acquire a fair pool slot. A task releases
 /// its slot before any result or reader-channel operation that would block, so
 /// a slow consumer cannot occupy the shared decode budget.
+///
+/// The pool is opt-in and does not alter decoders built without
+/// [`crate::DecoderBuilder::decoder_pool`]. Its `workers` value is an immutable
+/// maximum; [`Self::set_worker_limit`] can change the live aggregate ceiling.
+/// Decoders retain their own per-operation maximum and adaptive policy, so a
+/// pool slot can remain unused when no attached input exposes useful work.
+///
+/// Under contention, stable max-min allowances prevent every decoder from
+/// spawning its complete configured headroom, while FIFO permit admission
+/// prevents one decoder from monopolizing execution. Cloning a pool shares the
+/// same state and does not create threads or reserve slots.
+///
+/// # Examples
+///
+/// ```no_run
+/// use rapidgzip_core::{Decoder, DecoderPool};
+/// use std::io;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let pool = DecoderPool::builder()
+///     .workers(24)
+///     .initial_worker_limit(8)
+///     .build()?;
+/// let decoder = Decoder::builder()
+///     .decoder_threads(24) // Per-operation headroom.
+///     .decoder_pool(pool.clone())
+///     .build()?;
+///
+/// let mut first = decoder.open("sample-R1.fastq.gz")?;
+/// let mut second = decoder.open("sample-R2.fastq.gz")?;
+/// first.request_workers(12)?;
+/// second.request_workers(12)?;
+/// pool.set_worker_limit(16)?; // Aggregate execution ceiling.
+///
+/// // Applications normally consume independent readers concurrently.
+/// io::copy(&mut first, &mut io::sink())?;
+/// io::copy(&mut second, &mut io::sink())?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct DecoderPool {
     pub(crate) state: Arc<PoolState>,
@@ -105,7 +151,11 @@ impl fmt::Debug for DecoderPool {
 impl DecoderPool {
     /// Creates a process-wide decoder pool.
     ///
-    /// Use [`DecoderPool::builder`] for named configuration.
+    /// Use [`DecoderPool::builder`] for named configuration. `workers` is the
+    /// immutable maximum number of simultaneously occupied decode execution
+    /// slots. `initial_worker_limit` optionally starts the mutable aggregate
+    /// ceiling below that maximum so an external scheduler can grow it later.
+    /// Neither value eagerly creates operating-system threads.
     ///
     /// # Errors
     ///
@@ -136,7 +186,8 @@ impl DecoderPool {
     ///
     /// The small member registry is locked briefly to sum per-decoder queue
     /// depths and allowances. No decoder task or pool permit is held while
-    /// waiting for this snapshot.
+    /// waiting for this snapshot. The returned value is [`Copy`] and does not
+    /// retain or control the pool.
     pub fn stats(&self) -> DecoderPoolStats {
         self.state.stats()
     }
@@ -145,7 +196,9 @@ impl DecoderPool {
     ///
     /// The operation is nonblocking. Existing tasks retain their slots until
     /// they finish CPU-intensive work; no new task is admitted above the lower
-    /// limit. Raising the limit wakes queued decoders immediately.
+    /// limit. Raising the limit redistributes worker allowances and wakes
+    /// queued decoders immediately. The value is an aggregate ceiling, not a
+    /// request that the pool keep that many tasks busy.
     ///
     /// # Errors
     ///
