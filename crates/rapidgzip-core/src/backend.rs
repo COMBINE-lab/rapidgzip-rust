@@ -2992,6 +2992,23 @@ struct BackendTail {
     reached_stream_end: bool,
 }
 
+/// Largest discontinuity that the ordered coordinator will bridge exactly.
+///
+/// Parallel encoders such as pigz can place a tiny empty stored or fixed block
+/// between two otherwise adjacent dynamic blocks when they perform a sync
+/// flush. Structural search deliberately starts only at dynamic blocks, so it
+/// can skip that flush block. Keeping this limit small prevents an unrelated
+/// false-positive candidate from turning a substantial part of the stream
+/// into ordered coordinator work.
+const MAX_EXACT_GAP_BITS: usize = 64 * 8;
+
+/// Extra compressed input exposed to zlib-rs past an exact gap boundary.
+///
+/// Optimized DEFLATE implementations may read several bytes ahead even when
+/// `Z_BLOCK` stops at the requested boundary. This is only input visibility;
+/// [`inflate_tail`] still requires the decoded end bit to match exactly.
+const EXACT_GAP_LOOKAHEAD_BYTES: u64 = 64;
+
 fn inflate_tail(
     bytes: &[u8],
     start_bit: usize,
@@ -3000,6 +3017,29 @@ fn inflate_tail(
     maximum_output: usize,
     exact_stop: bool,
     window_bits: u8,
+) -> Result<BackendTail, NativeError> {
+    inflate_tail_with_capacity(
+        bytes,
+        start_bit,
+        stop_bit,
+        window,
+        maximum_output,
+        exact_stop,
+        window_bits,
+        2 * 1024 * 1024,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inflate_tail_with_capacity(
+    bytes: &[u8],
+    start_bit: usize,
+    stop_bit: usize,
+    window: &Window,
+    maximum_output: usize,
+    exact_stop: bool,
+    window_bits: u8,
+    initial_output_capacity: usize,
 ) -> Result<BackendTail, NativeError> {
     let mut inflater =
         RawInflater::new_with_window_bits(window_bits).map_err(|_| NativeError::InvalidSymbol)?;
@@ -3019,10 +3059,10 @@ fn inflate_tail(
         .set_dictionary_bytes(dictionary, start_bit as u64)
         .map_err(|_| NativeError::InvalidDistance)?;
 
-    // Typical 1 MiB compressed grid chunks expand to roughly 1--2 MiB. An
-    // eager 2 MiB ceiling avoids repeated growth/copying without reserving the
-    // much larger adversarial-output allowance for every worker.
-    let mut output = Vec::with_capacity(maximum_output.min(2 * 1024 * 1024));
+    // Normal grid tasks reserve 2 MiB to avoid growth and copying. Short exact
+    // bridges request less because their usual output is empty, while the
+    // output-limit path below still permits a highly compressed gap to grow.
+    let mut output = Vec::with_capacity(initial_output_capacity.min(maximum_output));
     loop {
         let input = bytes
             .get(input_position..)
@@ -3118,6 +3158,78 @@ fn inflate_tail(
             return Err(NativeError::UnexpectedEof);
         }
     }
+}
+
+/// Exact-decodes a small forward gap between ordered speculative chunks.
+///
+/// Success proves that `stop_bit` is an actual DEFLATE block boundary and
+/// returns all bytes produced by the intervening block(s). The caller must use
+/// the returned clean chunk before resolving the speculative chunk at
+/// `stop_bit`, so history and checksum accounting remain in stream order.
+#[cold]
+#[inline(never)]
+fn bridge_exact_gap<R: ReadAt + ?Sized>(
+    source: &R,
+    start_bit: usize,
+    stop_bit: usize,
+    predecessor: &Window,
+    maximum_output: usize,
+    window_bits: u8,
+    compressed: &mut Vec<u8>,
+) -> Result<Option<crate::parallel::deflate::Chunk>, NativeError> {
+    let Some(gap_bits) = stop_bit.checked_sub(start_bit) else {
+        return Ok(None);
+    };
+    if gap_bits == 0 || gap_bits > MAX_EXACT_GAP_BITS {
+        return Ok(None);
+    }
+
+    let byte_start = start_bit / 8;
+    let byte_stop = stop_bit.div_ceil(8);
+    let source_length = source.len().map_err(|_| NativeError::UnexpectedEof)?;
+    let read_end = u64::try_from(byte_stop)
+        .map_err(|_| NativeError::UnexpectedEof)?
+        .saturating_add(EXACT_GAP_LOOKAHEAD_BYTES)
+        .min(source_length);
+    let byte_start_u64 = u64::try_from(byte_start).map_err(|_| NativeError::UnexpectedEof)?;
+    let read_length = usize::try_from(read_end.saturating_sub(byte_start_u64))
+        .map_err(|_| NativeError::UnexpectedEof)?;
+    if read_length == 0 {
+        return Ok(None);
+    }
+    read_range_reuse(source, byte_start_u64, read_length, compressed)
+        .map_err(|_| NativeError::UnexpectedEof)?;
+
+    let base_bit = byte_start
+        .checked_mul(8)
+        .ok_or(NativeError::UnexpectedEof)?;
+    let local_start = start_bit
+        .checked_sub(base_bit)
+        .ok_or(NativeError::UnexpectedEof)?;
+    let local_stop = stop_bit
+        .checked_sub(base_bit)
+        .ok_or(NativeError::UnexpectedEof)?;
+    let tail = inflate_tail_with_capacity(
+        compressed,
+        local_start,
+        local_stop,
+        predecessor,
+        maximum_output,
+        true,
+        window_bits,
+        4 * 1024,
+    )?;
+    if tail.reached_stream_end || tail.end_bit != local_stop {
+        return Ok(None);
+    }
+
+    Ok(Some(crate::parallel::deflate::Chunk {
+        start_bit,
+        end_bit: stop_bit,
+        output: ChunkOutput::from_clean(tail.output),
+        reached_stream_end: false,
+        backend_continuation: None,
+    }))
 }
 
 fn run_estimated_task<R: ReadAt + ?Sized>(
@@ -3475,15 +3587,38 @@ fn run_admission_wave<R: ReadAt + ?Sized>(
     let mut decoded_bytes = 0_usize;
     let mut resolution_work = Duration::ZERO;
     let mut ordered_window_work = Duration::ZERO;
+    let mut exact_bridge_work = Duration::ZERO;
     let mut decode_elapsed = Duration::ZERO;
+    let mut bridge_compressed = Vec::new();
     for (result, task_elapsed) in results {
         decode_elapsed = decode_elapsed.max(task_elapsed);
         let Ok(chunk) = result else {
             return Ok(None);
         };
         if chunk.start_bit != previous_end {
-            return Ok(None);
+            let bridge_started = Instant::now();
+            let Ok(Some(bridge)) = bridge_exact_gap(
+                source,
+                previous_end,
+                chunk.start_bit,
+                &predecessor,
+                maximum_output,
+                window_bits,
+                &mut bridge_compressed,
+            ) else {
+                return Ok(None);
+            };
+            exact_bridge_work = exact_bridge_work.saturating_add(bridge_started.elapsed());
+            decoded_bytes = decoded_bytes.saturating_add(bridge.output.len());
+            let window_started = Instant::now();
+            let Ok(next_window) = bridge.output.window_after(&predecessor) else {
+                return Ok(None);
+            };
+            ordered_window_work = ordered_window_work.saturating_add(window_started.elapsed());
+            predecessor = next_window;
+            previous_end = bridge.end_bit;
         }
+        debug_assert_eq!(chunk.start_bit, previous_end);
         decoded_bytes = decoded_bytes.saturating_add(chunk.output.len());
         let resolution_started = Instant::now();
         if chunk
@@ -3509,6 +3644,7 @@ fn run_admission_wave<R: ReadAt + ?Sized>(
     Ok(Some(AdmissionWave {
         decoded_bytes,
         elapsed: decode_elapsed
+            .saturating_add(exact_bridge_work)
             .saturating_add(ordered_window_work)
             .saturating_add(parallel_resolution),
     }))
@@ -4116,110 +4252,157 @@ where
                 }
             };
 
-            match result {
-                Ok(chunk) if chunk.start_bit as u64 == current_bit => {
-                    let reached_stream_end = enqueue_native_resolution(
-                        chunk,
-                        config,
-                        collector,
-                        &mut current_bit,
-                        &mut window,
-                        &mut prepared_total_output,
-                        &mut next_resolve_sequence,
-                        &mut outstanding_resolves,
-                        &resolve_queue,
-                        &available_resolve_tasks,
-                        &work_signal,
-                    )?;
-                    let resolve_window = adaptive_workers.current_limit().min(pipeline_capacity);
-                    if outstanding_resolves >= resolve_window {
-                        let parts = wait_for_resolved(
-                            &resolve_receiver,
-                            &mut resolve_pending,
-                            next_resolve_to_emit,
-                            cancelled,
-                            current_bit,
-                        )?;
-                        emit_resolved_parts(
-                            parts,
-                            config,
-                            output,
-                            &mut accounting,
-                            &mut total_output,
-                        )?;
-                        next_resolve_to_emit += 1;
-                        outstanding_resolves -= 1;
-                    }
-                    next_to_emit += 1;
-                    let task_window = adaptive_workers.current_limit().min(pipeline_capacity);
-                    let schedule_end = next_to_emit.saturating_add(task_window).min(tasks.len());
-                    if next_to_schedule < schedule_end {
-                        let (lock, signal) = &*work_signal;
-                        let _guard = lock.lock().expect("estimated work mutex poisoned");
-                        while next_to_schedule < schedule_end {
-                            // Publish the count before queue visibility so a
-                            // fast worker cannot decrement zero.
-                            available_decode_tasks.fetch_add(1, Ordering::Release);
-                            task_queue.push(next_to_schedule);
-                            next_to_schedule += 1;
-                        }
-                        signal.notify_all();
-                    }
-                    if reached_stream_end {
-                        footer_offset = Some(current_bit / 8);
-                    } else if next_to_emit >= tasks.len() {
-                        drain_native_resolutions(
-                            &resolve_receiver,
-                            &mut resolve_pending,
-                            &mut next_resolve_to_emit,
-                            &mut outstanding_resolves,
-                            cancelled,
-                            current_bit,
-                            config,
-                            output,
-                            &mut accounting,
-                            &mut total_output,
-                        )?;
-                        footer_offset = Some(inflate_from_block(
+            let mut gap_bridge = None;
+            let chunk = match result {
+                Ok(chunk) if chunk.start_bit as u64 == current_bit => Some(chunk),
+                Ok(chunk) => {
+                    gap_bridge = usize::try_from(current_bit).ok().and_then(|start_bit| {
+                        bridge_exact_gap(
                             source,
-                            config,
-                            cancelled,
-                            output,
-                            current_bit,
+                            start_bit,
+                            chunk.start_bit,
                             &window,
+                            maximum_output,
                             window_bits,
-                            &mut accounting,
-                            &mut total_output,
-                        )?);
-                        prepared_total_output = total_output;
-                    }
+                            &mut bridge_compressed,
+                        )
+                        .ok()
+                        .flatten()
+                    });
+                    gap_bridge.as_ref().map(|_| chunk)
                 }
-                Ok(_) | Err(_) => {
-                    drain_native_resolutions(
+                Err(_) => None,
+            };
+            let Some(chunk) = chunk else {
+                drain_native_resolutions(
+                    &resolve_receiver,
+                    &mut resolve_pending,
+                    &mut next_resolve_to_emit,
+                    &mut outstanding_resolves,
+                    cancelled,
+                    current_bit,
+                    config,
+                    output,
+                    &mut accounting,
+                    &mut total_output,
+                )?;
+                footer_offset = Some(inflate_from_block(
+                    source,
+                    config,
+                    cancelled,
+                    output,
+                    current_bit,
+                    &window,
+                    window_bits,
+                    &mut accounting,
+                    &mut total_output,
+                )?);
+                prepared_total_output = total_output;
+                continue 'decode;
+            };
+
+            if let Some(bridge) = gap_bridge {
+                let reached_stream_end = enqueue_native_resolution(
+                    bridge,
+                    config,
+                    collector,
+                    &mut current_bit,
+                    &mut window,
+                    &mut prepared_total_output,
+                    &mut next_resolve_sequence,
+                    &mut outstanding_resolves,
+                    &resolve_queue,
+                    &available_resolve_tasks,
+                    &work_signal,
+                )?;
+                debug_assert!(
+                    !reached_stream_end,
+                    "gap bridges cannot end a DEFLATE stream"
+                );
+                debug_assert_eq!(chunk.start_bit as u64, current_bit);
+                let resolve_window = adaptive_workers.current_limit().min(pipeline_capacity);
+                if outstanding_resolves >= resolve_window {
+                    let parts = wait_for_resolved(
                         &resolve_receiver,
                         &mut resolve_pending,
-                        &mut next_resolve_to_emit,
-                        &mut outstanding_resolves,
+                        next_resolve_to_emit,
                         cancelled,
                         current_bit,
-                        config,
-                        output,
-                        &mut accounting,
-                        &mut total_output,
                     )?;
-                    footer_offset = Some(inflate_from_block(
-                        source,
-                        config,
-                        cancelled,
-                        output,
-                        current_bit,
-                        &window,
-                        window_bits,
-                        &mut accounting,
-                        &mut total_output,
-                    )?);
-                    prepared_total_output = total_output;
+                    emit_resolved_parts(parts, config, output, &mut accounting, &mut total_output)?;
+                    next_resolve_to_emit += 1;
+                    outstanding_resolves -= 1;
                 }
+            }
+
+            let reached_stream_end = enqueue_native_resolution(
+                chunk,
+                config,
+                collector,
+                &mut current_bit,
+                &mut window,
+                &mut prepared_total_output,
+                &mut next_resolve_sequence,
+                &mut outstanding_resolves,
+                &resolve_queue,
+                &available_resolve_tasks,
+                &work_signal,
+            )?;
+            let resolve_window = adaptive_workers.current_limit().min(pipeline_capacity);
+            if outstanding_resolves >= resolve_window {
+                let parts = wait_for_resolved(
+                    &resolve_receiver,
+                    &mut resolve_pending,
+                    next_resolve_to_emit,
+                    cancelled,
+                    current_bit,
+                )?;
+                emit_resolved_parts(parts, config, output, &mut accounting, &mut total_output)?;
+                next_resolve_to_emit += 1;
+                outstanding_resolves -= 1;
+            }
+            next_to_emit += 1;
+            let task_window = adaptive_workers.current_limit().min(pipeline_capacity);
+            let schedule_end = next_to_emit.saturating_add(task_window).min(tasks.len());
+            if next_to_schedule < schedule_end {
+                let (lock, signal) = &*work_signal;
+                let _guard = lock.lock().expect("estimated work mutex poisoned");
+                while next_to_schedule < schedule_end {
+                    // Publish the count before queue visibility so a fast
+                    // worker cannot decrement zero.
+                    available_decode_tasks.fetch_add(1, Ordering::Release);
+                    task_queue.push(next_to_schedule);
+                    next_to_schedule += 1;
+                }
+                signal.notify_all();
+            }
+            if reached_stream_end {
+                footer_offset = Some(current_bit / 8);
+            } else if next_to_emit >= tasks.len() {
+                drain_native_resolutions(
+                    &resolve_receiver,
+                    &mut resolve_pending,
+                    &mut next_resolve_to_emit,
+                    &mut outstanding_resolves,
+                    cancelled,
+                    current_bit,
+                    config,
+                    output,
+                    &mut accounting,
+                    &mut total_output,
+                )?;
+                footer_offset = Some(inflate_from_block(
+                    source,
+                    config,
+                    cancelled,
+                    output,
+                    current_bit,
+                    &window,
+                    window_bits,
+                    &mut accounting,
+                    &mut total_output,
+                )?);
+                prepared_total_output = total_output;
             }
         }
 
@@ -4718,9 +4901,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES, InputCursor, MemberAccounting, MemberHeader,
-        SourceCursor, Window, batch_independent_headers, find_gzip_magic, find_gzip_magic_scalar,
-        independent_member_task_candidate_limit, inflate_tail, validate_footer,
+        INDEPENDENT_MEMBER_TASK_MAX_CANDIDATES, InputCursor, MAX_EXACT_GAP_BITS, MemberAccounting,
+        MemberHeader, SourceCursor, Window, batch_independent_headers, bridge_exact_gap,
+        find_gzip_magic, find_gzip_magic_scalar, independent_member_task_candidate_limit,
+        inflate_tail, validate_footer,
     };
 
     fn header(start: u64) -> MemberHeader {
@@ -4811,6 +4995,113 @@ mod tests {
         assert!(tail.output.is_empty());
         assert_eq!(tail.end_bit, 16);
         assert!(tail.reached_stream_end);
+    }
+
+    #[test]
+    fn exact_gap_bridge_accepts_empty_stored_flush_block() {
+        let encoded = [
+            0, 5, 0, 250, 255, b'h', b'e', b'l', b'l', b'o', // first stored block
+            0, 0, 0, 255, 255, // empty non-final stored block
+            1, 5, 0, 250, 255, b'w', b'o', b'r', b'l', b'd', // final block
+        ];
+        let predecessor = Window::empty().advanced_by(b"hello");
+        let mut compressed = Vec::new();
+        let bridge = bridge_exact_gap(
+            encoded.as_slice(),
+            10 * 8,
+            15 * 8,
+            &predecessor,
+            1024,
+            15,
+            &mut compressed,
+        )
+        .unwrap()
+        .expect("the empty stored block is a valid short bridge");
+
+        assert_eq!(bridge.start_bit, 10 * 8);
+        assert_eq!(bridge.end_bit, 15 * 8);
+        assert!(bridge.output.resolve(&predecessor).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_gap_bridge_accepts_empty_fixed_block() {
+        // Non-final fixed-Huffman block containing only its end-of-block code.
+        // DEFLATE transmits the three-bit header and seven-bit EOB LSB-first.
+        let encoded = [0x02, 0x00];
+        let mut compressed = Vec::new();
+        let bridge = bridge_exact_gap(
+            encoded.as_slice(),
+            0,
+            10,
+            &Window::empty(),
+            1024,
+            15,
+            &mut compressed,
+        )
+        .unwrap()
+        .expect("the empty fixed block is a valid short bridge");
+
+        assert_eq!(bridge.end_bit, 10);
+        assert!(bridge.output.resolve(&Window::empty()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_gap_bridge_preserves_low_output_and_history() {
+        let encoded = [
+            0, 1, 0, 254, 255, b'!', // one-byte non-final stored block
+            1, 0, 0, 255, 255, // empty final stored block
+        ];
+        let predecessor = Window::new(b"history".to_vec()).unwrap();
+        let mut compressed = Vec::new();
+        let bridge = bridge_exact_gap(
+            encoded.as_slice(),
+            0,
+            6 * 8,
+            &predecessor,
+            1024,
+            15,
+            &mut compressed,
+        )
+        .unwrap()
+        .expect("a low-output block is a valid short bridge");
+
+        assert_eq!(
+            bridge.output.window_after(&predecessor).unwrap().as_slice(),
+            b"history!"
+        );
+        assert_eq!(bridge.output.resolve(&predecessor).unwrap(), b"!");
+    }
+
+    #[test]
+    fn exact_gap_bridge_rejects_unbounded_or_inexact_spans() {
+        let mut compressed = Vec::new();
+        assert!(
+            bridge_exact_gap(
+                &[][..],
+                0,
+                MAX_EXACT_GAP_BITS + 1,
+                &Window::empty(),
+                1024,
+                15,
+                &mut compressed,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let empty_stored = [0, 0, 0, 255, 255];
+        assert!(
+            bridge_exact_gap(
+                empty_stored.as_slice(),
+                0,
+                39,
+                &Window::empty(),
+                1024,
+                15,
+                &mut compressed,
+            )
+            .is_err()
+        );
     }
 
     #[test]
