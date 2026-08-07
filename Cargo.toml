@@ -9,7 +9,7 @@ resolver = "3"
 [workspace.package]
 version = "0.2.1"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 authors = ["rapidgzip-rust contributors"]
 license = "BSD-3-Clause AND MIT"
 repository = "https://github.com/COMBINE-lab/rapidgzip-rust"
