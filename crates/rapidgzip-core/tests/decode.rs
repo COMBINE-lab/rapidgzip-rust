@@ -518,6 +518,12 @@ fn reader_telemetry_survives_moving_and_finishing_the_reader() {
     assert_eq!(stats.active_workers, 0);
     assert_eq!(stats.spawned_workers, 0);
     assert_eq!(stats.auxiliary_threads, 0);
+    #[cfg(feature = "cpu-accounting")]
+    {
+        assert!(stats.completed_worker_cpu_time.unwrap() > Duration::ZERO);
+        assert!(stats.completed_auxiliary_cpu_time.unwrap() > Duration::ZERO);
+        assert_eq!(stats.cpu_accounting_failures, Some(0));
+    }
     assert!(matches!(stats.pressure, DecoderPressure::Finished));
     std::thread::sleep(Duration::from_millis(5));
     assert_eq!(

@@ -7,7 +7,7 @@ use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const NO_BEST_WORKER_COUNT: usize = usize::MAX;
 
@@ -150,6 +150,23 @@ pub struct DecoderStats {
     pub spawned_workers: usize,
     /// Live coordinator and scanner operating-system threads.
     pub auxiliary_threads: usize,
+    /// CPU time consumed by decoder worker threads that have exited.
+    ///
+    /// This is `Some` only with the `cpu-accounting` feature. Accounting reads
+    /// the thread CPU clock once at thread registration and once at thread
+    /// exit; it adds no timing operation or counter update to a decode task.
+    /// A running thread is intentionally absent until it exits, so this is a
+    /// final component-accounting signal rather than live scheduling feedback.
+    pub completed_worker_cpu_time: Option<Duration>,
+    /// CPU time consumed by coordinator and scanner threads that have exited.
+    ///
+    /// This has the same feature and final-only semantics as
+    /// [`Self::completed_worker_cpu_time`].
+    pub completed_auxiliary_cpu_time: Option<Duration>,
+    /// Failed thread CPU-clock reads, when accounting is enabled.
+    ///
+    /// A nonzero final value invalidates the component measurement.
+    pub cpu_accounting_failures: Option<usize>,
     /// Empirically selected worker count, once calibration has completed.
     ///
     /// This remains the controller's unconstrained choice even when an
@@ -352,10 +369,31 @@ pub(crate) enum AuxiliaryKind {
 pub(crate) struct ThreadRegistration {
     state: Arc<RuntimeState>,
     auxiliary: bool,
+    #[cfg(feature = "cpu-accounting")]
+    cpu_started: Option<cpu_time::ThreadTime>,
 }
 
 impl Drop for ThreadRegistration {
     fn drop(&mut self) {
+        #[cfg(feature = "cpu-accounting")]
+        if let Some(started) = self.cpu_started.as_ref() {
+            match started.try_elapsed() {
+                Ok(elapsed) => {
+                    let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+                    let counter = if self.auxiliary {
+                        &self.state.completed_auxiliary_cpu_nanos
+                    } else {
+                        &self.state.completed_worker_cpu_nanos
+                    };
+                    counter.fetch_add(nanos, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    self.state
+                        .cpu_accounting_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         let counter = if self.auxiliary {
             &self.state.auxiliary_threads
         } else {
@@ -438,6 +476,12 @@ pub(crate) struct RuntimeState {
     busy_workers: AtomicUsize,
     spawned_workers: AtomicUsize,
     auxiliary_threads: AtomicUsize,
+    #[cfg(feature = "cpu-accounting")]
+    completed_worker_cpu_nanos: AtomicU64,
+    #[cfg(feature = "cpu-accounting")]
+    completed_auxiliary_cpu_nanos: AtomicU64,
+    #[cfg(feature = "cpu-accounting")]
+    cpu_accounting_failures: AtomicUsize,
     queued_tasks: AtomicUsize,
     best_workers: AtomicUsize,
     decompressed_bytes: AtomicU64,
@@ -464,6 +508,12 @@ impl RuntimeState {
             busy_workers: AtomicUsize::new(0),
             spawned_workers: AtomicUsize::new(0),
             auxiliary_threads: AtomicUsize::new(0),
+            #[cfg(feature = "cpu-accounting")]
+            completed_worker_cpu_nanos: AtomicU64::new(0),
+            #[cfg(feature = "cpu-accounting")]
+            completed_auxiliary_cpu_nanos: AtomicU64::new(0),
+            #[cfg(feature = "cpu-accounting")]
+            cpu_accounting_failures: AtomicUsize::new(0),
             queued_tasks: AtomicUsize::new(0),
             best_workers: AtomicUsize::new(NO_BEST_WORKER_COUNT),
             decompressed_bytes: AtomicU64::new(0),
@@ -663,6 +713,8 @@ impl RuntimeState {
         ThreadRegistration {
             state: Arc::clone(self),
             auxiliary: false,
+            #[cfg(feature = "cpu-accounting")]
+            cpu_started: self.start_thread_cpu_accounting(),
         }
     }
 
@@ -674,6 +726,19 @@ impl RuntimeState {
         ThreadRegistration {
             state: Arc::clone(self),
             auxiliary: true,
+            #[cfg(feature = "cpu-accounting")]
+            cpu_started: self.start_thread_cpu_accounting(),
+        }
+    }
+
+    #[cfg(feature = "cpu-accounting")]
+    fn start_thread_cpu_accounting(&self) -> Option<cpu_time::ThreadTime> {
+        match cpu_time::ThreadTime::try_now() {
+            Ok(started) => Some(started),
+            Err(_) => {
+                self.cpu_accounting_failures.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 
@@ -804,6 +869,22 @@ impl RuntimeState {
         let busy_workers = self.busy_workers.load(Ordering::Relaxed);
         let spawned_workers = self.spawned_workers.load(Ordering::Relaxed);
         let auxiliary_threads = self.auxiliary_threads.load(Ordering::Relaxed);
+        #[cfg(feature = "cpu-accounting")]
+        let completed_worker_cpu_time = Some(Duration::from_nanos(
+            self.completed_worker_cpu_nanos.load(Ordering::Relaxed),
+        ));
+        #[cfg(not(feature = "cpu-accounting"))]
+        let completed_worker_cpu_time = None;
+        #[cfg(feature = "cpu-accounting")]
+        let completed_auxiliary_cpu_time = Some(Duration::from_nanos(
+            self.completed_auxiliary_cpu_nanos.load(Ordering::Relaxed),
+        ));
+        #[cfg(not(feature = "cpu-accounting"))]
+        let completed_auxiliary_cpu_time = None;
+        #[cfg(feature = "cpu-accounting")]
+        let cpu_accounting_failures = Some(self.cpu_accounting_failures.load(Ordering::Relaxed));
+        #[cfg(not(feature = "cpu-accounting"))]
+        let cpu_accounting_failures = None;
         let queued_tasks = self.queued_tasks();
         let pool_limited = self.pool_member.as_ref().is_some_and(|member| {
             member.waiting_workers() != 0 || member.granted_workers() < desired_workers
@@ -854,6 +935,9 @@ impl RuntimeState {
             busy_workers,
             spawned_workers,
             auxiliary_threads,
+            completed_worker_cpu_time,
+            completed_auxiliary_cpu_time,
+            cpu_accounting_failures,
             best_workers,
             decompressed_bytes,
             consumed_bytes,
@@ -951,5 +1035,52 @@ mod tests {
         assert_eq!(first.shared_output_backlog_pressure(100), (false, true));
     }
 
+    #[cfg(not(feature = "cpu-accounting"))]
+    #[test]
+    fn thread_cpu_accounting_is_absent_by_default() {
+        let stats = DecoderHandle::new(RuntimeState::new(2, None)).stats();
+        assert_eq!(stats.completed_worker_cpu_time, None);
+        assert_eq!(stats.completed_auxiliary_cpu_time, None);
+        assert_eq!(stats.cpu_accounting_failures, None);
+    }
+
+    #[cfg(feature = "cpu-accounting")]
+    #[test]
+    fn completed_thread_cpu_is_accounted_only_at_lifetime_boundaries() {
+        let state = RuntimeState::new(2, None);
+        let handle = DecoderHandle::new(Arc::clone(&state));
+        assert_eq!(
+            handle.stats().completed_worker_cpu_time,
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            handle.stats().completed_auxiliary_cpu_time,
+            Some(Duration::ZERO)
+        );
+
+        {
+            let _worker = state.register_worker();
+            for value in 0..1_000_000 {
+                std::hint::black_box(value * 3);
+            }
+            assert_eq!(
+                handle.stats().completed_worker_cpu_time,
+                Some(Duration::ZERO)
+            );
+        }
+        assert!(handle.stats().completed_worker_cpu_time.unwrap() > Duration::ZERO);
+
+        {
+            let _auxiliary = state.register_auxiliary(super::AuxiliaryKind::Coordinator);
+            for value in 0..1_000_000 {
+                std::hint::black_box(value * 7);
+            }
+        }
+        assert!(handle.stats().completed_auxiliary_cpu_time.unwrap() > Duration::ZERO);
+        assert_eq!(handle.stats().cpu_accounting_failures, Some(0));
+    }
+
     use std::sync::Arc;
+    #[cfg(feature = "cpu-accounting")]
+    use std::time::Duration;
 }

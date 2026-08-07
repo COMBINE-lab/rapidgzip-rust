@@ -19,6 +19,9 @@ path = "src/main.rs"
 clap.workspace = true
 rapidgzip-core.workspace = true
 
+[features]
+cpu-accounting = ["rapidgzip-core/cpu-accounting"]
+
 [target.'cfg(windows)'.dependencies]
 same-file.workspace = true
 

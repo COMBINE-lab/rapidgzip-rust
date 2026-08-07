@@ -146,6 +146,15 @@ and consumed bytes, average rates, and a high-level pressure classification.
 Snapshots use relaxed atomic loads, are deliberately approximate, and describe
 rapidgzip task activity rather than operating-system CPU utilization.
 
+The optional `rapidgzip-core/cpu-accounting` feature adds final component
+telemetry for completed decoder-worker and coordinator/scanner thread
+lifetimes. It reads the current-thread CPU clock once at registration and once
+at exit, then performs one relaxed cumulative update. It deliberately adds no
+clock read, counter update, or conditional branch to a decode task. Running
+threads are omitted until exit, and any clock failures are reported explicitly,
+so these fields are intended for end-of-run validation rather than live worker
+control.
+
 For ordinary gzip, zlib, and raw-DEFLATE files, telemetry may briefly report
 `DecoderPath::MarkerAdmission`. This bounded input-aware screen compares exact
 zlib-rs work with a useful-width speculative marker wave derived from the

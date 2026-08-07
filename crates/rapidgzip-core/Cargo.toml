@@ -15,7 +15,11 @@ categories = ["compression", "filesystem"]
 [dependencies]
 bon.workspace = true
 crossbeam-deque.workspace = true
+cpu-time = { workspace = true, optional = true }
 libz-rs-sys.workspace = true
+
+[features]
+cpu-accounting = ["dep:cpu-time"]
 
 [dev-dependencies]
 libz-rs-sys.workspace = true
