@@ -10,6 +10,10 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const NO_BEST_WORKER_COUNT: usize = usize::MAX;
+#[cfg(feature = "busy-time-accounting")]
+const ACCOUNTED_TRANSITION_ACTIVE_MASK: u64 = u32::MAX as u64;
+#[cfg(feature = "busy-time-accounting")]
+const ACCOUNTED_TRANSITION_FINISH: u64 = (1u64 << 32) - 1;
 
 /// Decoder implementation selected for the current input.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -171,12 +175,12 @@ pub struct DecoderStats {
     ///
     /// This is `Some` only with the `busy-time-accounting` feature.
     /// That feature reads the monotonic clock and updates one relaxed counter at
-    /// every existing `busy_workers` begin/end boundary. It is intended as an
-    /// cumulative signal for scheduling and for validating external occupancy
-    /// samplers. The snapshot includes executing regions that are still in
-    /// progress at the instant it is collected. Feature-off builds contain
-    /// neither the clock reads, counter, nor a conditional on the decoder hot
-    /// path.
+    /// every existing `busy_workers` begin/end boundary. A feature-gated event
+    /// epoch lets snapshots reject concurrent count/balance transitions without
+    /// locking workers. It is intended as an exact monotonic cumulative signal
+    /// for scheduling and for validating external occupancy samplers, including
+    /// work still in progress at snapshot time. Feature-off builds contain
+    /// neither the clocks, counters, nor a conditional on the decoder hot path.
     pub accounted_busy_time: Option<Duration>,
     /// Empirically selected worker count, once calibration has completed.
     ///
@@ -428,9 +432,15 @@ pub(crate) struct BusyRegistration<'a> {
 
 impl Drop for BusyRegistration<'_> {
     fn drop(&mut self) {
-        self.state.busy_workers.fetch_sub(1, Ordering::Relaxed);
         #[cfg(feature = "busy-time-accounting")]
-        self.state.end_accounted_busy();
+        {
+            self.state.begin_accounted_transition();
+            self.state.busy_workers.fetch_sub(1, Ordering::Relaxed);
+            self.state.end_accounted_busy();
+            self.state.finish_accounted_transition();
+        }
+        #[cfg(not(feature = "busy-time-accounting"))]
+        self.state.busy_workers.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -455,16 +465,25 @@ impl ReusableTaskSlot<'_> {
             self.pool_permit = Some(member.acquire());
         }
         #[cfg(feature = "busy-time-accounting")]
+        self.state.begin_accounted_transition();
+        #[cfg(feature = "busy-time-accounting")]
         self.state.begin_accounted_busy();
         self.state.busy_workers.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "busy-time-accounting")]
+        self.state.finish_accounted_transition();
         self.executing = true;
     }
 
     pub(crate) fn end(&mut self) {
         debug_assert!(self.executing);
+        #[cfg(feature = "busy-time-accounting")]
+        self.state.begin_accounted_transition();
         self.state.busy_workers.fetch_sub(1, Ordering::Relaxed);
         #[cfg(feature = "busy-time-accounting")]
-        self.state.end_accounted_busy();
+        {
+            self.state.end_accounted_busy();
+            self.state.finish_accounted_transition();
+        }
         self.executing = false;
     }
 
@@ -501,6 +520,8 @@ pub(crate) struct RuntimeState {
     cpu_accounting_failures: AtomicUsize,
     #[cfg(feature = "busy-time-accounting")]
     accounted_busy_balance_nanos: AtomicU64,
+    #[cfg(feature = "busy-time-accounting")]
+    accounted_busy_transition_state: AtomicU64,
     queued_tasks: AtomicUsize,
     best_workers: AtomicUsize,
     decompressed_bytes: AtomicU64,
@@ -535,6 +556,8 @@ impl RuntimeState {
             cpu_accounting_failures: AtomicUsize::new(0),
             #[cfg(feature = "busy-time-accounting")]
             accounted_busy_balance_nanos: AtomicU64::new(0),
+            #[cfg(feature = "busy-time-accounting")]
+            accounted_busy_transition_state: AtomicU64::new(0),
             queued_tasks: AtomicUsize::new(0),
             best_workers: AtomicUsize::new(NO_BEST_WORKER_COUNT),
             decompressed_bytes: AtomicU64::new(0),
@@ -766,8 +789,12 @@ impl RuntimeState {
     pub(crate) fn begin_task(&self) -> BusyRegistration<'_> {
         let pool_permit = self.pool_member.as_ref().map(PoolMember::acquire);
         #[cfg(feature = "busy-time-accounting")]
+        self.begin_accounted_transition();
+        #[cfg(feature = "busy-time-accounting")]
         self.begin_accounted_busy();
         self.busy_workers.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "busy-time-accounting")]
+        self.finish_accounted_transition();
         BusyRegistration {
             state: self,
             _pool_permit: pool_permit,
@@ -809,6 +836,17 @@ impl RuntimeState {
     }
 
     #[cfg(feature = "busy-time-accounting")]
+    fn begin_accounted_transition(&self) {
+        let previous = self
+            .accounted_busy_transition_state
+            .fetch_add(1, Ordering::AcqRel);
+        debug_assert_ne!(
+            previous & ACCOUNTED_TRANSITION_ACTIVE_MASK,
+            ACCOUNTED_TRANSITION_ACTIVE_MASK
+        );
+    }
+
+    #[cfg(feature = "busy-time-accounting")]
     fn end_accounted_busy(&self) {
         let now = self.accounted_now_nanos();
         self.accounted_busy_balance_nanos
@@ -816,19 +854,33 @@ impl RuntimeState {
     }
 
     #[cfg(feature = "busy-time-accounting")]
+    fn finish_accounted_transition(&self) {
+        // Decrement the low active-transition count and increment the high
+        // generation in one wrapping addition. Readers therefore detect both
+        // partial transitions and complete ABA between their state loads.
+        self.accounted_busy_transition_state
+            .fetch_add(ACCOUNTED_TRANSITION_FINISH, Ordering::Release);
+    }
+
+    #[cfg(feature = "busy-time-accounting")]
     fn accounted_busy_time(&self) -> Duration {
         // The wrapping balance contains `-start` for every active interval and
         // `end-start` for every completed interval. Add `now` once per active
         // interval to obtain an exact cumulative value, including work in
-        // progress. Double collection rejects a begin/end concurrent with the
-        // snapshot without adding synchronization to the decoder hot path.
+        // progress. The epoch closes the ABA hole in the two-counter snapshot.
         loop {
+            let transition_before = self.accounted_busy_transition_state.load(Ordering::Acquire);
             let busy_before = self.busy_workers.load(Ordering::Acquire);
             let balance_before = self.accounted_busy_balance_nanos.load(Ordering::Acquire);
             let now = self.accounted_now_nanos();
             let balance_after = self.accounted_busy_balance_nanos.load(Ordering::Acquire);
             let busy_after = self.busy_workers.load(Ordering::Acquire);
-            if busy_before == busy_after && balance_before == balance_after {
+            let transition_after = self.accounted_busy_transition_state.load(Ordering::Acquire);
+            if transition_before & ACCOUNTED_TRANSITION_ACTIVE_MASK == 0
+                && transition_before == transition_after
+                && busy_before == busy_after
+                && balance_before == balance_after
+            {
                 let nanos = balance_before.wrapping_add((busy_before as u64).wrapping_mul(now));
                 let plausible_max = now.saturating_mul(self.configured_workers as u64);
                 if nanos <= plausible_max {
@@ -1142,6 +1194,47 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
         reusable.end();
         assert!(handle.stats().accounted_busy_time.unwrap() > first);
+    }
+
+    #[cfg(feature = "busy-time-accounting")]
+    #[test]
+    fn busy_time_snapshots_never_regress_under_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let state = RuntimeState::new(4, None);
+        let handle = DecoderHandle::new(Arc::clone(&state));
+        let remaining = Arc::new(AtomicUsize::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                let remaining = Arc::clone(&remaining);
+                std::thread::spawn(move || {
+                    for value in 0..10_000 {
+                        let _busy = state.begin_task();
+                        std::hint::black_box(value * 3);
+                        if value % 31 == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+                    remaining.fetch_sub(1, Ordering::Release);
+                })
+            })
+            .collect();
+
+        let mut previous = Duration::ZERO;
+        while remaining.load(Ordering::Acquire) != 0 {
+            let observed = handle.stats().accounted_busy_time.unwrap();
+            assert!(
+                observed >= previous,
+                "busy time regressed: {previous:?} -> {observed:?}"
+            );
+            previous = observed;
+            std::thread::yield_now();
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(handle.stats().accounted_busy_time.unwrap() >= previous);
     }
 
     #[cfg(feature = "cpu-accounting")]
