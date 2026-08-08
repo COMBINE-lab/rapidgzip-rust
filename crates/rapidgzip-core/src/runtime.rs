@@ -169,14 +169,14 @@ pub struct DecoderStats {
     pub cpu_accounting_failures: Option<usize>,
     /// Exact cumulative wall time inside decoder executing regions.
     ///
-    /// This is `Some` only with the `busy-time-accounting` validation feature.
+    /// This is `Some` only with the `busy-time-accounting` feature.
     /// That feature reads the monotonic clock and updates one relaxed counter at
     /// every existing `busy_workers` begin/end boundary. It is intended as an
-    /// event-time oracle for validating external occupancy samplers, not as
-    /// production scheduling feedback. The snapshot includes executing regions
-    /// that are still in progress at the instant it is collected. Feature-off
-    /// builds contain neither the clock reads, counter, nor a conditional on
-    /// the decoder hot path.
+    /// cumulative signal for scheduling and for validating external occupancy
+    /// samplers. The snapshot includes executing regions that are still in
+    /// progress at the instant it is collected. Feature-off builds contain
+    /// neither the clock reads, counter, nor a conditional on the decoder hot
+    /// path.
     pub accounted_busy_time: Option<Duration>,
     /// Empirically selected worker count, once calibration has completed.
     ///
