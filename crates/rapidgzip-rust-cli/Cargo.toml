@@ -21,6 +21,7 @@ rapidgzip-core.workspace = true
 
 [features]
 cpu-accounting = ["rapidgzip-core/cpu-accounting"]
+busy-time-accounting = ["rapidgzip-core/busy-time-accounting"]
 
 [target.'cfg(windows)'.dependencies]
 same-file.workspace = true

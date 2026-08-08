@@ -167,6 +167,17 @@ pub struct DecoderStats {
     ///
     /// A nonzero final value invalidates the component measurement.
     pub cpu_accounting_failures: Option<usize>,
+    /// Exact cumulative wall time inside decoder executing regions.
+    ///
+    /// This is `Some` only with the `busy-time-accounting` validation feature.
+    /// That feature reads the monotonic clock and updates one relaxed counter at
+    /// every existing `busy_workers` begin/end boundary. It is intended as an
+    /// event-time oracle for validating external occupancy samplers, not as
+    /// production scheduling feedback. The snapshot includes executing regions
+    /// that are still in progress at the instant it is collected. Feature-off
+    /// builds contain neither the clock reads, counter, nor a conditional on
+    /// the decoder hot path.
+    pub accounted_busy_time: Option<Duration>,
     /// Empirically selected worker count, once calibration has completed.
     ///
     /// This remains the controller's unconstrained choice even when an
@@ -418,6 +429,8 @@ pub(crate) struct BusyRegistration<'a> {
 impl Drop for BusyRegistration<'_> {
     fn drop(&mut self) {
         self.state.busy_workers.fetch_sub(1, Ordering::Relaxed);
+        #[cfg(feature = "busy-time-accounting")]
+        self.state.end_accounted_busy();
     }
 }
 
@@ -441,6 +454,8 @@ impl ReusableTaskSlot<'_> {
         {
             self.pool_permit = Some(member.acquire());
         }
+        #[cfg(feature = "busy-time-accounting")]
+        self.state.begin_accounted_busy();
         self.state.busy_workers.fetch_add(1, Ordering::Relaxed);
         self.executing = true;
     }
@@ -448,6 +463,8 @@ impl ReusableTaskSlot<'_> {
     pub(crate) fn end(&mut self) {
         debug_assert!(self.executing);
         self.state.busy_workers.fetch_sub(1, Ordering::Relaxed);
+        #[cfg(feature = "busy-time-accounting")]
+        self.state.end_accounted_busy();
         self.executing = false;
     }
 
@@ -482,6 +499,8 @@ pub(crate) struct RuntimeState {
     completed_auxiliary_cpu_nanos: AtomicU64,
     #[cfg(feature = "cpu-accounting")]
     cpu_accounting_failures: AtomicUsize,
+    #[cfg(feature = "busy-time-accounting")]
+    accounted_busy_balance_nanos: AtomicU64,
     queued_tasks: AtomicUsize,
     best_workers: AtomicUsize,
     decompressed_bytes: AtomicU64,
@@ -514,6 +533,8 @@ impl RuntimeState {
             completed_auxiliary_cpu_nanos: AtomicU64::new(0),
             #[cfg(feature = "cpu-accounting")]
             cpu_accounting_failures: AtomicUsize::new(0),
+            #[cfg(feature = "busy-time-accounting")]
+            accounted_busy_balance_nanos: AtomicU64::new(0),
             queued_tasks: AtomicUsize::new(0),
             best_workers: AtomicUsize::new(NO_BEST_WORKER_COUNT),
             decompressed_bytes: AtomicU64::new(0),
@@ -744,6 +765,8 @@ impl RuntimeState {
 
     pub(crate) fn begin_task(&self) -> BusyRegistration<'_> {
         let pool_permit = self.pool_member.as_ref().map(PoolMember::acquire);
+        #[cfg(feature = "busy-time-accounting")]
+        self.begin_accounted_busy();
         self.busy_workers.fetch_add(1, Ordering::Relaxed);
         BusyRegistration {
             state: self,
@@ -770,6 +793,49 @@ impl RuntimeState {
             state: self,
             pool_permit: None,
             executing: false,
+        }
+    }
+
+    #[cfg(feature = "busy-time-accounting")]
+    fn accounted_now_nanos(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    #[cfg(feature = "busy-time-accounting")]
+    fn begin_accounted_busy(&self) {
+        let now = self.accounted_now_nanos();
+        self.accounted_busy_balance_nanos
+            .fetch_sub(now, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "busy-time-accounting")]
+    fn end_accounted_busy(&self) {
+        let now = self.accounted_now_nanos();
+        self.accounted_busy_balance_nanos
+            .fetch_add(now, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "busy-time-accounting")]
+    fn accounted_busy_time(&self) -> Duration {
+        // The wrapping balance contains `-start` for every active interval and
+        // `end-start` for every completed interval. Add `now` once per active
+        // interval to obtain an exact cumulative value, including work in
+        // progress. Double collection rejects a begin/end concurrent with the
+        // snapshot without adding synchronization to the decoder hot path.
+        loop {
+            let busy_before = self.busy_workers.load(Ordering::Acquire);
+            let balance_before = self.accounted_busy_balance_nanos.load(Ordering::Acquire);
+            let now = self.accounted_now_nanos();
+            let balance_after = self.accounted_busy_balance_nanos.load(Ordering::Acquire);
+            let busy_after = self.busy_workers.load(Ordering::Acquire);
+            if busy_before == busy_after && balance_before == balance_after {
+                let nanos = balance_before.wrapping_add((busy_before as u64).wrapping_mul(now));
+                let plausible_max = now.saturating_mul(self.configured_workers as u64);
+                if nanos <= plausible_max {
+                    return Duration::from_nanos(nanos);
+                }
+            }
+            std::hint::spin_loop();
         }
     }
 
@@ -885,6 +951,10 @@ impl RuntimeState {
         let cpu_accounting_failures = Some(self.cpu_accounting_failures.load(Ordering::Relaxed));
         #[cfg(not(feature = "cpu-accounting"))]
         let cpu_accounting_failures = None;
+        #[cfg(feature = "busy-time-accounting")]
+        let accounted_busy_time = Some(self.accounted_busy_time());
+        #[cfg(not(feature = "busy-time-accounting"))]
+        let accounted_busy_time = None;
         let queued_tasks = self.queued_tasks();
         let pool_limited = self.pool_member.as_ref().is_some_and(|member| {
             member.waiting_workers() != 0 || member.granted_workers() < desired_workers
@@ -938,6 +1008,7 @@ impl RuntimeState {
             completed_worker_cpu_time,
             completed_auxiliary_cpu_time,
             cpu_accounting_failures,
+            accounted_busy_time,
             best_workers,
             decompressed_bytes,
             consumed_bytes,
@@ -1044,6 +1115,35 @@ mod tests {
         assert_eq!(stats.cpu_accounting_failures, None);
     }
 
+    #[cfg(not(feature = "busy-time-accounting"))]
+    #[test]
+    fn busy_time_accounting_is_absent_by_default() {
+        let stats = DecoderHandle::new(RuntimeState::new(2, None)).stats();
+        assert_eq!(stats.accounted_busy_time, None);
+    }
+
+    #[cfg(feature = "busy-time-accounting")]
+    #[test]
+    fn busy_time_is_accounted_at_existing_execution_boundaries() {
+        let state = RuntimeState::new(2, None);
+        let handle = DecoderHandle::new(Arc::clone(&state));
+        assert_eq!(handle.stats().accounted_busy_time, Some(Duration::ZERO));
+
+        {
+            let _busy = state.begin_task();
+            std::thread::sleep(Duration::from_millis(2));
+            assert!(handle.stats().accounted_busy_time.unwrap() >= Duration::from_millis(1));
+        }
+        let first = handle.stats().accounted_busy_time.unwrap();
+        assert!(first >= Duration::from_millis(1));
+
+        let mut reusable = state.reusable_task_slot();
+        reusable.begin();
+        std::thread::sleep(Duration::from_millis(2));
+        reusable.end();
+        assert!(handle.stats().accounted_busy_time.unwrap() > first);
+    }
+
     #[cfg(feature = "cpu-accounting")]
     #[test]
     fn completed_thread_cpu_is_accounted_only_at_lifetime_boundaries() {
@@ -1081,6 +1181,6 @@ mod tests {
     }
 
     use std::sync::Arc;
-    #[cfg(feature = "cpu-accounting")]
+    #[cfg(any(feature = "cpu-accounting", feature = "busy-time-accounting"))]
     use std::time::Duration;
 }

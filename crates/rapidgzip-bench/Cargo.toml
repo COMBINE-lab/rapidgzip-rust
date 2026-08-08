@@ -17,6 +17,9 @@ rapidgzip-core.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 
+[features]
+busy-time-accounting = ["rapidgzip-core/busy-time-accounting"]
+
 [[bench]]
 name = "decode"
 harness = false

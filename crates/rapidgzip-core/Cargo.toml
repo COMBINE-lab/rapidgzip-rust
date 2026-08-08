@@ -20,6 +20,7 @@ libz-rs-sys.workspace = true
 
 [features]
 cpu-accounting = ["dep:cpu-time"]
+busy-time-accounting = []
 
 [dev-dependencies]
 libz-rs-sys.workspace = true
