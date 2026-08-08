@@ -157,12 +157,13 @@ control.
 
 The optional `rapidgzip-core/busy-time-accounting` feature supplies an exact,
 live cumulative integral of decoder executing regions, including work in
-progress at snapshot time. It reads the monotonic clock and updates one relaxed
-wrapping balance at each existing executing-region boundary. Applications can
-use this allocation-sensitive signal for scheduling without polling
-`busy_workers`. Feature-off builds compile out the clocks, balance, and branch
-entirely. Feature-on/off release benchmarks are therefore a required gate for
-changes to this instrumentation.
+progress at snapshot time. It reads the monotonic clock, updates a relaxed
+wrapping balance, and publishes a transition epoch at each existing
+executing-region boundary. The epoch lets readers reject count/balance ABA
+without locking workers. Applications can use this allocation-sensitive signal
+for scheduling without polling `busy_workers`. Feature-off builds compile out
+the clocks, counters, and branch entirely. Feature-on/off release benchmarks are
+therefore a required gate for changes to this instrumentation.
 
 For ordinary gzip, zlib, and raw-DEFLATE files, telemetry may briefly report
 `DecoderPath::MarkerAdmission`. This bounded input-aware screen compares exact
