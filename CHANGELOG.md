@@ -5,6 +5,23 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-09
+
+### Fixed
+
+- **A lost wakeup in `DecoderPool` that could deadlock every attached decoder.**
+  `release` decremented the busy count and notified waiters without holding the
+  scheduler lock, so the final release could land between a waiter's
+  check and its park, notify nobody, and leave the pool with free permits,
+  parked waiters, and no future notify — with all later `acquire` calls joining
+  the dead queue behind them. Reached in practice when a shared pool is shrunk
+  to a few slots (e.g. by a supervising thread broker) with two or more
+  attached decoders, so admission lives on the contended slow path; observed as
+  a total hang of salmon on paired gzip input at higher thread counts. The
+  notify is now ordered against check-then-park by the scheduler lock, matching
+  every other notify site, and a regression test hammers the race (it deadlocks
+  the unfixed pool in under two seconds).
+
 ## [0.3.0] - 2026-08-09
 
 ### Added
