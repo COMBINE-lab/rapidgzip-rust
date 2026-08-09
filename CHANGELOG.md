@@ -5,6 +5,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-09
+
 ### Added
 
 - Opt-in `DecoderPool` process-wide decode budgets with a validated `bon`
@@ -17,6 +19,19 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   limiting progress.
 - A concurrent programmatic-reader benchmark driver for shared versus private
   scheduling through both ordinary `Read` and paraseq FASTQ parsing.
+- Optional `cpu-accounting` feature reporting lifetime worker and auxiliary
+  thread CPU through `DecoderStats::completed_worker_cpu_time`,
+  `completed_auxiliary_cpu_time`, and `cpu_accounting_failures`. Each thread
+  reads its own CPU clock exactly twice, at registration and exit, so no timing
+  call, atomic, or branch is added to decode task begin/end or the inflate
+  loops. With the feature disabled the accounting compiles out and the fields
+  are `None`. Threads still running are omitted until exit, making this
+  component accounting rather than an exact decision-window counter.
+- Optional `busy-time-accounting` feature exposing a monotonic cumulative
+  executing-region integral as `DecoderStats::accounted_busy_time`. This gives
+  a scheduler an exact busy-time signal that does not depend on its own polling
+  cadence; reconstructing the same quantity by sampling executing-worker counts
+  was measured 17-313% off on sparse, bursty, and stored decoder paths.
 
 ### Changed
 
