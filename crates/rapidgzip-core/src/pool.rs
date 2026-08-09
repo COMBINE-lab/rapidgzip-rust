@@ -340,6 +340,25 @@ impl PoolState {
         {
             self.refresh_runnable(member);
         }
+        // The notify must be ordered against `acquire`'s check-then-wait by the
+        // scheduler mutex, or the wakeup can be lost: a waiter that has read
+        // `busy == limit` but not yet parked misses a notify sent now, then
+        // parks against a state nobody will announce again. Taking the lock
+        // (even briefly) forces this release to happen-before an in-flight
+        // check completes its park -- the waiter either sees the decremented
+        // count when it re-checks, or is already parked when the notify fires.
+        //
+        // Every other notify site already held the lock; this one, on the hot
+        // release path, skipped it as an optimisation. The cost of the lock is
+        // only ever paid when the slow path is active at all, and the saving
+        // bought a deadlock: two decoders sharing a shrunken pool park in
+        // `acquire`, the final release notifies nobody, and -- because
+        // `try_acquire_fast` refuses to jump a non-empty queue -- every future
+        // acquire joins the dead queue. Found as a salmon-side hang; the same
+        // pool and broker in piscem never hit it only because piscem's decode
+        // share keeps enough slots granted that the slow path is rarely
+        // entered.
+        drop(self.scheduler.lock().expect("decoder pool mutex poisoned"));
         self.signal.notify_all();
     }
 
@@ -680,6 +699,101 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
+
+
+    /// `release` must not lose the wakeup of a waiter that has checked the
+    /// permit count but not yet parked.
+    ///
+    /// The failure this pins (found as a salmon-side hang, but the bug is
+    /// here): a waiter in `acquire`'s slow path holds the scheduler mutex,
+    /// reads `busy == limit`, and parks. `release` used to decrement
+    /// `busy_workers` (an atomic, outside the mutex) and call `notify_all`
+    /// without the lock -- so the final release could land in the window
+    /// between a waiter's check and its park, notify nobody, and leave the
+    /// pool with free permits, parked waiters, and no future notify. Every
+    /// subsequent acquire then queues behind the dead waiters, because
+    /// `try_acquire_fast` refuses to jump a non-empty queue.
+    ///
+    /// The window is a few instructions wide, so this hammers it: churning
+    /// acquire/release across two members (as two gzip inputs do) through a
+    /// limit of 1 -- the configuration the thread broker's shrinks produce --
+    /// while a resizer toggles the limit, maximising slow-path traffic. Before
+    /// the fix this test hangs within a few hundred thousand iterations; the
+    /// watchdog turns that into a failure rather than a stuck CI job.
+    #[test]
+    fn release_wakes_waiters_that_raced_the_final_release() {
+        const CHURNERS_PER_MEMBER: usize = 1;
+        // Pre-fix this deadlocked at ~700k iterations; 5M gives ~7x margin while
+        // keeping the test under ten seconds in release.
+        const ITERS: u64 = 5_000_000;
+
+        let pool = DecoderPool::builder()
+            .workers(4)
+            .initial_worker_limit(1)
+            .build()
+            .unwrap();
+        let members: Vec<Arc<PoolMember>> = (0..2)
+            .map(|_| Arc::new(pool.state.register_decoder()))
+            .collect();
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progressed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let start = Arc::new(Barrier::new(2 * CHURNERS_PER_MEMBER + 1));
+
+        let mut handles = Vec::new();
+        for member in &members {
+            for _ in 0..CHURNERS_PER_MEMBER {
+                let member = Arc::clone(member);
+                let done = Arc::clone(&done);
+                let progressed = Arc::clone(&progressed);
+                let start = Arc::clone(&start);
+                handles.push(thread::spawn(move || {
+                    start.wait();
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        // The accounting-region pattern: acquire, tiny region,
+                        // release. Nothing is held across anything blocking.
+                        let permit = member.acquire();
+                        drop(permit);
+                        progressed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }));
+            }
+        }
+        // Deliberately NO limit churn: `set_worker_limit` notifies under the
+        // scheduler lock, which *repairs* a lost wakeup -- a version of this
+        // test with a resizer thread passed against the broken code for
+        // exactly that reason. The hang in the wild appears after the broker
+        // settles and stops moving the limit, leaving nobody to rescue the
+        // parked waiters.
+
+        start.wait();
+        // Watchdog: require continuous global progress. A lost wakeup shows up
+        // as the counter freezing while every churner sits parked in acquire.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut last = 0_u64;
+        loop {
+            thread::sleep(Duration::from_millis(200));
+            let now = progressed.load(std::sync::atomic::Ordering::Relaxed);
+            if now >= ITERS {
+                break;
+            }
+            assert!(
+                now > last,
+                "no acquire/release progress in 200ms at {now} iterations: \
+                 waiters are parked with free permits -- the release lost their wakeup"
+            );
+            last = now;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test exceeded its deadline while still progressing; raise ITERS \
+                 only with cause"
+            );
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
 
     #[test]
     fn builder_validates_limits() {
