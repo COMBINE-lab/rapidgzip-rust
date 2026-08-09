@@ -140,13 +140,13 @@ impl<R: ReadAt> IndexedReader<R> {
         let source_length = source
             .len()
             .map_err(|error| IndexedReaderError::Io(Arc::new(error)))?;
-        if let Some(index_size) = index.compressed_size() {
-            if index_size != source_length {
-                return Err(IndexedReaderError::Index(IndexError::ArchiveSizeMismatch {
-                    index_size,
-                    archive_size: source_length,
-                }));
-            }
+        if let Some(index_size) = index.compressed_size()
+            && index_size != source_length
+        {
+            return Err(IndexedReaderError::Index(IndexError::ArchiveSizeMismatch {
+                index_size,
+                archive_size: source_length,
+            }));
         }
         let window_bits = if index.kind() == IndexKind::Zlib {
             let header = read_exact_from_source::<2, _>(&source, 0)

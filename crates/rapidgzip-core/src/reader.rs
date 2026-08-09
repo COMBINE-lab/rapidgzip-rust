@@ -468,10 +468,10 @@ impl DecoderReader {
             ReaderMode::Coordinator { worker, .. } => worker.take(),
             ReaderMode::Streaming { .. } => None,
         };
-        if let Some(worker) = worker {
-            if worker.join().is_err() {
-                return Err(DecodeError::WorkerPanicked);
-            }
+        if let Some(worker) = worker
+            && worker.join().is_err()
+        {
+            return Err(DecodeError::WorkerPanicked);
         }
         Ok(())
     }

@@ -122,13 +122,13 @@ impl<'a> ImportedLineVerifier<'a> {
             }
             self.next += 1;
         }
-        if let Some(expected_lines) = self.total {
-            if expected_lines != lines {
-                return Err(DecodeError::IndexTotalLineMismatch {
-                    expected_lines,
-                    actual_lines: lines,
-                });
-            }
+        if let Some(expected_lines) = self.total
+            && expected_lines != lines
+        {
+            return Err(DecodeError::IndexTotalLineMismatch {
+                expected_lines,
+                actual_lines: lines,
+            });
         }
         Ok(())
     }
@@ -153,24 +153,24 @@ impl IndexedPlan {
         let source_length = source
             .len()
             .map_err(|error| DecodeError::input_io(0, error))?;
-        if let Some(index_length) = index.compressed_size() {
-            if index_length != source_length {
-                return Err(IndexError::ArchiveSizeMismatch {
-                    index_size: index_length,
-                    archive_size: source_length,
-                }
-                .into());
+        if let Some(index_length) = index.compressed_size()
+            && index_length != source_length
+        {
+            return Err(IndexError::ArchiveSizeMismatch {
+                index_size: index_length,
+                archive_size: source_length,
             }
+            .into());
         }
 
         let format = format_for_index(index.kind());
-        if let FormatSelection::Explicit(selected) = config.format {
-            if selected != format {
-                return Err(IndexDecodeError::FormatMismatch {
-                    selected,
-                    indexed: index.kind(),
-                });
-            }
+        if let FormatSelection::Explicit(selected) = config.format
+            && selected != format
+        {
+            return Err(IndexDecodeError::FormatMismatch {
+                selected,
+                indexed: index.kind(),
+            });
         }
 
         let checkpoints = index.checkpoints();
@@ -194,18 +194,17 @@ impl IndexedPlan {
             )
             .into());
         }
-        if let Some(total) = total_output {
-            if total
+        if let Some(total) = total_output
+            && total
                 < checkpoints
                     .last()
                     .expect("nonempty")
                     .uncompressed_offset_in_bytes
-            {
-                return Err(IndexError::InvalidCheckpoint(
-                    "the final checkpoint is after the recorded decompressed size",
-                )
-                .into());
-            }
+        {
+            return Err(IndexError::InvalidCheckpoint(
+                "the final checkpoint is after the recorded decompressed size",
+            )
+            .into());
         }
 
         let mut spans = Vec::new();
@@ -660,13 +659,12 @@ fn finish_gzip_member<R: ReadAt + ?Sized>(
             if let CheckpointKind::GzipMemberDeflate {
                 header_offset_in_bytes,
             } = target.kind
+                && header_offset_in_bytes != next_header
             {
-                if header_offset_in_bytes != next_header {
-                    return Err(DecodeError::IndexBoundaryMismatch {
-                        expected_bit_offset: target_bit,
-                        actual_bit_offset: deflate_bit,
-                    });
-                }
+                return Err(DecodeError::IndexBoundaryMismatch {
+                    expected_bit_offset: target_bit,
+                    actual_bit_offset: deflate_bit,
+                });
             }
             return Ok(MemberTransition::SpanFinished);
         }
@@ -729,18 +727,18 @@ fn finish_non_gzip<R: ReadAt + ?Sized>(
 }
 
 fn verify_span_output(span: Span, actual: u64) -> Result<(), DecodeError> {
-    if let Some(expected) = span.expected_output {
-        if expected != actual {
-            return Err(DecodeError::IndexOutputMismatch {
-                checkpoint_bit_offset: span
-                    .end
-                    .map_or(span.start.compressed_offset_in_bits, |end| {
-                        end.compressed_offset_in_bits
-                    }),
-                expected_bytes: expected,
-                actual_bytes: actual,
-            });
-        }
+    if let Some(expected) = span.expected_output
+        && expected != actual
+    {
+        return Err(DecodeError::IndexOutputMismatch {
+            checkpoint_bit_offset: span
+                .end
+                .map_or(span.start.compressed_offset_in_bits, |end| {
+                    end.compressed_offset_in_bits
+                }),
+            expected_bytes: expected,
+            actual_bytes: actual,
+        });
     }
     Ok(())
 }
@@ -963,22 +961,20 @@ fn decode_span<R: ReadAt + ?Sized>(
             continue;
         }
 
-        if at_boundary {
-            if let Some(target) = span.end {
-                let target_bit = target.compressed_offset_in_bits;
-                if matches!(target.kind, CheckpointKind::DeflateBlock) {
-                    if current_bit == target_bit {
-                        flush_decoded(plan.kind, &mut resources.decoded, sink, runtime)?;
-                        verify_span_output(span, span_output)?;
-                        sink.send(SpanEvent::Finished)?;
-                        return Ok(span_output);
-                    }
-                    if current_bit > target_bit {
-                        return Err(DecodeError::IndexBoundaryMismatch {
-                            expected_bit_offset: target_bit,
-                            actual_bit_offset: current_bit,
-                        });
-                    }
+        if at_boundary && let Some(target) = span.end {
+            let target_bit = target.compressed_offset_in_bits;
+            if matches!(target.kind, CheckpointKind::DeflateBlock) {
+                if current_bit == target_bit {
+                    flush_decoded(plan.kind, &mut resources.decoded, sink, runtime)?;
+                    verify_span_output(span, span_output)?;
+                    sink.send(SpanEvent::Finished)?;
+                    return Ok(span_output);
+                }
+                if current_bit > target_bit {
+                    return Err(DecodeError::IndexBoundaryMismatch {
+                        expected_bit_offset: target_bit,
+                        actual_bit_offset: current_bit,
+                    });
                 }
             }
         }

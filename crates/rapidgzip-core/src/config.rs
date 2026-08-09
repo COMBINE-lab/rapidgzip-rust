@@ -94,10 +94,10 @@ impl Config {
 
     /// Confirms an exact output expectation after framing verification.
     pub(crate) fn verify_expected_output(&self, actual: u64) -> Result<(), DecodeError> {
-        if let Some(expected) = self.expected_uncompressed_size {
-            if expected != actual {
-                return Err(DecodeError::UnexpectedOutputSize { expected, actual });
-            }
+        if let Some(expected) = self.expected_uncompressed_size
+            && expected != actual
+        {
+            return Err(DecodeError::UnexpectedOutputSize { expected, actual });
         }
         Ok(())
     }

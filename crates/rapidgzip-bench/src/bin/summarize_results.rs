@@ -236,13 +236,13 @@ fn summarize(raw: &str, result_directory: &str) -> Result<Outputs, String> {
             continue;
         }
         let decoded_bytes = parse_u64(&fields, 12, "decoded_bytes")?;
-        if let Some(previous) = corpus_sizes.insert(key.corpus.clone(), decoded_bytes) {
-            if previous != decoded_bytes {
-                return Err(format!(
-                    "line {line_number}: decoded size disagrees for corpus {}",
-                    key.corpus
-                ));
-            }
+        if let Some(previous) = corpus_sizes.insert(key.corpus.clone(), decoded_bytes)
+            && previous != decoded_bytes
+        {
+            return Err(format!(
+                "line {line_number}: decoded size disagrees for corpus {}",
+                key.corpus
+            ));
         }
         if group
             .decoded_bytes

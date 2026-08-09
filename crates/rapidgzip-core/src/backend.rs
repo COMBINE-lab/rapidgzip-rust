@@ -356,14 +356,14 @@ where
             let _busy = runtime.begin_pool_task();
             index_stored_stream(source, config.input_page_size.min(256))?
         };
-        if let Some(index) = stored_index {
-            if index.tasks.len() > 1 {
-                runtime.set_path(DecoderPath::Stored);
-                if let Some(collector) = collector {
-                    offer_stored_checkpoints(&index, collector);
-                }
-                return decode_stored_parallel(source, config, cancelled, output, &index, runtime);
+        if let Some(index) = stored_index
+            && index.tasks.len() > 1
+        {
+            runtime.set_path(DecoderPath::Stored);
+            if let Some(collector) = collector {
+                offer_stored_checkpoints(&index, collector);
             }
+            return decode_stored_parallel(source, config, cancelled, output, &index, runtime);
         }
         if let Some(index) = index_independent_members(source, config, runtime)? {
             runtime.set_path(DecoderPath::DenseMembers);
@@ -1262,30 +1262,26 @@ impl<C: InputCursor> SequentialDecoder<C> {
                     if status != z::Z_STREAM_END
                         && stream.inflater.stream.data_type & 0x80 != 0
                         && stream.inflater.stream.data_type & 0x40 == 0
-                    {
-                        if let (Some(collector), Some(history)) =
+                        && let (Some(collector), Some(history)) =
                             (&self.collector, stream.index_history.as_ref())
-                        {
-                            if history.len() == WINDOW_SIZE {
-                                let unused_bits =
-                                    u64::try_from(stream.inflater.stream.data_type & 0x3f)
-                                        .expect("the low six data_type bits are non-negative");
-                                let boundary = self
-                                    .cursor
-                                    .position()
-                                    .saturating_mul(8)
-                                    .saturating_sub(unused_bits);
-                                collector.offer(
-                                    Checkpoint {
-                                        compressed_offset_in_bits: boundary,
-                                        uncompressed_offset_in_bytes: self.total_output,
-                                        kind: CheckpointKind::DeflateBlock,
-                                        line_offset: None,
-                                    },
-                                    history,
-                                );
-                            }
-                        }
+                        && history.len() == WINDOW_SIZE
+                    {
+                        let unused_bits = u64::try_from(stream.inflater.stream.data_type & 0x3f)
+                            .expect("the low six data_type bits are non-negative");
+                        let boundary = self
+                            .cursor
+                            .position()
+                            .saturating_mul(8)
+                            .saturating_sub(unused_bits);
+                        collector.offer(
+                            Checkpoint {
+                                compressed_offset_in_bits: boundary,
+                                uncompressed_offset_in_bytes: self.total_output,
+                                kind: CheckpointKind::DeflateBlock,
+                                line_offset: None,
+                            },
+                            history,
+                        );
                     }
 
                     let reached_stream_end = status == z::Z_STREAM_END
@@ -3563,18 +3559,18 @@ fn enqueue_native_resolution(
     available_resolve_tasks: &AtomicUsize,
     work_signal: &(Mutex<()>, Condvar),
 ) -> Result<bool, DecodeError> {
-    if window.as_slice().len() == WINDOW_SIZE {
-        if let Some(collector) = collector {
-            collector.offer(
-                Checkpoint {
-                    compressed_offset_in_bits: *current_bit,
-                    uncompressed_offset_in_bytes: *prepared_total,
-                    kind: CheckpointKind::DeflateBlock,
-                    line_offset: None,
-                },
-                window.as_slice(),
-            );
-        }
+    if window.as_slice().len() == WINDOW_SIZE
+        && let Some(collector) = collector
+    {
+        collector.offer(
+            Checkpoint {
+                compressed_offset_in_bits: *current_bit,
+                uncompressed_offset_in_bytes: *prepared_total,
+                kind: CheckpointKind::DeflateBlock,
+                line_offset: None,
+            },
+            window.as_slice(),
+        );
     }
     let prepared = prepare_native_chunk(chunk, *next_sequence, window, *current_bit)?;
     let next_total = config.checked_output_total(*prepared_total, prepared.decoded_size)?;
