@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "rapidgzip-bench"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "criterion",
  "libz-rs-sys",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "rapidgzip-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bon",
  "cpu-time",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "rapidgzip-rust-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "rapidgzip-core",
