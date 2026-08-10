@@ -700,7 +700,6 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-
     /// `release` must not lose the wakeup of a waiter that has checked the
     /// permit count but not yet parked.
     ///
